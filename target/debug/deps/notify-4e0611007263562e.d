@@ -1,0 +1,12 @@
+/Users/kos_svat/Claude-Agents/dev/mnemonic/target/debug/deps/notify-4e0611007263562e.d: /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/lib.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/fsevent.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/null.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/poll.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/config.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/error.rs
+
+/Users/kos_svat/Claude-Agents/dev/mnemonic/target/debug/deps/libnotify-4e0611007263562e.rlib: /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/lib.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/fsevent.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/null.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/poll.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/config.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/error.rs
+
+/Users/kos_svat/Claude-Agents/dev/mnemonic/target/debug/deps/libnotify-4e0611007263562e.rmeta: /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/lib.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/fsevent.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/null.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/poll.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/config.rs /Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/error.rs
+
+/Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/lib.rs:
+/Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/fsevent.rs:
+/Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/null.rs:
+/Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/poll.rs:
+/Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/config.rs:
+/Users/kos_svat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/notify-8.2.0/src/error.rs:

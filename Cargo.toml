@@ -1,0 +1,46 @@
+[package]
+name = "mnemonic"
+version = "0.1.0"
+edition = "2024"
+description = "Background memory daemon for AI coding agents"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# File watching
+notify = { version = "8", features = ["macos_fsevent"] }
+notify-debouncer-mini = "0.6"
+
+# Git
+git2 = "0.20"
+
+# Storage
+rusqlite = { version = "0.35", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utils
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+anyhow = "1"
+
+# Unix socket server
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+urlencoding = "2"
+libc = "0.2"
