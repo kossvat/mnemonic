@@ -18,6 +18,38 @@ use config::Config;
 use daemon::Daemon;
 use event::{EventSource, MemoryEntry, MemoryType};
 
+fn init_logging(log_file: Option<&std::path::Path>) {
+    if let Some(path) = log_file {
+        // Daemon mode: log to file
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new("mnemonic=info")),
+                )
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+            return;
+        }
+    }
+    // Interactive mode: log to stderr
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("mnemonic=info")),
+        )
+        .with_target(false)
+        .init();
+}
+
 #[derive(Parser)]
 #[command(
     name = "mnemonic",
@@ -119,15 +151,14 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("mnemonic=info")),
-        )
-        .with_target(false)
-        .init();
-
     let config = Config::load()?;
+
+    // Daemon and foreground start: log to file. Everything else: log to stderr.
+    match &cli.command {
+        Commands::Start { .. } => init_logging(Some(&config.daemon.log_file)),
+        Commands::Mcp => {} // MCP: no tracing (stdout is JSON-RPC)
+        _ => init_logging(None),
+    }
 
     match cli.command {
         Commands::Start { daemon: bg } => {

@@ -71,21 +71,33 @@ impl super::Watcher for GitWatcher {
         let interval = self.poll_interval_secs;
 
         tokio::spawn(async move {
-            let repo = match Repository::open(&repo_path) {
-                Ok(r) => r,
+            // Get initial HEAD to track changes
+            let mut last_commit_id = match Repository::open(&repo_path) {
+                Ok(repo) => {
+                    let id = Self::get_head_commit_id(&repo);
+                    info!("Git watcher tracking HEAD: {:?}", id);
+                    id
+                }
                 Err(e) => {
                     warn!("Cannot open git repo at {}: {e}", repo_path.display());
                     return;
                 }
             };
 
-            let mut last_commit_id = Self::get_head_commit_id(&repo);
-            info!("Git watcher tracking HEAD: {:?}", last_commit_id);
-
             let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(interval));
 
             loop {
                 tick.tick().await;
+
+                // Re-open repo each poll to see new commits
+                // (git2 caches internal state, won't see external changes otherwise)
+                let repo = match Repository::open(&repo_path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("Git repo reopen error: {e}");
+                        continue;
+                    }
+                };
 
                 let current_id = Self::get_head_commit_id(&repo);
 
