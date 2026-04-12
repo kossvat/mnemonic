@@ -1,0 +1,23 @@
+/target
+*.swp
+*.swo
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+Thumbs.db
+.Spotlight-V100
+
+# Local data (never commit user memories)
+*.db
+*.db-journal
+*.db-wal
+*.pid
+
+# Environment
+.env
+.env.*

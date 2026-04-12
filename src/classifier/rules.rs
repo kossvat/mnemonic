@@ -161,7 +161,14 @@ impl super::Classifier for RuleClassifier {
             }
             EventKind::SessionStart | EventKind::SessionEnd => {
                 let mut entry = MemoryEntry::new(
-                    format!("Session {}", if event.kind == EventKind::SessionStart { "started" } else { "ended" }),
+                    format!(
+                        "Session {}",
+                        if event.kind == EventKind::SessionStart {
+                            "started"
+                        } else {
+                            "ended"
+                        }
+                    ),
                     &event.content,
                     MemoryType::SessionSummary,
                     event.source.clone(),
@@ -196,12 +203,11 @@ fn extract_tags_from_commit(message: &str) -> Vec<String> {
     }
 
     // Scope from conventional commit: feat(auth): ...
-    if let Some(start) = lower.find('(') {
-        if let Some(end) = lower.find(')') {
-            if end > start + 1 {
-                tags.push(lower[start + 1..end].to_string());
-            }
-        }
+    if let Some(start) = lower.find('(')
+        && let Some(end) = lower.find(')')
+        && end > start + 1
+    {
+        tags.push(lower[start + 1..end].to_string());
     }
 
     tags

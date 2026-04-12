@@ -1,8 +1,8 @@
 use anyhow::Result;
-use hyper::{body::Incoming, server::conn::http1, service::service_fn, Request, Response};
-use hyper_util::rt::TokioIo;
 use http_body_util::Full;
 use hyper::body::Bytes;
+use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioIo;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tracing::{error, info};
@@ -43,10 +43,7 @@ impl ApiServer {
                             async move { handle_request(req, storage).await }
                         });
 
-                        if let Err(e) = http1::Builder::new()
-                            .serve_connection(io, svc)
-                            .await
-                        {
+                        if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                             error!("Connection error: {e}");
                         }
                     });
@@ -68,10 +65,12 @@ async fn handle_request(
 
     let response = match (method.as_str(), path.as_str()) {
         ("GET", "/status") => {
-            let stats = storage.stats().unwrap_or_else(|_| crate::storage::StorageStats {
-                total: 0,
-                by_type: vec![],
-            });
+            let stats = storage
+                .stats()
+                .unwrap_or_else(|_| crate::storage::StorageStats {
+                    total: 0,
+                    by_type: vec![],
+                });
             let body = serde_json::json!({
                 "status": "running",
                 "memories": stats.total,
@@ -102,22 +101,20 @@ async fn handle_request(
                 Err(e) => json_response(500, &serde_json::json!({ "error": e.to_string() })),
             }
         }
-        ("GET", "/recent") => {
-            match storage.recent(20) {
-                Ok(entries) => {
-                    let body = serde_json::json!({
-                        "results": entries.iter().map(|e| serde_json::json!({
-                            "title": e.title,
-                            "type": e.memory_type.to_string(),
-                            "importance": e.importance,
-                            "timestamp": e.timestamp.to_rfc3339(),
-                        })).collect::<Vec<_>>(),
-                    });
-                    json_response(200, &body)
-                }
-                Err(e) => json_response(500, &serde_json::json!({ "error": e.to_string() })),
+        ("GET", "/recent") => match storage.recent(20) {
+            Ok(entries) => {
+                let body = serde_json::json!({
+                    "results": entries.iter().map(|e| serde_json::json!({
+                        "title": e.title,
+                        "type": e.memory_type.to_string(),
+                        "importance": e.importance,
+                        "timestamp": e.timestamp.to_rfc3339(),
+                    })).collect::<Vec<_>>(),
+                });
+                json_response(200, &body)
             }
-        }
+            Err(e) => json_response(500, &serde_json::json!({ "error": e.to_string() })),
+        },
         _ => json_response(404, &serde_json::json!({ "error": "not found" })),
     };
 

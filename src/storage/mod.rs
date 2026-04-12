@@ -1,14 +1,15 @@
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info};
 
+use crate::embedding::{Embedding, cosine_similarity, embedding_from_bytes, embedding_to_bytes};
 use crate::event::MemoryEntry;
 
 /// SQLite-backed memory storage (thread-safe via Mutex)
 pub struct Storage {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
 }
 
 impl Storage {
@@ -39,6 +40,7 @@ impl Storage {
                 source TEXT NOT NULL,
                 importance REAL NOT NULL DEFAULT 0.5,
                 metadata TEXT NOT NULL DEFAULT '{}',
+                embedding BLOB,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -73,15 +75,36 @@ impl Storage {
             ",
         )?;
 
+        // Migration: add embedding column to existing databases
+        Self::migrate_add_column(&conn, "memories", "embedding", "BLOB");
+
         info!("Storage initialized at {:?}", conn.path());
         Ok(())
     }
 
+    /// Safe column migration — ignores "duplicate column" errors
+    fn migrate_add_column(conn: &Connection, table: &str, column: &str, col_type: &str) {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {col_type}");
+        if conn.execute(&sql, []).is_ok() {
+            info!("Migration: added column {table}.{column}");
+        }
+        // Column already exists — fine
+    }
+
     pub fn save(&self, entry: &MemoryEntry) -> Result<()> {
+        self.save_with_embedding(entry, None)
+    }
+
+    pub fn save_with_embedding(
+        &self,
+        entry: &MemoryEntry,
+        embedding: Option<&Embedding>,
+    ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let blob = embedding.map(|e| embedding_to_bytes(e));
         conn.execute(
-            "INSERT OR REPLACE INTO memories (id, timestamp, title, content, memory_type, tags, source, importance, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO memories (id, timestamp, title, content, memory_type, tags, source, importance, metadata, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 entry.id,
                 entry.timestamp.to_rfc3339(),
@@ -92,9 +115,84 @@ impl Storage {
                 serde_json::to_string(&entry.source)?,
                 entry.importance,
                 entry.metadata.to_string(),
+                blob,
             ],
         )?;
         Ok(())
+    }
+
+    /// Check if a similar memory already exists (cosine > threshold).
+    /// Returns Some(similarity) if duplicate found, None if unique.
+    pub fn is_duplicate(&self, embedding: &Embedding, threshold: f32) -> Result<Option<f32>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT embedding FROM memories WHERE embedding IS NOT NULL ORDER BY timestamp DESC LIMIT 200",
+        )?;
+
+        let rows: Vec<Vec<u8>> = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for blob in &rows {
+            let existing = embedding_from_bytes(blob);
+            let sim = cosine_similarity(embedding, &existing);
+            if sim >= threshold {
+                debug!("Duplicate found: cosine={sim:.4} >= threshold={threshold:.4}");
+                return Ok(Some(sim));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Find memories most similar to a given embedding
+    pub fn find_similar(
+        &self,
+        embedding: &Embedding,
+        limit: usize,
+    ) -> Result<Vec<(MemoryEntry, f32)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, timestamp, title, content, memory_type, tags, source, importance, metadata, embedding
+             FROM memories WHERE embedding IS NOT NULL",
+        )?;
+
+        let mut scored: Vec<(StorageRow, Vec<u8>, f32)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    StorageRow {
+                        id: row.get(0)?,
+                        timestamp: row.get(1)?,
+                        title: row.get(2)?,
+                        content: row.get(3)?,
+                        memory_type: row.get(4)?,
+                        tags: row.get(5)?,
+                        source: row.get(6)?,
+                        importance: row.get(7)?,
+                        metadata: row.get(8)?,
+                    },
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(row, blob)| {
+                let existing = embedding_from_bytes(&blob);
+                let sim = cosine_similarity(embedding, &existing);
+                (row, blob, sim)
+            })
+            .collect();
+
+        // Sort by similarity descending
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        let results: Vec<(MemoryEntry, f32)> = scored
+            .into_iter()
+            .filter_map(|(row, _, sim)| row.into_memory_entry().ok().map(|e| (e, sim)))
+            .collect();
+
+        Ok(results)
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
@@ -161,8 +259,7 @@ impl Storage {
 
     pub fn count(&self) -> Result<usize> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 
@@ -181,6 +278,111 @@ impl Storage {
             .collect();
 
         Ok(StorageStats { total, by_type })
+    }
+
+    /// Export all memories as JSON array
+    pub fn export_all(&self) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, timestamp, title, content, memory_type, tags, source, importance, metadata
+             FROM memories ORDER BY timestamp ASC",
+        )?;
+
+        let mut entries = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            entries.push(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "timestamp": row.get::<_, String>(1)?,
+                "title": row.get::<_, String>(2)?,
+                "content": row.get::<_, String>(3)?,
+                "memory_type": row.get::<_, String>(4)?,
+                "tags": row.get::<_, String>(5)?,
+                "source": row.get::<_, String>(6)?,
+                "importance": row.get::<_, f64>(7)?,
+                "metadata": row.get::<_, String>(8)?,
+            }));
+        }
+
+        Ok(entries)
+    }
+
+    /// Import memories from JSON array (skips duplicates by id)
+    pub fn import_entries(&self, entries: &[serde_json::Value]) -> Result<(usize, usize)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut imported = 0;
+        let mut skipped = 0;
+
+        for entry in entries {
+            let id = entry["id"].as_str().unwrap_or_default();
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+
+            if exists {
+                skipped += 1;
+                continue;
+            }
+
+            conn.execute(
+                "INSERT INTO memories (id, timestamp, title, content, memory_type, tags, source, importance, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    id,
+                    entry["timestamp"].as_str().unwrap_or_default(),
+                    entry["title"].as_str().unwrap_or_default(),
+                    entry["content"].as_str().unwrap_or_default(),
+                    entry["memory_type"].as_str().unwrap_or("note"),
+                    entry["tags"].as_str().unwrap_or("[]"),
+                    entry["source"].as_str().unwrap_or("\"manual\""),
+                    entry["importance"].as_f64().unwrap_or(0.5),
+                    entry["metadata"].as_str().unwrap_or("{}"),
+                ],
+            )?;
+            imported += 1;
+        }
+
+        Ok((imported, skipped))
+    }
+
+    /// Cleanup old low-importance memories.
+    /// Keeps: decisions (forever), feedback (forever), high-importance (>= threshold).
+    /// Removes: notes older than max_age_days with importance < threshold.
+    pub fn cleanup(&self, max_age_days: i64, importance_threshold: f32) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        let deleted = conn.execute(
+            "DELETE FROM memories
+             WHERE memory_type NOT IN ('decision', 'feedback')
+             AND importance < ?1
+             AND timestamp < ?2",
+            params![importance_threshold as f64, cutoff_str],
+        )?;
+
+        if deleted > 0 {
+            conn.execute(
+                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')",
+                [],
+            )?;
+            info!("Cleanup: removed {deleted} old low-importance memories");
+        }
+
+        Ok(deleted)
+    }
+
+    /// Get database file size in bytes
+    pub fn db_size(&self) -> Result<u64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        match conn.path() {
+            Some(path) => Ok(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)),
+            None => Ok(0),
+        }
     }
 }
 
@@ -208,8 +410,7 @@ impl StorageRow {
             _ => MemoryType::Note,
         };
 
-        let source: EventSource =
-            serde_json::from_str(&self.source).unwrap_or(EventSource::Manual);
+        let source: EventSource = serde_json::from_str(&self.source).unwrap_or(EventSource::Manual);
         let tags: Vec<String> = serde_json::from_str(&self.tags).unwrap_or_default();
         let metadata: serde_json::Value =
             serde_json::from_str(&self.metadata).unwrap_or(serde_json::Value::Null);

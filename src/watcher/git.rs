@@ -82,9 +82,7 @@ impl super::Watcher for GitWatcher {
             let mut last_commit_id = Self::get_head_commit_id(&repo);
             info!("Git watcher tracking HEAD: {:?}", last_commit_id);
 
-            let mut tick = tokio::time::interval(
-                tokio::time::Duration::from_secs(interval),
-            );
+            let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(interval));
 
             loop {
                 tick.tick().await;
@@ -101,18 +99,15 @@ impl super::Watcher for GitWatcher {
                             info.files_changed,
                         );
 
-                        let event = Event::new(
-                            EventSource::GitWatcher,
-                            EventKind::GitCommit,
-                            &content,
-                        )
-                        .with_metadata(serde_json::json!({
-                            "commit_id": info.id,
-                            "message": info.message.trim(),
-                            "files_changed": info.files_changed,
-                            "insertions": info.insertions,
-                            "deletions": info.deletions,
-                        }));
+                        let event =
+                            Event::new(EventSource::GitWatcher, EventKind::GitCommit, &content)
+                                .with_metadata(serde_json::json!({
+                                    "commit_id": info.id,
+                                    "message": info.message.trim(),
+                                    "files_changed": info.files_changed,
+                                    "insertions": info.insertions,
+                                    "deletions": info.deletions,
+                                }));
 
                         debug!("New commit detected: {}", info.message.trim());
 

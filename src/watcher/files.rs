@@ -109,9 +109,7 @@ impl super::Watcher for FileWatcher {
                 match sync_rx.recv() {
                     Ok(Ok(notify_event)) => {
                         let now = std::time::Instant::now();
-                        if now.duration_since(last_event_time).as_millis()
-                            < debounce_ms as u128
-                        {
+                        if now.duration_since(last_event_time).as_millis() < debounce_ms as u128 {
                             continue;
                         }
                         last_event_time = now;
@@ -122,32 +120,25 @@ impl super::Watcher for FileWatcher {
                                 continue;
                             }
 
-                            if let Some(kind) =
-                                Self::classify_event(&notify_event.kind, path)
-                            {
+                            if let Some(kind) = Self::classify_event(&notify_event.kind, path) {
                                 let content = format!(
                                     "{}: {}",
                                     match &kind {
                                         MnemonicEventKind::FileCreated => "File created",
                                         MnemonicEventKind::FileModified => "File modified",
                                         MnemonicEventKind::FileDeleted => "File deleted",
-                                        MnemonicEventKind::DependencyAdded =>
-                                            "Dependency changed",
+                                        MnemonicEventKind::DependencyAdded => "Dependency changed",
                                         _ => "File event",
                                     },
                                     path.display()
                                 );
 
-                                let event = Event::new(
-                                    EventSource::FileWatcher,
-                                    kind,
-                                    &content,
-                                )
-                                .with_metadata(serde_json::json!({
-                                    "path": path.to_string_lossy(),
-                                    "extension": path.extension()
-                                        .map(|e| e.to_string_lossy().to_string()),
-                                }));
+                                let event = Event::new(EventSource::FileWatcher, kind, &content)
+                                    .with_metadata(serde_json::json!({
+                                        "path": path.to_string_lossy(),
+                                        "extension": path.extension()
+                                            .map(|e| e.to_string_lossy().to_string()),
+                                    }));
 
                                 debug!("File event: {content}");
 

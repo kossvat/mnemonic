@@ -66,17 +66,23 @@ impl Default for Config {
         Self {
             daemon: DaemonConfig {
                 pid_file: data_dir.join("mnemonic.pid"),
-                socket_path: PathBuf::from("/tmp/mnemonic.sock"),
+                socket_path: data_dir.join("mnemonic.sock"),
                 log_file: data_dir.join("daemon.log"),
             },
             watchers: WatcherConfig {
                 watch_paths: vec![
-                    PathBuf::from("."),           // current working dir
-                    home.join(".claude-flow"),     // sessions, insights
+                    PathBuf::from("."),        // current working dir
+                    home.join(".claude-flow"), // sessions, insights
                 ],
                 extensions: vec![
-                    "rs".into(), "ts".into(), "js".into(), "py".into(),
-                    "md".into(), "toml".into(), "json".into(), "yaml".into(),
+                    "rs".into(),
+                    "ts".into(),
+                    "js".into(),
+                    "py".into(),
+                    "md".into(),
+                    "toml".into(),
+                    "json".into(),
+                    "yaml".into(),
                 ],
                 ignore_patterns: vec![
                     "target/".into(),
@@ -98,7 +104,7 @@ impl Default for Config {
                 memory_files_enabled: true,
                 memory_files_path: claude_memory,
                 obsidian_enabled: false,
-                obsidian_path: home.join(".claude/obsidian"),
+                obsidian_path: home.join("Documents/Obsidian/Vault"),
                 batch_interval_secs: 5,
             },
         }
@@ -126,13 +132,5 @@ impl Config {
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
-    }
-
-    pub fn data_dir(&self) -> PathBuf {
-        self.storage
-            .db_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf()
     }
 }
