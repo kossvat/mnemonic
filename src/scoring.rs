@@ -46,7 +46,14 @@ impl ImportanceScorer {
         let rec = self.recency_score(embedding, conn)?;
         let sig = self.signal_score(event_kind, memory_type);
 
-        let score = self.w_frequency * freq + self.w_recency * rec + self.w_signal * sig;
+        let mut score = self.w_frequency * freq + self.w_recency * rec + self.w_signal * sig;
+
+        // Floor: new unique events (never seen before) get at least signal strength as score.
+        // Without this, first occurrence of any topic scores ~0.16 and gets dropped.
+        if freq == 0.0 && rec == 0.0 {
+            score = score.max(sig * 0.75);
+        }
+
         let score = score.clamp(0.0, 1.0);
 
         debug!("Importance: freq={freq:.2} rec={rec:.2} sig={sig:.2} → {score:.2}");
@@ -125,6 +132,8 @@ impl ImportanceScorer {
             EventKind::ErrorFixed => return 0.8,
             // Manual save = user explicitly wanted this saved → high signal
             EventKind::Custom(s) if s == "manual" => return 0.8,
+            // Git commits are explicit developer actions → decent signal
+            EventKind::GitCommit => return 0.6,
             _ => {}
         }
 
@@ -153,7 +162,7 @@ mod tests {
         );
         assert_eq!(
             scorer.signal_score(&EventKind::GitCommit, &MemoryType::Decision),
-            0.7
+            0.6
         );
         assert_eq!(
             scorer.signal_score(&EventKind::FileCreated, &MemoryType::Note),
