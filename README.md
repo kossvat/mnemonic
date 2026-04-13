@@ -25,11 +25,14 @@ Mnemonic runs in the background and automatically captures:
 - **Git commits** — classified by conventional commit type (feat → decision, fix → note)
 - **File changes** — new files, dependency additions, significant modifications
 - **User corrections** — when you override an agent's approach (highest priority)
+- **Conversation monitoring** — watches Claude Code sessions for corrections and decisions in real-time
+- **Knowledge graph** — extracts entities (projects, tech, modules) and their relationships
 
 Everything is deduplicated, scored for importance, and stored locally:
-1. **SQLite** — with FTS5 full-text search and semantic embeddings
+1. **SQLite** — with FTS5 full-text search, semantic embeddings, and knowledge graph
 2. **Claude Code memory files** — agents see memories on session start
 3. **Obsidian vault** (optional) — human-readable notes with tags and frontmatter
+4. **Memory API** (optional) — sync to shared API for cross-agent access
 
 ## Requirements
 
@@ -109,51 +112,53 @@ Add to `~/.claude.json`:
 }
 ```
 
-MCP tools: `memory_search`, `memory_save`, `memory_recent`, `memory_similar`, `memory_context`, `memory_status`
+MCP tools: `memory_search`, `memory_save`, `memory_recent`, `memory_similar`, `memory_context`, `memory_status`, `memory_graph`
 
 ## How It Works
 
 ```
-                    ┌──────────────┐
-                    │  File System │
-                    │   (notify)   │
-                    └──────┬───────┘
-                           │ events
-┌──────────┐       ┌──────▼───────┐       ┌─────────────┐
-│   Git    │──────►│   Daemon     │──────►│  Classifier  │
-│ (git2)   │       │  (tokio)     │       │  (rules)     │
-└──────────┘       └──────┬───────┘       └──────┬───────┘
-                          │                       │
-                   ┌──────▼───────┐       ┌──────▼───────┐
-                   │  Embedder    │       │   Scorer     │
-                   │  (SimHash)   │       │  (dynamic)   │
-                   └──────┬───────┘       └──────┬───────┘
-                          │                       │
-                          ▼ dedup check           ▼ importance
-                   ┌──────────────┐
-                   │   Storage    │
-                   │  (SQLite +   │
-                   │   FTS5)      │
-                   └──────┬───────┘
-                          │
-              ┌───────────┼───────────┐
-              ▼           ▼           ▼
-        ┌──────────┐ ┌────────┐ ┌──────────┐
-        │  Claude  │ │Obsidian│ │ Whisper  │
-        │  Memory  │ │  Vault │ │ Context  │
-        │  Files   │ │ (opt.) │ │ (.md)    │
-        └──────────┘ └────────┘ └──────────┘
+┌──────────────┐  ┌──────────┐  ┌───────────────┐
+│  File System │  │   Git    │  │ Conversations │
+│   (notify)   │  │  (git2)  │  │  (JSONL poll) │
+└──────┬───────┘  └────┬─────┘  └───────┬───────┘
+       │               │                │
+       └───────────────┼────────────────┘
+                       ▼
+                ┌──────────────┐       ┌─────────────┐
+                │    Daemon    │──────►│  Classifier  │
+                │   (tokio)   │       │   (rules)    │
+                └──────┬──────┘       └──────┬───────┘
+                       │                      │
+                ┌──────▼──────┐       ┌──────▼───────┐
+                │  Embedder   │       │   Scorer     │
+                │ (hash/NN)   │       │  (dynamic)   │
+                └──────┬──────┘       └──────┬───────┘
+                       │                      │
+                       ▼ dedup                ▼ importance
+                ┌──────────────┐       ┌─────────────┐
+                │   Storage    │◄─────►│  Knowledge  │
+                │ (SQLite+FTS) │       │    Graph    │
+                └──────┬───────┘       └─────────────┘
+                       │
+           ┌───────────┼───────────┬───────────┐
+           ▼           ▼           ▼           ▼
+     ┌──────────┐ ┌────────┐ ┌──────────┐ ┌────────┐
+     │  Claude  │ │Obsidian│ │ Whisper  │ │Memory  │
+     │  Memory  │ │  Vault │ │ Context  │ │  API   │
+     │  Files   │ │ (opt.) │ │ (.md)    │ │ (opt.) │
+     └──────────┘ └────────┘ └──────────┘ └────────┘
 ```
 
 ### Memory Flow
 
-1. **Watch** — File watcher (FSEvents/inotify) and Git watcher (polling HEAD) emit events
-2. **Batch** — Events collected in 5-second batches (urgent events bypass)
+1. **Watch** — File watcher (FSEvents/inotify), Git watcher (polling HEAD), and Conversation watcher (Claude Code JSONL) emit events
+2. **Batch** — Events collected in 5-second batches (urgent events like corrections bypass)
 3. **Classify** — Rule-based classifier determines type and base importance
-4. **Embed** — SimHash generates 256-dim embedding for dedup + similarity search
+4. **Embed** — Hash (256-dim) or neural (384-dim MiniLM-L6-v2) embedding for dedup + similarity
 5. **Score** — Dynamic importance: `frequency × 0.3 + recency × 0.3 + signal × 0.4`
 6. **Dedup** — Skip if cosine similarity > 0.92 with existing memory
-7. **Store** — Write to SQLite (FTS5), Claude memory files, and optionally Obsidian vault
+7. **Extract** — Rule-based entity extraction builds knowledge graph (projects, tech, modules, relationships)
+8. **Store** — Write to SQLite (FTS5 + graph), Claude memory files, Obsidian, and/or Memory API
 
 ### Memory Types
 
@@ -194,10 +199,11 @@ mnemonic cleanup --days 30 --threshold 0.5 --confirm
 Every component is a trait — swap implementations without changing the pipeline:
 
 ```rust
-trait Watcher    // FileWatcher, GitWatcher, (future: ConversationWatcher)
-trait Classifier // RuleClassifier, (future: LLM-based)
-trait Embedder   // HashEmbedder, (future: NeuralEmbedder with MiniLM-L6-v2)
-trait OutputSink // SQLite, MemoryFiles, Obsidian, (future: any)
+trait Watcher         // FileWatcher, GitWatcher, ConversationWatcher
+trait Classifier      // RuleClassifier, (future: LLM-based)
+trait Embedder        // HashEmbedder, NeuralEmbedder (optional, --features neural)
+trait EntityExtractor // RuleExtractor, (future: LLM-based)
+trait OutputSink      // SQLite, MemoryFiles, Obsidian, MemoryAPI
 ```
 
 ## CLI Reference
@@ -218,6 +224,11 @@ mnemonic stats [--json]      # Stats with daily breakdown (JSON for widgets)
 # Write
 mnemonic save -t <title> <content> [-T type] [--tags a,b]  # Manual save
 mnemonic context [-t topic]  # Generate context file (Whisper)
+
+# Knowledge Graph
+mnemonic graph <entity>      # Query entity relationships and neighbors
+mnemonic entities [--limit N] # List known entities by mention count
+mnemonic backfill            # Rebuild graph from existing memories
 
 # Data Management
 mnemonic export              # Export all memories as JSON (stdout)
@@ -289,16 +300,20 @@ See [clients/macos/README.md](clients/macos/README.md) for details.
 - [x] Semantic deduplication
 - [x] Dynamic importance scoring
 - [x] Whisper (context injection)
-- [x] MCP server (6 tools)
-- [x] CLI (15 commands)
+- [x] MCP server (7 tools incl. graph queries)
+- [x] CLI (18 commands)
 - [x] Auto-start via SessionStart hook
 - [x] Export/import for backup and migration
 - [x] Memory cleanup with TTL
 - [x] Doctor diagnostics
 - [x] macOS menu bar widget (SwiftUI)
-- [ ] Neural embeddings (MiniLM-L6-v2 via candle)
-- [ ] Conversation watcher (Claude Code session monitoring)
-- [ ] Embedding backfill for old memories
+- [x] Knowledge graph (entities, edges, rule-based extraction)
+- [x] Neural embeddings (MiniLM-L6-v2 via fastembed, optional `--features neural`)
+- [x] Conversation watcher (Claude Code JSONL session monitoring)
+- [x] Memory API sync (cross-agent shared memory)
+- [x] Graph-aware context generation (entities + neighbors in CONTEXT.md)
+- [ ] LLM-based entity extraction (Claude/Gemini for richer graph)
+- [ ] Obsidian graph sync (export knowledge graph as linked notes)
 - [ ] Web UI for browsing memories
 - [ ] Linux tray widget
 - [ ] Windows support
@@ -309,6 +324,9 @@ See [clients/macos/README.md](clients/macos/README.md) for details.
 # Requires Rust 1.70+
 cargo build --release
 
+# With neural embeddings (384-dim MiniLM-L6-v2, adds ~20MB)
+cargo build --release --features neural
+
 # Run tests
 cargo test
 
@@ -316,7 +334,7 @@ cargo test
 cargo install --path .
 ```
 
-Binary size: ~6MB (statically linked SQLite).
+Binary size: ~6MB default, ~26MB with `--features neural` (statically linked SQLite + ONNX Runtime).
 
 ## License
 
