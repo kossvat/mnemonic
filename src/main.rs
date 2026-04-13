@@ -142,6 +142,15 @@ enum Commands {
     },
     /// Diagnose common setup issues
     Doctor,
+    /// JSON stats for widgets (daily counts, last activity, dedup)
+    Stats {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Number of days for daily breakdown (default: 7)
+        #[arg(short, long, default_value = "7")]
+        days: usize,
+    },
     /// Run as MCP server (JSON-RPC over stdio)
     Mcp,
     /// Generate default config file
@@ -156,7 +165,7 @@ async fn main() -> Result<()> {
     // Daemon and foreground start: log to file. Everything else: log to stderr.
     match &cli.command {
         Commands::Start { .. } => init_logging(Some(&config.daemon.log_file)),
-        Commands::Mcp => {} // MCP: no tracing (stdout is JSON-RPC)
+        Commands::Mcp | Commands::Stats { .. } => {} // stdout is structured output, no tracing
         _ => init_logging(None),
     }
 
@@ -503,6 +512,79 @@ async fn main() -> Result<()> {
                 println!("\nAll checks passed ✓");
             } else {
                 println!("\n{issues} issue(s) found");
+            }
+        }
+        Commands::Stats { json, days } => {
+            let st = storage::Storage::open(&config.storage.db_path)?;
+            let stats = st.stats()?;
+            let daily = st.daily_counts(days)?;
+            let last_activity = st.last_activity()?;
+            let db_size = st.db_size()?;
+            let (saved, with_emb) = st.dedup_estimate()?;
+            let is_running = Daemon::is_running(&config);
+
+            if json {
+                let daily_json: Vec<serde_json::Value> = daily
+                    .iter()
+                    .map(|(date, count)| {
+                        serde_json::json!({"date": date, "count": count})
+                    })
+                    .collect();
+
+                let by_type: serde_json::Map<String, serde_json::Value> = stats
+                    .by_type
+                    .iter()
+                    .map(|(t, c)| (t.clone(), serde_json::json!(c)))
+                    .collect();
+
+                // Calculate hours since last activity
+                let silent_hours = last_activity.as_ref().and_then(|ts| {
+                    chrono::DateTime::parse_from_rfc3339(ts).ok().map(|dt| {
+                        let now = chrono::Utc::now();
+                        let diff = now - dt.with_timezone(&chrono::Utc);
+                        diff.num_minutes() as f64 / 60.0
+                    })
+                });
+
+                let output = serde_json::json!({
+                    "total": stats.total,
+                    "by_type": by_type,
+                    "daily": daily_json,
+                    "last_activity": last_activity,
+                    "silent_hours": silent_hours,
+                    "db_size_bytes": db_size,
+                    "db_size_kb": db_size as f64 / 1024.0,
+                    "saved_total": saved,
+                    "with_embeddings": with_emb,
+                    "daemon_running": is_running.is_some(),
+                    "daemon_pid": is_running,
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("mnemonic stats ({days}-day view)\n");
+                println!("{stats}");
+                println!("Database: {:.1} KB", db_size as f64 / 1024.0);
+                println!("Entries with embeddings: {with_emb}/{saved}");
+
+                if let Some(ts) = &last_activity {
+                    println!("Last activity: {ts}");
+                }
+
+                if !daily.is_empty() {
+                    println!("\nDaily breakdown:");
+                    let max_count = daily.iter().map(|(_, c)| *c).max().unwrap_or(1);
+                    for (date, count) in &daily {
+                        let bar_len = (*count as f64 / max_count as f64 * 20.0) as usize;
+                        let bar: String = "█".repeat(bar_len);
+                        println!("  {date} {bar} {count}");
+                    }
+                }
+
+                if let Some(pid) = is_running {
+                    println!("\nDaemon: running (PID {pid})");
+                } else {
+                    println!("\nDaemon: stopped");
+                }
             }
         }
         Commands::Mcp => {

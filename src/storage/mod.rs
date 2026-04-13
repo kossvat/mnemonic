@@ -376,6 +376,50 @@ impl Storage {
         Ok(deleted)
     }
 
+    /// Daily memory counts for the last N days (for sparkline graphs)
+    pub fn daily_counts(&self, days: usize) -> Result<Vec<(String, usize)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT date(timestamp) as d, COUNT(*) as c
+             FROM memories
+             WHERE timestamp >= datetime('now', ?1)
+             GROUP BY d
+             ORDER BY d ASC",
+        )?;
+        let offset = format!("-{days} days");
+        let rows: Vec<(String, usize)> = stmt
+            .query_map([&offset], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Timestamp of the most recent memory entry
+    pub fn last_activity(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT timestamp FROM memories ORDER BY timestamp DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(result)
+    }
+
+    /// Dedup stats: how many entries were saved vs have embeddings
+    pub fn dedup_estimate(&self) -> Result<(usize, usize)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let saved: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+        // embeddings table may not exist in older DBs
+        let with_emb: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .unwrap_or(0);
+        Ok((saved as usize, with_emb as usize))
+    }
+
     /// Get database file size in bytes
     pub fn db_size(&self) -> Result<u64> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;

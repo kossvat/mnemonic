@@ -1,6 +1,19 @@
-# mnemonic
+<p align="center">
+  <img src="assets/logo.svg" alt="mnemonic" width="400"/>
+</p>
 
-Background memory daemon for AI coding agents. Watches your project, captures decisions, and builds persistent memory — without requiring explicit `memory_save()` calls.
+<p align="center">
+  <a href="https://github.com/kossvat/mnemonic/actions"><img src="https://github.com/kossvat/mnemonic/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kossvat/mnemonic/releases"><img src="https://img.shields.io/github/v/release/kossvat/mnemonic?color=6366f1" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"></a>
+</p>
+
+<p align="center">
+  Background memory daemon for AI coding agents.<br>
+  Watches your project, captures decisions, and builds persistent memory — automatically.
+</p>
+
+---
 
 ## The Problem
 
@@ -36,13 +49,13 @@ No external databases, no Docker, no API keys. Everything runs locally.
 ### One-line install (from GitHub)
 
 ```bash
-cargo install --git https://github.com/AgentForgeAI/mnemonic
+cargo install --git https://github.com/kossvat/mnemonic
 ```
 
 ### Or from source
 
 ```bash
-git clone https://github.com/AgentForgeAI/mnemonic.git
+git clone https://github.com/kossvat/mnemonic.git
 cd mnemonic
 cargo install --path .
 ```
@@ -200,6 +213,7 @@ mnemonic doctor              # Diagnose setup issues
 mnemonic query <text>        # Full-text search (FTS5)
 mnemonic similar <text>      # Semantic similarity search
 mnemonic recent [-l N]       # Show N most recent memories
+mnemonic stats [--json]      # Stats with daily breakdown (JSON for widgets)
 
 # Write
 mnemonic save -t <title> <content> [-T type] [--tags a,b]  # Manual save
@@ -249,6 +263,20 @@ mnemonic import memories-backup.json
 # Duplicates are skipped automatically
 ```
 
+## macOS Menu Bar Widget
+
+Native SwiftUI widget for monitoring mnemonic from the menu bar.
+
+```bash
+cd clients/macos
+swift build
+.build/debug/MnemonicBar
+```
+
+Features: live stats, memory search, type filtering, expandable entries, quick save, daemon start/stop, context generation, activity alerts.
+
+See [clients/macos/README.md](clients/macos/README.md) for details.
+
 ## Roadmap
 
 - [x] File watcher (FSEvents/inotify via `notify`)
@@ -262,15 +290,17 @@ mnemonic import memories-backup.json
 - [x] Dynamic importance scoring
 - [x] Whisper (context injection)
 - [x] MCP server (6 tools)
-- [x] CLI (14 commands)
+- [x] CLI (15 commands)
 - [x] Auto-start via SessionStart hook
 - [x] Export/import for backup and migration
 - [x] Memory cleanup with TTL
 - [x] Doctor diagnostics
+- [x] macOS menu bar widget (SwiftUI)
 - [ ] Neural embeddings (MiniLM-L6-v2 via candle)
 - [ ] Conversation watcher (Claude Code session monitoring)
 - [ ] Embedding backfill for old memories
 - [ ] Web UI for browsing memories
+- [ ] Linux tray widget
 - [ ] Windows support
 
 ## Building
