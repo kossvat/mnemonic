@@ -7,13 +7,16 @@ use crate::api::ApiServer;
 use crate::classifier::Classifier;
 use crate::classifier::rules::RuleClassifier;
 use crate::config::Config;
-use crate::embedding::{Embedder, HashEmbedder};
+use crate::embedding::Embedder;
 use crate::event::Event;
+use crate::graph::extractor::{EntityExtractor, RuleExtractor};
 use crate::output::memory_files::MemoryFileSink;
+use crate::output::memory_api::MemoryApiSink;
 use crate::output::obsidian::ObsidianSink;
 use crate::scoring::ImportanceScorer;
 use crate::storage::{OutputSink, Storage};
 use crate::watcher::Watcher;
+use crate::watcher::conversation::ConversationWatcher;
 use crate::watcher::files::FileWatcher;
 use crate::watcher::git::GitWatcher;
 
@@ -36,16 +39,16 @@ impl Daemon {
         // Classifier
         let classifier = RuleClassifier::new(self.config.classifier.clone());
 
-        // Embedder (hash-based, zero deps, <1ms)
-        let embedder = Arc::new(HashEmbedder::new());
+        // Embedder — auto-selects neural (384-dim) or hash (256-dim) based on features
+        let embedder: Arc<dyn Embedder> = Arc::from(crate::embedding::create_embedder()?);
         let dedup_threshold = self.config.classifier.dedup_threshold;
-        info!(
-            "Embedder ready (256-dim hash, dedup threshold: {:.2})",
-            dedup_threshold
-        );
+        info!("Embedder ready (dedup threshold: {:.2})", dedup_threshold);
 
         // Dynamic importance scorer
         let scorer = ImportanceScorer::default();
+
+        // Entity extractor for knowledge graph
+        let graph_extractor = Arc::new(RuleExtractor::new());
         let importance_threshold = self.config.classifier.importance_threshold;
         info!("Scorer ready (threshold: {:.2})", importance_threshold);
 
@@ -61,7 +64,12 @@ impl Daemon {
                 self.config.output.obsidian_path.clone(),
             )));
         }
-        // Phase 2: WhisperSink
+        if self.config.output.memory_api_enabled && !self.config.output.memory_api_url.is_empty() {
+            sinks.push(Box::new(MemoryApiSink::new(
+                self.config.output.memory_api_url.clone(),
+                self.config.output.memory_api_key.clone(),
+            )));
+        }
 
         info!(
             "Output sinks: {}",
@@ -95,6 +103,26 @@ impl Daemon {
             warn!("No .git directory found, git watcher disabled");
         }
 
+        // Start conversation watcher (Claude Code JSONL sessions)
+        if self.config.watchers.conversation_enabled {
+            let sessions_dir = self.config.watchers.conversation_sessions_dir.clone()
+                .unwrap_or_else(|| {
+                    dirs::home_dir().unwrap_or_default().join(".claude/projects")
+                });
+            if sessions_dir.exists() {
+                let conv_watcher = ConversationWatcher::new(sessions_dir.clone());
+                let conv_tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = conv_watcher.start(conv_tx).await {
+                        error!("Conversation watcher error: {e}");
+                    }
+                });
+                info!("Conversation watcher monitoring: {}", sessions_dir.display());
+            } else {
+                warn!("Sessions dir not found: {}, conversation watcher disabled", sessions_dir.display());
+            }
+        }
+
         info!("mnemonic daemon running. Watching for events...");
 
         // Event processing loop
@@ -116,6 +144,13 @@ impl Daemon {
                             if let Err(e) = storage.save_with_embedding(&entry, emb.as_ref()) {
                                 error!("Storage save error: {e}");
                             }
+                            // Extract entities for knowledge graph
+                            let extraction = graph_extractor.extract(&entry);
+                            if !extraction.entities.is_empty() || !extraction.edges.is_empty() {
+                                if let Err(e) = storage.save_graph(&entry.id, &extraction.entities, &extraction.edges) {
+                                    warn!("Graph save error: {e}");
+                                }
+                            }
                             for sink in &sinks {
                                 if let Err(e) = sink.write(&entry) {
                                     warn!("Sink {} error: {e}", sink.name());
@@ -129,14 +164,14 @@ impl Daemon {
                 }
                 _ = batch_timer.tick() => {
                     if !batch.is_empty() {
-                        self.process_batch(&batch, &classifier, &storage, &sinks, &*embedder, dedup_threshold, &scorer, importance_threshold);
+                        self.process_batch(&batch, &classifier, &storage, &sinks, &*embedder, dedup_threshold, &scorer, importance_threshold, &*graph_extractor);
                         batch.clear();
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutting down...");
                     if !batch.is_empty() {
-                        self.process_batch(&batch, &classifier, &storage, &sinks, &*embedder, dedup_threshold, &scorer, importance_threshold);
+                        self.process_batch(&batch, &classifier, &storage, &sinks, &*embedder, dedup_threshold, &scorer, importance_threshold, &*graph_extractor);
                     }
                     self.cleanup();
                     return Ok(());
@@ -156,6 +191,7 @@ impl Daemon {
         dedup_threshold: f32,
         scorer: &ImportanceScorer,
         importance_threshold: f32,
+        graph_extractor: &dyn EntityExtractor,
     ) {
         let mut saved = 0;
         let mut skipped = 0;
@@ -206,6 +242,13 @@ impl Daemon {
                     if let Err(e) = storage.save_with_embedding(&entry, emb.as_ref()) {
                         error!("Storage save error: {e}");
                         continue;
+                    }
+                    // Extract entities for knowledge graph
+                    let extraction = graph_extractor.extract(&entry);
+                    if !extraction.entities.is_empty() || !extraction.edges.is_empty() {
+                        if let Err(e) = storage.save_graph(&entry.id, &extraction.entities, &extraction.edges) {
+                            warn!("Graph save error: {e}");
+                        }
                     }
                     for sink in sinks {
                         if let Err(e) = sink.write(&entry) {

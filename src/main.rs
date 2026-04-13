@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod embedding;
 mod event;
+mod graph;
 mod mcp;
 mod output;
 mod scoring;
@@ -151,6 +152,19 @@ enum Commands {
         #[arg(short, long, default_value = "7")]
         days: usize,
     },
+    /// Query knowledge graph for an entity
+    Graph {
+        /// Entity name to look up
+        entity: String,
+    },
+    /// List all known entities
+    Entities {
+        /// Max results
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+    /// Backfill graph from existing memories
+    Backfill,
     /// Run as MCP server (JSON-RPC over stdio)
     Mcp,
     /// Generate default config file
@@ -308,6 +322,13 @@ async fn main() -> Result<()> {
             }
             if config.output.obsidian_enabled {
                 let sink = output::obsidian::ObsidianSink::new(config.output.obsidian_path.clone());
+                sink.write(&entry)?;
+            }
+            if config.output.memory_api_enabled && !config.output.memory_api_url.is_empty() {
+                let sink = output::memory_api::MemoryApiSink::new(
+                    config.output.memory_api_url.clone(),
+                    config.output.memory_api_key.clone(),
+                );
                 sink.write(&entry)?;
             }
 
@@ -586,6 +607,92 @@ async fn main() -> Result<()> {
                     println!("\nDaemon: stopped");
                 }
             }
+        }
+        Commands::Graph { entity } => {
+            let st = storage::Storage::open(&config.storage.db_path)?;
+            let result = st.graph_query(&entity)?;
+
+            if !result.found {
+                println!("Entity '{}' not found in graph.", entity);
+                println!("\nTip: run 'mnemonic entities' to see known entities,");
+                println!("     or 'mnemonic backfill' to build graph from existing memories.");
+            } else {
+                println!(
+                    "Entity: {} ({}, mentioned {} times)",
+                    result.entity_name, result.entity_type, result.mention_count
+                );
+                println!("First seen: {}", result.first_seen);
+                println!("Last seen:  {}", result.last_seen);
+
+                if !result.edges.is_empty() {
+                    println!("\nConnections:");
+                    for edge in &result.edges {
+                        let arrow = if edge.source == result.entity_name {
+                            format!("  {} --{}→ {}", edge.source, edge.relation, edge.target)
+                        } else {
+                            format!("  {} --{}→ {}", edge.source, edge.relation, edge.target)
+                        };
+                        println!("{arrow} (weight: {:.1})", edge.weight);
+                    }
+                }
+
+                if !result.neighbors.is_empty() {
+                    println!("\nConnected entities:");
+                    for n in &result.neighbors {
+                        println!("  {} ({}, {} mentions)", n.name, n.entity_type, n.mention_count);
+                    }
+                }
+
+                if !result.memories.is_empty() {
+                    println!("\nRelated memories:");
+                    for m in &result.memories {
+                        println!(
+                            "  [{:>10}] {} (importance: {:.1})",
+                            m.memory_type, m.title, m.importance
+                        );
+                        println!("             {}", m.timestamp);
+                    }
+                }
+            }
+        }
+        Commands::Entities { limit } => {
+            let st = storage::Storage::open(&config.storage.db_path)?;
+            let entities = st.list_entities(limit)?;
+            let (entity_count, edge_count) = st.graph_stats()?;
+
+            println!("Knowledge graph: {entity_count} entities, {edge_count} edges\n");
+
+            if entities.is_empty() {
+                println!("No entities yet. Run 'mnemonic backfill' to build from existing memories.");
+            } else {
+                for (name, etype, count) in &entities {
+                    println!("  {name:20} ({etype:8}) — {count} mentions");
+                }
+            }
+        }
+        Commands::Backfill => {
+            let st = storage::Storage::open(&config.storage.db_path)?;
+            let all = st.recent(1000)?; // Get all memories
+            let extractor = graph::extractor::RuleExtractor::new();
+            use graph::extractor::EntityExtractor;
+
+            let mut total_entities = 0;
+            let mut total_edges = 0;
+
+            for entry in &all {
+                let result = extractor.extract(entry);
+                if !result.entities.is_empty() || !result.edges.is_empty() {
+                    st.save_graph(&entry.id, &result.entities, &result.edges)?;
+                    total_entities += result.entities.len();
+                    total_edges += result.edges.len();
+                }
+            }
+
+            let (entity_count, edge_count) = st.graph_stats()?;
+            println!("Backfill complete:");
+            println!("  Processed: {} memories", all.len());
+            println!("  Extracted: {total_entities} entity mentions, {total_edges} edges");
+            println!("  Graph now: {entity_count} unique entities, {edge_count} edges");
         }
         Commands::Mcp => {
             let server = mcp::McpServer::new(config);

@@ -131,6 +131,7 @@ impl McpServer {
             "memory_similar" => self.handle_similar(&req.params, storage, embedder),
             "memory_context" => self.handle_context(&req.params, storage),
             "memory_status" => self.handle_status(storage),
+            "memory_graph" => self.handle_graph(&req.params, storage),
 
             _ => Err(anyhow::anyhow!("Unknown method: {}", req.method)),
         }
@@ -217,6 +218,18 @@ impl McpServer {
                         "type": "object",
                         "properties": {}
                     }
+                },
+                {
+                    "name": "memory_graph",
+                    "description": "Query knowledge graph: find all connections, related memories, and neighbors for an entity",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "entity": {"type": "string", "description": "Entity name to look up (e.g. 'auth', 'postgresql', 'jwt')"},
+                            "list_all": {"type": "boolean", "description": "If true, list all known entities instead of querying one"}
+                        },
+                        "required": ["entity"]
+                    }
                 }
             ]
         }))
@@ -243,6 +256,7 @@ impl McpServer {
             "memory_similar" => self.handle_similar(&arguments, storage, embedder)?,
             "memory_context" => self.handle_context(&arguments, storage)?,
             "memory_status" => self.handle_status(storage)?,
+            "memory_graph" => self.handle_graph(&arguments, storage)?,
             _ => return Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
         };
 
@@ -412,6 +426,68 @@ impl McpServer {
 
         Ok(json!({
             "context": content
+        }))
+    }
+
+    fn handle_graph(&self, params: &Value, storage: &Storage) -> Result<Value> {
+        let entity = params
+            .get("entity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let list_all = params
+            .get("list_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if list_all || entity.is_empty() {
+            let entities = storage.list_entities(50)?;
+            let (entity_count, edge_count) = storage.graph_stats()?;
+            let list: Vec<Value> = entities
+                .iter()
+                .map(|(name, etype, count)| {
+                    json!({"name": name, "type": etype, "mentions": count})
+                })
+                .collect();
+            return Ok(json!({
+                "entities": list,
+                "total_entities": entity_count,
+                "total_edges": edge_count
+            }));
+        }
+
+        let result = storage.graph_query(entity)?;
+        if !result.found {
+            return Ok(json!({
+                "found": false,
+                "entity": entity,
+                "message": "Entity not found. Use list_all=true to see known entities."
+            }));
+        }
+
+        Ok(json!({
+            "found": true,
+            "entity": result.entity_name,
+            "type": result.entity_type,
+            "mentions": result.mention_count,
+            "first_seen": result.first_seen,
+            "last_seen": result.last_seen,
+            "edges": result.edges.iter().map(|e| json!({
+                "source": e.source,
+                "target": e.target,
+                "relation": e.relation,
+                "weight": e.weight
+            })).collect::<Vec<_>>(),
+            "neighbors": result.neighbors.iter().map(|n| json!({
+                "name": n.name,
+                "type": n.entity_type,
+                "mentions": n.mention_count
+            })).collect::<Vec<_>>(),
+            "memories": result.memories.iter().map(|m| json!({
+                "title": m.title,
+                "type": m.memory_type,
+                "importance": m.importance,
+                "timestamp": m.timestamp
+            })).collect::<Vec<_>>()
         }))
     }
 

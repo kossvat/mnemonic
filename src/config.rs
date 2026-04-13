@@ -28,6 +28,16 @@ pub struct WatcherConfig {
     pub ignore_patterns: Vec<String>,
     /// Debounce interval in milliseconds
     pub debounce_ms: u64,
+    /// Enable conversation watcher (Claude Code JSONL sessions)
+    #[serde(default = "default_true")]
+    pub conversation_enabled: bool,
+    /// Directory with Claude Code session JSONL files
+    #[serde(default)]
+    pub conversation_sessions_dir: Option<PathBuf>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,8 +63,13 @@ pub struct OutputConfig {
     pub obsidian_path: PathBuf,
     /// Batch write interval in seconds
     pub batch_interval_secs: u64,
-    // Whisper (Phase 2) — trait OutputSink will handle this
-    // pub whisper_enabled: bool,
+    /// Send to shared Memory API (for cross-agent access)
+    #[serde(default)]
+    pub memory_api_enabled: bool,
+    #[serde(default)]
+    pub memory_api_url: String,
+    #[serde(default)]
+    pub memory_api_key: String,
 }
 
 impl Default for Config {
@@ -92,6 +107,8 @@ impl Default for Config {
                     "*.lock".into(),
                 ],
                 debounce_ms: 500,
+                conversation_enabled: true,
+                conversation_sessions_dir: None, // defaults to ~/.claude/projects/
             },
             classifier: ClassifierConfig {
                 importance_threshold: 0.4,
@@ -106,6 +123,9 @@ impl Default for Config {
                 obsidian_enabled: false,
                 obsidian_path: home.join("Documents/Obsidian/Vault"),
                 batch_interval_secs: 5,
+                memory_api_enabled: false,
+                memory_api_url: String::new(),
+                memory_api_key: String::new(),
             },
         }
     }

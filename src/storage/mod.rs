@@ -6,6 +6,7 @@ use tracing::{debug, info};
 
 use crate::embedding::{Embedding, cosine_similarity, embedding_from_bytes, embedding_to_bytes};
 use crate::event::MemoryEntry;
+use crate::graph::{Edge, Entity};
 
 /// SQLite-backed memory storage (thread-safe via Mutex)
 pub struct Storage {
@@ -77,6 +78,45 @@ impl Storage {
 
         // Migration: add embedding column to existing databases
         Self::migrate_add_column(&conn, "memories", "embedding", "BLOB");
+
+        // Knowledge graph tables
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS entities (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                entity_type TEXT NOT NULL DEFAULT 'concept',
+                mention_count INTEGER NOT NULL DEFAULT 1,
+                first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+                last_seen TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+            CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
+
+            CREATE TABLE IF NOT EXISTS edges (
+                id TEXT PRIMARY KEY,
+                source_entity TEXT NOT NULL,
+                target_entity TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                memory_id TEXT,
+                weight REAL NOT NULL DEFAULT 1.0,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(source_entity, target_entity, relation, memory_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_entity);
+            CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_entity);
+
+            CREATE TABLE IF NOT EXISTS memory_entities (
+                memory_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                PRIMARY KEY (memory_id, entity_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_me_entity ON memory_entities(entity_id);
+            ",
+        )?;
 
         info!("Storage initialized at {:?}", conn.path());
         Ok(())
@@ -428,6 +468,277 @@ impl Storage {
             None => Ok(0),
         }
     }
+
+    // === Knowledge Graph Methods ===
+
+    /// Upsert an entity — create if new, bump mention_count if exists
+    pub fn upsert_entity(&self, entity: &Entity) -> Result<String> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Try to find existing entity by name
+        let existing_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM entities WHERE name = ?1",
+                params![entity.name],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(id) = existing_id {
+            conn.execute(
+                "UPDATE entities SET mention_count = mention_count + 1, last_seen = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+            Ok(id)
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO entities (id, name, entity_type, mention_count, first_seen, last_seen)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?4)",
+                params![id, entity.name, entity.entity_type.to_string(), now],
+            )?;
+            Ok(id)
+        }
+    }
+
+    /// Save an edge between two entities
+    pub fn save_edge(&self, edge: &Edge) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // INSERT OR IGNORE to skip duplicate edges
+        conn.execute(
+            "INSERT OR IGNORE INTO edges (id, source_entity, target_entity, relation, memory_id, weight, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1.0, ?6)",
+            params![id, edge.source, edge.target, edge.relation, edge.memory_id, now],
+        )?;
+
+        // If edge already existed, bump weight
+        conn.execute(
+            "UPDATE edges SET weight = weight + 0.5
+             WHERE source_entity = ?1 AND target_entity = ?2 AND relation = ?3 AND memory_id != ?4",
+            params![edge.source, edge.target, edge.relation, edge.memory_id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Link a memory to an entity
+    pub fn link_memory_entity(&self, memory_id: &str, entity_id: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id) VALUES (?1, ?2)",
+            params![memory_id, entity_id],
+        )?;
+        Ok(())
+    }
+
+    /// Save extraction results: entities, edges, and links to memory
+    pub fn save_graph(
+        &self,
+        memory_id: &str,
+        entities: &[Entity],
+        edges: &[Edge],
+    ) -> Result<()> {
+        for entity in entities {
+            let entity_id = self.upsert_entity(entity)?;
+            self.link_memory_entity(memory_id, &entity_id)?;
+        }
+        for edge in edges {
+            self.save_edge(edge)?;
+        }
+        Ok(())
+    }
+
+    /// Query the graph: find all connections for an entity
+    pub fn graph_query(&self, entity_name: &str) -> Result<GraphResult> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let name_lower = entity_name.to_lowercase();
+
+        // Find the entity
+        let entity_row: Option<(String, String, i64, String, String)> = conn
+            .query_row(
+                "SELECT id, entity_type, mention_count, first_seen, last_seen FROM entities WHERE lower(name) = ?1",
+                params![name_lower],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .ok();
+
+        let (entity_id, entity_type, mention_count, first_seen, last_seen) = match entity_row {
+            Some(r) => r,
+            None => return Ok(GraphResult::not_found(entity_name)),
+        };
+
+        // Find all edges where this entity is source or target
+        let mut edges = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT source_entity, target_entity, relation, weight FROM edges
+                 WHERE source_entity = ?1 OR target_entity = ?1
+                 ORDER BY weight DESC",
+            )?;
+            let rows = stmt.query_map(params![name_lower], |row| {
+                Ok(GraphEdgeResult {
+                    source: row.get(0)?,
+                    target: row.get(1)?,
+                    relation: row.get(2)?,
+                    weight: row.get(3)?,
+                })
+            })?;
+            for row in rows {
+                if let Ok(edge) = row {
+                    edges.push(edge);
+                }
+            }
+        }
+
+        // Find related memories
+        let mut memories = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.title, m.memory_type, m.importance, m.timestamp
+                 FROM memories m
+                 JOIN memory_entities me ON me.memory_id = m.id
+                 WHERE me.entity_id = ?1
+                 ORDER BY m.timestamp DESC
+                 LIMIT 20",
+            )?;
+            let rows = stmt.query_map(params![entity_id], |row| {
+                Ok(GraphMemoryResult {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    memory_type: row.get(2)?,
+                    importance: row.get(3)?,
+                    timestamp: row.get(4)?,
+                })
+            })?;
+            for row in rows {
+                if let Ok(mem) = row {
+                    memories.push(mem);
+                }
+            }
+        }
+
+        // Find connected entities (neighbors)
+        let mut neighbors = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT e.name, e.entity_type, e.mention_count
+                 FROM entities e
+                 JOIN edges ed ON (ed.source_entity = e.name OR ed.target_entity = e.name)
+                 WHERE (ed.source_entity = ?1 OR ed.target_entity = ?1)
+                   AND e.name != ?1
+                 ORDER BY e.mention_count DESC
+                 LIMIT 20",
+            )?;
+            let rows = stmt.query_map(params![name_lower], |row| {
+                Ok(GraphNeighbor {
+                    name: row.get(0)?,
+                    entity_type: row.get(1)?,
+                    mention_count: row.get(2)?,
+                })
+            })?;
+            for row in rows {
+                if let Ok(n) = row {
+                    neighbors.push(n);
+                }
+            }
+        }
+
+        Ok(GraphResult {
+            entity_name: name_lower,
+            entity_type,
+            mention_count,
+            first_seen,
+            last_seen,
+            edges,
+            memories,
+            neighbors,
+            found: true,
+        })
+    }
+
+    /// List all entities, sorted by mention count
+    pub fn list_entities(&self, limit: usize) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT name, entity_type, mention_count FROM entities ORDER BY mention_count DESC LIMIT ?1",
+        )?;
+        let rows: Vec<(String, String, i64)> = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Count entities and edges
+    pub fn graph_stats(&self) -> Result<(usize, usize)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let entities: i64 =
+            conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
+        let edges: i64 =
+            conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))?;
+        Ok((entities as usize, edges as usize))
+    }
+}
+
+// === Graph Result Types ===
+
+#[derive(Debug, serde::Serialize)]
+pub struct GraphResult {
+    pub entity_name: String,
+    pub entity_type: String,
+    pub mention_count: i64,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub edges: Vec<GraphEdgeResult>,
+    pub memories: Vec<GraphMemoryResult>,
+    pub neighbors: Vec<GraphNeighbor>,
+    pub found: bool,
+}
+
+impl GraphResult {
+    fn not_found(name: &str) -> Self {
+        Self {
+            entity_name: name.to_string(),
+            entity_type: String::new(),
+            mention_count: 0,
+            first_seen: String::new(),
+            last_seen: String::new(),
+            edges: Vec::new(),
+            memories: Vec::new(),
+            neighbors: Vec::new(),
+            found: false,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct GraphEdgeResult {
+    pub source: String,
+    pub target: String,
+    pub relation: String,
+    pub weight: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct GraphMemoryResult {
+    pub id: String,
+    pub title: String,
+    pub memory_type: String,
+    pub importance: f64,
+    pub timestamp: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct GraphNeighbor {
+    pub name: String,
+    pub entity_type: String,
+    pub mention_count: i64,
 }
 
 struct StorageRow {

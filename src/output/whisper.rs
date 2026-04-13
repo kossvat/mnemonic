@@ -107,6 +107,43 @@ impl Whisper {
             sections.push(String::new());
         }
 
+        // Knowledge Graph summary (top entities with connections)
+        if let Ok((entity_count, edge_count)) = storage.graph_stats() {
+            if entity_count > 0 {
+                sections.push("## Knowledge Graph\n".into());
+                if let Ok(top_entities) = storage.list_entities(10) {
+                    for (name, etype, count) in &top_entities {
+                        if *count >= 2 {
+                            // Only show entities mentioned 2+ times
+                            sections.push(format!(
+                                "- **{}** ({}, {} mentions)",
+                                name, etype, count
+                            ));
+
+                            // Show neighbors for high-mention entities
+                            if let Ok(graph) = storage.graph_query(name) {
+                                if graph.found && !graph.neighbors.is_empty() {
+                                    let neighbor_names: Vec<String> = graph.neighbors
+                                        .iter()
+                                        .take(5)
+                                        .map(|n| n.name.clone())
+                                        .collect();
+                                    sections.push(format!(
+                                        "  → connected to: {}",
+                                        neighbor_names.join(", ")
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                sections.push(format!(
+                    "\n_Graph: {} entities, {} edges_\n",
+                    entity_count, edge_count
+                ));
+            }
+        }
+
         // Stats
         if let Ok(stats) = storage.stats() {
             sections.push(format!(

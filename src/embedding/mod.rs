@@ -12,7 +12,6 @@ pub trait Embedder: Send + Sync {
 
 /// Hash-based embedder using weighted SimHash + TF-IDF-like features.
 /// Zero dependencies, <1ms per call, good enough for dedup (cosine > 0.92).
-/// Swap to MiniLM-L6-v2 in Phase 2 when ONNX Runtime is stable on macOS.
 pub struct HashEmbedder;
 
 impl HashEmbedder {
@@ -25,6 +24,58 @@ impl Embedder for HashEmbedder {
     fn embed(&self, text: &str) -> Result<Embedding> {
         Ok(hash_embed(text))
     }
+}
+
+/// Neural embedder using all-MiniLM-L6-v2 via fastembed (ONNX Runtime).
+/// 384-dim real semantic embeddings. ~5ms per call.
+/// Enable with: cargo build --features neural
+#[cfg(feature = "neural")]
+pub struct NeuralEmbedder {
+    model: fastembed::TextEmbedding,
+}
+
+#[cfg(feature = "neural")]
+impl NeuralEmbedder {
+    pub fn new() -> Result<Self> {
+        use fastembed::{InitOptions, EmbeddingModel};
+        let model = fastembed::TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+                .with_show_download_progress(true),
+        )?;
+        Ok(Self { model })
+    }
+}
+
+#[cfg(feature = "neural")]
+impl Embedder for NeuralEmbedder {
+    fn embed(&self, text: &str) -> Result<Embedding> {
+        let results = self.model.embed(vec![text], None)?;
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No embedding returned"))
+    }
+}
+
+/// Create the best available embedder based on compiled features.
+/// With --features neural: NeuralEmbedder (384-dim, semantic).
+/// Without: HashEmbedder (256-dim, hash-based).
+pub fn create_embedder() -> Result<Box<dyn Embedder>> {
+    #[cfg(feature = "neural")]
+    {
+        match NeuralEmbedder::new() {
+            Ok(e) => {
+                tracing::info!("Using neural embedder (all-MiniLM-L6-v2, 384-dim)");
+                return Ok(Box::new(e));
+            }
+            Err(e) => {
+                tracing::warn!("Neural embedder failed to load: {e}. Falling back to hash embedder.");
+            }
+        }
+    }
+
+    tracing::info!("Using hash embedder (256-dim)");
+    Ok(Box::new(HashEmbedder::new()))
 }
 
 /// Generate a 256-dim embedding from text using feature hashing (SimHash-style).

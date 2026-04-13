@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Background memory daemon for AI coding agents. Watches your project, captures decisions, and builds persistent memory automatically."
 license = "MIT"
-repository = "https://github.com/AgentForgeAI/mnemonic"
-homepage = "https://github.com/AgentForgeAI/mnemonic"
+repository = "https://github.com/kossvat/mnemonic"
+homepage = "https://github.com/kossvat/mnemonic"
 keywords = ["ai", "memory", "claude", "agent", "mcp"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
@@ -55,3 +55,13 @@ http-body-util = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 urlencoding = "2"
 libc = "0.2"
+
+# HTTP client (for Memory API sync)
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+
+# Neural embeddings (optional — adds ~20MB to binary, downloads 23MB model on first use)
+fastembed = { version = "4", optional = true }
+
+[features]
+default = []
+neural = ["fastembed"]

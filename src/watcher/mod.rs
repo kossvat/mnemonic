@@ -1,3 +1,4 @@
+pub mod conversation;
 pub mod files;
 pub mod git;
 

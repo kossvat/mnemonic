@@ -177,6 +177,17 @@ impl super::Classifier for RuleClassifier {
                 entry.tags = vec!["session".into()];
                 Some(entry)
             }
+            EventKind::Custom(s) if s == "conversation_decision" => {
+                let mut entry = MemoryEntry::new(
+                    "Conversation decision",
+                    &event.content,
+                    MemoryType::Decision,
+                    event.source.clone(),
+                );
+                entry.importance = 0.7;
+                entry.tags = vec!["decision".into(), "conversation".into()];
+                Some(entry)
+            }
             _ => None,
         }
     }
