@@ -7,6 +7,13 @@ struct DailyCount: Identifiable {
     let count: Int
 }
 
+struct GraphEntity: Identifiable {
+    let id = UUID()
+    let name: String
+    let type: String
+    let mentions: Int
+}
+
 struct MemoryStats {
     var total: Int = 0
     var decisions: Int = 0
@@ -20,6 +27,9 @@ struct MemoryStats {
     var daily: [DailyCount] = []
     var silentHours: Double? = nil
     var lastActivity: String? = nil
+    var graphEntities: Int = 0
+    var graphEdges: Int = 0
+    var topEntities: [GraphEntity] = []
 }
 
 struct MemoryEntry: Identifiable {
@@ -108,6 +118,18 @@ class MnemonicService: ObservableObject {
                 guard let date = item["date"] as? String,
                       let count = item["count"] as? Int else { return nil }
                 return DailyCount(date: date, count: count)
+            }
+        }
+
+        stats.graphEntities = json["graph_entities"] as? Int ?? 0
+        stats.graphEdges = json["graph_edges"] as? Int ?? 0
+
+        if let entities = json["top_entities"] as? [[String: Any]] {
+            stats.topEntities = entities.compactMap { item in
+                guard let name = item["name"] as? String,
+                      let type = item["type"] as? String,
+                      let mentions = item["mentions"] as? Int else { return nil }
+                return GraphEntity(name: name, type: type, mentions: mentions)
             }
         }
 

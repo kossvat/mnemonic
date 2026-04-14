@@ -41,6 +41,13 @@ struct MenuBarView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
 
+                // Knowledge Graph
+                if service.stats.graphEntities > 0 {
+                    graphSection
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 4)
+                }
+
                 // Last activity info
                 lastActivityRow
                     .padding(.horizontal, 12)
@@ -85,7 +92,7 @@ struct MenuBarView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Mnemonic")
                     .font(.system(size: 13, weight: .semibold))
-                Text("\(service.stats.total) memories")
+                Text("\(service.stats.total) memories · \(service.stats.graphEntities) entities")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -343,6 +350,67 @@ struct MenuBarView: View {
         actionFeedback = text
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
             actionFeedback = nil
+        }
+    }
+
+    // MARK: - Knowledge Graph
+
+    private var graphSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.purple)
+                Text("KNOWLEDGE GRAPH")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Spacer()
+                Text("\(service.stats.graphEntities)n / \(service.stats.graphEdges)e")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+
+            if !service.stats.topEntities.isEmpty {
+                ForEach(service.stats.topEntities) { entity in
+                    HStack(spacing: 6) {
+                        Image(systemName: iconForEntityType(entity.type))
+                            .font(.system(size: 9))
+                            .foregroundStyle(colorForEntityType(entity.type))
+                            .frame(width: 14)
+                        Text(entity.name)
+                            .font(.system(size: 11))
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(entity.mentions)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.vertical, 1)
+                }
+            }
+        }
+    }
+
+    private func iconForEntityType(_ type: String) -> String {
+        switch type {
+        case "project": return "folder.fill"
+        case "tech": return "wrench.and.screwdriver.fill"
+        case "module": return "puzzlepiece.fill"
+        case "file": return "doc.fill"
+        case "person": return "person.fill"
+        default: return "tag.fill"
+        }
+    }
+
+    private func colorForEntityType(_ type: String) -> Color {
+        switch type {
+        case "project": return .purple
+        case "tech": return .blue
+        case "module": return .green
+        case "file": return .gray
+        case "person": return .orange
+        default: return .secondary
         }
     }
 

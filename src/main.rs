@@ -169,6 +169,8 @@ enum Commands {
     Mcp,
     /// Generate default config file
     Init,
+    /// Rebuild and install binary + restart widget
+    Upgrade,
 }
 
 #[tokio::main]
@@ -544,6 +546,16 @@ async fn main() -> Result<()> {
             let (saved, with_emb) = st.dedup_estimate()?;
             let is_running = Daemon::is_running(&config);
 
+            // Graph stats
+            let (graph_entities, graph_edges) = st.graph_stats().unwrap_or((0, 0));
+            let top_entities: Vec<serde_json::Value> = st.list_entities(5)
+                .unwrap_or_default()
+                .iter()
+                .map(|(name, etype, count)| {
+                    serde_json::json!({"name": name, "type": etype, "mentions": count})
+                })
+                .collect();
+
             if json {
                 let daily_json: Vec<serde_json::Value> = daily
                     .iter()
@@ -579,6 +591,9 @@ async fn main() -> Result<()> {
                     "with_embeddings": with_emb,
                     "daemon_running": is_running.is_some(),
                     "daemon_pid": is_running,
+                    "graph_entities": graph_entities,
+                    "graph_edges": graph_edges,
+                    "top_entities": top_entities,
                 });
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
@@ -599,6 +614,10 @@ async fn main() -> Result<()> {
                         let bar: String = "█".repeat(bar_len);
                         println!("  {date} {bar} {count}");
                     }
+                }
+
+                if graph_entities > 0 {
+                    println!("\nKnowledge graph: {graph_entities} entities, {graph_edges} edges");
                 }
 
                 if let Some(pid) = is_running {
@@ -705,8 +724,87 @@ async fn main() -> Result<()> {
             default_config.save(&config_path)?;
             println!("Config written to: {}", config_path.display());
         }
+        Commands::Upgrade => {
+            upgrade()?;
+        }
     }
 
+    Ok(())
+}
+
+fn upgrade() -> Result<()> {
+    let home = dirs::home_dir().unwrap_or_default();
+
+    // Find source dir: either current dir (if Cargo.toml exists) or standard location
+    let source_dir = {
+        let cwd = std::env::current_dir()?;
+        if cwd.join("Cargo.toml").exists() {
+            cwd
+        } else {
+            // Try standard dev location
+            let dev_path = home.join("Claude-Agents/dev/mnemonic");
+            if dev_path.join("Cargo.toml").exists() {
+                dev_path
+            } else {
+                anyhow::bail!(
+                    "Cannot find mnemonic source. Run from the source directory or ensure ~/Claude-Agents/dev/mnemonic exists."
+                );
+            }
+        }
+    };
+
+    println!("1/4  Building release binary...");
+    let status = std::process::Command::new("cargo")
+        .args(["install", "--path", "."])
+        .current_dir(&source_dir)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("cargo install failed");
+    }
+    println!("     Binary installed to ~/.cargo/bin/mnemonic");
+
+    // Restart daemon if running
+    println!("2/4  Restarting daemon...");
+    let _ = std::process::Command::new(home.join(".cargo/bin/mnemonic"))
+        .arg("stop")
+        .status();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let _ = std::process::Command::new(home.join(".cargo/bin/mnemonic"))
+        .args(["start", "-d"])
+        .status();
+
+    // Rebuild widget if source exists
+    let widget_dir = source_dir.join("clients/macos");
+    if widget_dir.join("Package.swift").exists() {
+        println!("3/4  Rebuilding widget...");
+
+        // Kill old widget
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "MnemonicBar"])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let status = std::process::Command::new("swift")
+            .args(["build"])
+            .current_dir(&widget_dir)
+            .status()?;
+        if !status.success() {
+            eprintln!("     Widget build failed, skipping");
+        } else {
+            println!("4/4  Launching widget...");
+            let _ = std::process::Command::new(widget_dir.join(".build/debug/MnemonicBar"))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .stdin(std::process::Stdio::null())
+                .spawn();
+            println!("     Widget launched");
+        }
+    } else {
+        println!("3/4  Widget source not found, skipping");
+        println!("4/4  Done");
+    }
+
+    println!("\nUpgrade complete!");
     Ok(())
 }
 
