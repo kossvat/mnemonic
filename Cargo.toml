@@ -62,6 +62,10 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 # Neural embeddings (optional — adds ~20MB to binary, downloads 23MB model on first use)
 fastembed = { version = "4", optional = true }
 
+# HNSW approximate nearest neighbor search
+hnsw_rs = "0.3"
+anndists = "0.1"
+
 [features]
 default = []
 neural = ["fastembed"]

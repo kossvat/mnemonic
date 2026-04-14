@@ -138,7 +138,8 @@ MCP tools: `memory_search`, `memory_save`, `memory_recent`, `memory_similar`, `m
                 ┌──────────────┐       ┌─────────────┐
                 │   Storage    │◄─────►│  Knowledge  │
                 │ (SQLite+FTS) │       │    Graph    │
-                └──────┬───────┘       └─────────────┘
+                │  + HNSW idx  │       └─────────────┘
+                └──────┬───────┘
                        │
            ┌───────────┼───────────┬───────────┐
            ▼           ▼           ▼           ▼
@@ -154,7 +155,7 @@ MCP tools: `memory_search`, `memory_save`, `memory_recent`, `memory_similar`, `m
 1. **Watch** — File watcher (FSEvents/inotify), Git watcher (polling HEAD), and Conversation watcher (Claude Code JSONL) emit events
 2. **Batch** — Events collected in 5-second batches (urgent events like corrections bypass)
 3. **Classify** — Rule-based classifier determines type and base importance
-4. **Embed** — Hash (256-dim) or neural (384-dim MiniLM-L6-v2) embedding for dedup + similarity
+4. **Embed** — Hash (256-dim) or neural (384-dim MiniLM-L6-v2) embedding, indexed via HNSW for O(log n) search
 5. **Score** — Dynamic importance: `frequency × 0.3 + recency × 0.3 + signal × 0.4`
 6. **Dedup** — Skip if cosine similarity > 0.92 with existing memory
 7. **Extract** — Rule-based entity extraction builds knowledge graph (projects, tech, modules, relationships)
@@ -312,6 +313,7 @@ See [clients/macos/README.md](clients/macos/README.md) for details.
 - [x] Conversation watcher (Claude Code JSONL session monitoring)
 - [x] Memory API sync (cross-agent shared memory)
 - [x] Graph-aware context generation (entities + neighbors in CONTEXT.md)
+- [x] HNSW vector index (`hnsw_rs`) — O(log n) approximate nearest neighbor search, scales to 50K+ memories
 - [ ] LLM-based entity extraction (Claude/Gemini for richer graph)
 - [ ] Obsidian graph sync (export knowledge graph as linked notes)
 - [ ] Web UI for browsing memories

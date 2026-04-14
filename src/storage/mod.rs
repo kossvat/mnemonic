@@ -1,3 +1,5 @@
+pub mod hnsw_index;
+
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::path::Path;
@@ -8,9 +10,13 @@ use crate::embedding::{Embedding, cosine_similarity, embedding_from_bytes, embed
 use crate::event::MemoryEntry;
 use crate::graph::{Edge, Entity};
 
+use self::hnsw_index::HnswIndex;
+
 /// SQLite-backed memory storage (thread-safe via Mutex)
+/// Vector search uses HNSW index for O(log n) approximate nearest neighbor.
 pub struct Storage {
     pub(crate) conn: Mutex<Connection>,
+    hnsw: Mutex<HnswIndex>,
 }
 
 impl Storage {
@@ -20,11 +26,44 @@ impl Storage {
         }
 
         let conn = Connection::open(path)?;
+        let hnsw = HnswIndex::new(50_000);
         let storage = Self {
             conn: Mutex::new(conn),
+            hnsw: Mutex::new(hnsw),
         };
         storage.init_schema()?;
+        storage.rebuild_hnsw_index()?;
         Ok(storage)
+    }
+
+    /// Rebuild HNSW index from all embeddings in SQLite.
+    /// Called once on startup — O(n) scan, then O(log n) searches.
+    fn rebuild_hnsw_index(&self) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL",
+        )?;
+
+        let rows: Vec<(String, Vec<u8>)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let count = rows.len();
+        if count == 0 {
+            return Ok(());
+        }
+
+        let mut hnsw = self.hnsw.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        for (id, blob) in &rows {
+            let embedding = embedding_from_bytes(blob);
+            hnsw.insert(id, &embedding);
+        }
+
+        info!("HNSW index rebuilt: {count} vectors indexed");
+        Ok(())
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -158,12 +197,36 @@ impl Storage {
                 blob,
             ],
         )?;
+        drop(conn);
+
+        // Add to HNSW index
+        if let Some(emb) = embedding {
+            if let Ok(mut hnsw) = self.hnsw.lock() {
+                hnsw.insert(&entry.id, emb);
+            }
+        }
         Ok(())
     }
 
     /// Check if a similar memory already exists (cosine > threshold).
     /// Returns Some(similarity) if duplicate found, None if unique.
+    /// Uses HNSW for fast check, falls back to brute-force.
     pub fn is_duplicate(&self, embedding: &Embedding, threshold: f32) -> Result<Option<f32>> {
+        // Try HNSW first — check top-1 neighbor
+        if let Ok(hnsw) = self.hnsw.lock() {
+            if !hnsw.is_empty() {
+                let results = hnsw.search(embedding, 1);
+                if let Some((_, similarity)) = results.first() {
+                    if *similarity >= threshold {
+                        debug!("HNSW duplicate found: cosine={similarity:.4} >= threshold={threshold:.4}");
+                        return Ok(Some(*similarity));
+                    }
+                }
+                return Ok(None);
+            }
+        }
+
+        // Fallback: brute-force scan
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT embedding FROM memories WHERE embedding IS NOT NULL ORDER BY timestamp DESC LIMIT 200",
@@ -186,8 +249,61 @@ impl Storage {
         Ok(None)
     }
 
-    /// Find memories most similar to a given embedding
+    /// Find memories most similar to a given embedding.
+    /// Uses HNSW index for O(log n) approximate nearest neighbor search.
+    /// Falls back to brute-force scan if HNSW index is empty.
     pub fn find_similar(
+        &self,
+        embedding: &Embedding,
+        limit: usize,
+    ) -> Result<Vec<(MemoryEntry, f32)>> {
+        // Try HNSW first
+        let hnsw_results = self.hnsw.lock()
+            .map_err(|e| anyhow::anyhow!("lock: {e}"))?
+            .search(embedding, limit);
+
+        if !hnsw_results.is_empty() {
+            debug!("HNSW search returned {} results", hnsw_results.len());
+            let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            let mut results = Vec::new();
+
+            for (memory_id, similarity) in &hnsw_results {
+                let row = conn.query_row(
+                    "SELECT id, timestamp, title, content, memory_type, tags, source, importance, metadata
+                     FROM memories WHERE id = ?1",
+                    params![memory_id],
+                    |row| {
+                        Ok(StorageRow {
+                            id: row.get(0)?,
+                            timestamp: row.get(1)?,
+                            title: row.get(2)?,
+                            content: row.get(3)?,
+                            memory_type: row.get(4)?,
+                            tags: row.get(5)?,
+                            source: row.get(6)?,
+                            importance: row.get(7)?,
+                            metadata: row.get(8)?,
+                        })
+                    },
+                );
+
+                if let Ok(row) = row {
+                    if let Ok(entry) = row.into_memory_entry() {
+                        results.push((entry, *similarity));
+                    }
+                }
+            }
+
+            return Ok(results);
+        }
+
+        // Fallback: brute-force scan (for empty index or edge cases)
+        debug!("HNSW empty, falling back to brute-force scan");
+        self.find_similar_bruteforce(embedding, limit)
+    }
+
+    /// Brute-force similarity scan — fallback when HNSW is empty
+    fn find_similar_bruteforce(
         &self,
         embedding: &Embedding,
         limit: usize,
@@ -198,7 +314,7 @@ impl Storage {
              FROM memories WHERE embedding IS NOT NULL",
         )?;
 
-        let mut scored: Vec<(StorageRow, Vec<u8>, f32)> = stmt
+        let mut scored: Vec<(StorageRow, f32)> = stmt
             .query_map([], |row| {
                 Ok((
                     StorageRow {
@@ -219,17 +335,16 @@ impl Storage {
             .map(|(row, blob)| {
                 let existing = embedding_from_bytes(&blob);
                 let sim = cosine_similarity(embedding, &existing);
-                (row, blob, sim)
+                (row, sim)
             })
             .collect();
 
-        // Sort by similarity descending
-        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
 
         let results: Vec<(MemoryEntry, f32)> = scored
             .into_iter()
-            .filter_map(|(row, _, sim)| row.into_memory_entry().ok().map(|e| (e, sim)))
+            .filter_map(|(row, sim)| row.into_memory_entry().ok().map(|e| (e, sim)))
             .collect();
 
         Ok(results)
