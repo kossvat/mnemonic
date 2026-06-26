@@ -1,0 +1,114 @@
+[
+  {
+    "title": "Inventory Labeler pricing decision",
+    "content": "Decision: flat $2k for the Inventory Labeler app, client Acme Devices, stack Rust + Postgres, device grading workflow.",
+    "memory_type": "decision",
+    "expected_entities": ["inventory-labeler", "acme-devices", "rust", "postgres", "device-grading"],
+    "expected_relations": [
+      ["inventory-labeler", "acme-devices", "owns"],
+      ["inventory-labeler", "rust", "uses"],
+      ["inventory-labeler", "postgres", "uses"]
+    ]
+  },
+  {
+    "title": "Supplier Parser demo shipped to Vercel",
+    "content": "Supplier Parser proof demo deployed to supplier-parser-demo.vercel.app. Client contact reviewed login flow, pricing proposal ready.",
+    "memory_type": "decision",
+    "expected_entities": ["supplier-parser", "vercel", "client-contact", "pricing-proposal"],
+    "expected_relations": [
+      ["supplier-parser", "vercel", "uses"],
+      ["supplier-parser", "client-contact", "owns"]
+    ]
+  },
+  {
+    "title": "Dev Server disk cleanup",
+    "content": "Dev Server root disk /dev/vda1 was 100 percent full and cleanup reduced it to 76 percent. Memory API depends on the dev server.",
+    "memory_type": "note",
+    "expected_entities": ["dev-server", "memory-api", "disk-cleanup"],
+    "expected_relations": [
+      ["memory-api", "dev-server", "depends_on"],
+      ["disk-cleanup", "dev-server", "related_to"]
+    ]
+  },
+  {
+    "title": "Voice Assistant migration blocker",
+    "content": "Voice Assistant migration from provider X to provider Y is blocked because BYOT is required. Keep the prompt-sync layer intact.",
+    "memory_type": "decision",
+    "expected_entities": ["voice-assistant", "provider-x", "provider-y", "byot", "prompt-sync"],
+    "expected_relations": [
+      ["voice-assistant", "provider-x", "replaces"],
+      ["voice-assistant", "provider-y", "depends_on"],
+      ["byot", "voice-assistant", "blocks"],
+      ["voice-assistant", "prompt-sync", "uses"]
+    ]
+  },
+  {
+    "title": "Media Pipeline image-to-video step",
+    "content": "Media Pipeline uses ImageGen API with reference-driven motion transfer for short-form reels. The pipeline runs through the viral-reels producer skill.",
+    "memory_type": "note",
+    "expected_entities": ["media-pipeline", "imagegen", "motion-transfer", "viral-reels-producer"],
+    "expected_relations": [
+      ["media-pipeline", "imagegen", "uses"],
+      ["media-pipeline", "motion-transfer", "uses"],
+      ["viral-reels-producer", "media-pipeline", "part_of"]
+    ]
+  },
+  {
+    "title": "Inventory Labeler receipt upload correction",
+    "content": "User correction: Inventory Labeler must accept both PDF and a low-quality receipt photo; the parser should handle both formats.",
+    "memory_type": "feedback",
+    "expected_entities": ["inventory-labeler", "pdf", "receipt-photo", "parser"],
+    "expected_relations": [
+      ["inventory-labeler", "pdf", "uses"],
+      ["inventory-labeler", "receipt-photo", "uses"],
+      ["parser", "receipt-photo", "depends_on"]
+    ]
+  },
+  {
+    "title": "Internal CRM task lookup source",
+    "content": "Internal CRM tasks live in PostgreSQL on the Dev Server, not GitHub Issues or Linear. Agents should query the database first.",
+    "memory_type": "decision",
+    "expected_entities": ["internal-crm", "postgresql", "dev-server", "github", "linear"],
+    "expected_relations": [
+      ["internal-crm", "postgresql", "uses"],
+      ["postgresql", "dev-server", "depends_on"],
+      ["internal-crm", "github", "related_to"],
+      ["internal-crm", "linear", "related_to"]
+    ]
+  },
+  {
+    "title": "Cross-agent sync live",
+    "content": "Mnemonic sends every memory to the shared Memory API on the Dev Server so agents A, B, and C can search the same store.",
+    "memory_type": "decision",
+    "expected_entities": ["mnemonic", "memory-api", "dev-server", "agent-a", "agent-b", "agent-c"],
+    "expected_relations": [
+      ["mnemonic", "memory-api", "uses"],
+      ["memory-api", "dev-server", "depends_on"],
+      ["agent-a", "memory-api", "uses"],
+      ["agent-b", "memory-api", "uses"]
+    ]
+  },
+  {
+    "title": "ConsultingCo service pricing",
+    "content": "ConsultingCo strategy is service, not DIY. Personal tier starts at $500, Business tier starts at $2000, security is a selling point.",
+    "memory_type": "decision",
+    "expected_entities": ["consultingco", "personal-tier", "business-tier", "security"],
+    "expected_relations": [
+      ["consultingco", "personal-tier", "costs"],
+      ["consultingco", "business-tier", "costs"],
+      ["security", "consultingco", "part_of"]
+    ]
+  },
+  {
+    "title": "Mnemonic retrieval architecture",
+    "content": "Mnemonic retrieval now fuses BM25, HNSW vector search, and graph hop via RRF. Whisper context prints source citations.",
+    "memory_type": "decision",
+    "expected_entities": ["mnemonic", "bm25", "hnsw", "vector-search", "graph-hop", "rrf", "whisper"],
+    "expected_relations": [
+      ["mnemonic", "bm25", "uses"],
+      ["mnemonic", "hnsw", "uses"],
+      ["mnemonic", "graph-hop", "uses"],
+      ["whisper", "mnemonic", "part_of"]
+    ]
+  }
+]

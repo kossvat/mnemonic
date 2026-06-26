@@ -1,0 +1,46 @@
+# Mnemonic retrieval eval seed (example / public).
+#
+# This file ships with the repo so `mnemonic eval` works out of the box,
+# but the queries reference *example* topics, not your real memories.
+# After you've been running mnemonic for a few weeks, copy this file to
+# `queries.local.jsonl` (gitignored) and replace these rows with queries
+# that match what you actually search for. The eval harness reads
+# whichever file you pass via --file, defaulting to this one.
+#
+# Format: one JSON object per non-comment line.
+#   {"query", "expected_ids"?, "expected_title_contains"?, "tags"?}
+#
+# A returned memory counts as relevant when its id is in expected_ids OR
+# its title contains (case-insensitive) any string in expected_title_contains.
+#
+# Two relevance modes:
+#   - expected_ids:  set retrieval — denominator = expected_ids.len()
+#   - expected_title_contains: presence retrieval — denominator = 1
+#                              (collapses to "did any matching title
+#                              appear in top-k")
+#
+# Substring mode is easier to maintain because memory ids drift across
+# reflection runs and reembed. Switch to expected_ids when a query's
+# relevant memories are stable.
+
+# === project / service retrieval (rule-based + graph entity boost) ===
+{"query": "auth service jwt rotation", "expected_title_contains": ["auth", "jwt"], "tags": ["auth", "security"]}
+{"query": "billing tier pricing decision", "expected_title_contains": ["billing", "pricing", "tier"], "tags": ["billing", "decision"]}
+{"query": "checkout flow redesign", "expected_title_contains": ["checkout", "flow"], "tags": ["product"]}
+{"query": "api gateway timeout config", "expected_title_contains": ["api", "gateway", "timeout"], "tags": ["infra"]}
+{"query": "search relevance evaluation", "expected_title_contains": ["search", "relevance", "eval"], "tags": ["retrieval"]}
+
+# === decision retrieval (memory_type=decision should rank up) ===
+{"query": "database migration plan", "expected_title_contains": ["migration", "database"], "tags": ["infra", "decision"]}
+{"query": "framework choice react vs vue", "expected_title_contains": ["react", "vue", "framework"], "tags": ["frontend", "decision"]}
+
+# === feedback / corrections (user-correction memory_type) ===
+{"query": "destructive git command", "expected_title_contains": ["git", "destructive", "force"], "tags": ["feedback", "git"]}
+{"query": "do not commit secrets", "expected_title_contains": ["secret", "commit", "credentials"], "tags": ["feedback", "security"]}
+
+# === tool / tech-stack retrieval ===
+{"query": "rust async runtime tokio", "expected_title_contains": ["rust", "tokio", "async"], "tags": ["tech"]}
+{"query": "sqlite fts5 query syntax", "expected_title_contains": ["sqlite", "fts", "query"], "tags": ["tech"]}
+
+# === mnemonic self-reference (exercises graph hop on known entities) ===
+{"query": "mnemonic llm extractor reextract", "expected_title_contains": ["mnemonic", "extractor", "llm"], "tags": ["mnemonic"]}
