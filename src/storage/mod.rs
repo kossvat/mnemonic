@@ -2419,7 +2419,7 @@ impl Storage {
             limit,
         )?);
         // Callers rely on newest-first ordering (the digest's Latest section).
-        rows.sort_by(|a, b| b.entry.timestamp.cmp(&a.entry.timestamp));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.entry.timestamp));
         Ok(rows)
     }
 
