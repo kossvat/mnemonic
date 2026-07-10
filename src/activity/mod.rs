@@ -193,6 +193,11 @@ const MIN_SESSION_SECS: f64 = 60.0;
 /// SQLite-backed activity store (own file, thread-safe via Mutex).
 pub struct ActivityStore {
     conn: Mutex<Connection>,
+    /// Closed sessions shorter than this are deleted instead of kept
+    /// (phantom idle-counter blips from peripherals/utilities). Only the
+    /// daemon's writer store sets this; read/reporting opens keep 0 so
+    /// they never delete anything.
+    min_session_secs: f64,
 }
 
 impl ActivityStore {
@@ -208,8 +213,12 @@ impl ActivityStore {
     /// state by a previous daemon run is finalized at its stored end —
     /// we never resume across a process restart, which guarantees
     /// downtime can't be folded into a work span.
-    pub fn open_for_daemon(path: &Path) -> Result<Self> {
-        let store = Self::open_inner(path)?;
+    ///
+    /// `min_session_secs`: closed sessions shorter than this are dropped
+    /// (phantom idle blips). 0 keeps everything.
+    pub fn open_for_daemon(path: &Path, min_session_secs: u64) -> Result<Self> {
+        let mut store = Self::open_inner(path)?;
+        store.min_session_secs = min_session_secs as f64;
         store.close_open_sessions()?;
         Ok(store)
     }
@@ -225,6 +234,7 @@ impl ActivityStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         let store = Self {
             conn: Mutex::new(conn),
+            min_session_secs: 0.0,
         };
         store.init_schema()?;
         Ok(store)
@@ -264,11 +274,37 @@ impl ActivityStore {
 
     /// Finalize every still-open session. Called on startup so a crash
     /// or restart can never leave a span that later ticks would extend
-    /// across the downtime.
+    /// across the downtime. Sessions below the minimum are dropped
+    /// rather than finalized.
     pub fn close_open_sessions(&self) -> Result<usize> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        if self.min_session_secs > 0.0 {
+            conn.execute(
+                "DELETE FROM work_sessions WHERE open = 1
+                 AND (julianday(ended_at) - julianday(started_at)) * 86400.0 < ?1",
+                [self.min_session_secs],
+            )?;
+        }
         let n = conn.execute("UPDATE work_sessions SET open = 0 WHERE open = 1", [])?;
         Ok(n)
+    }
+
+    /// Finalize one session by id: drop it when shorter than the minimum,
+    /// otherwise mark it closed. The duration check runs on the STORED
+    /// timestamps, so it is exact regardless of tick timing.
+    fn finalize_session(&self, conn: &Connection, id: &str) -> Result<()> {
+        if self.min_session_secs > 0.0 {
+            let dropped = conn.execute(
+                "DELETE FROM work_sessions WHERE id = ?1
+                 AND (julianday(ended_at) - julianday(started_at)) * 86400.0 < ?2",
+                rusqlite::params![id, self.min_session_secs],
+            )?;
+            if dropped > 0 {
+                return Ok(());
+            }
+        }
+        conn.execute("UPDATE work_sessions SET open = 0 WHERE id = ?1", [id])?;
+        Ok(())
     }
 
     /// The currently-open session, if any.
@@ -338,14 +374,11 @@ impl ActivityStore {
                 }))
             }
             TickAction::Close { id } => {
-                conn.execute("UPDATE work_sessions SET open = 0 WHERE id = ?1", [id])?;
+                self.finalize_session(&conn, id)?;
                 Ok(None)
             }
             TickAction::Rotate { close_id, open } => {
-                conn.execute(
-                    "UPDATE work_sessions SET open = 0 WHERE id = ?1",
-                    [close_id],
-                )?;
+                self.finalize_session(&conn, close_id)?;
                 conn.execute(
                     "INSERT OR REPLACE INTO work_sessions (id, started_at, ended_at, open)
                      VALUES (?1, ?2, ?3, 1)",
@@ -1129,6 +1162,111 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
+    /// Phantom idle blips (peripherals resetting the idle counter for an
+    /// instant) produce 0-second sessions. With a minimum configured, the
+    /// writer store drops them at finalize time; real sessions survive.
+    #[test]
+    fn short_sessions_are_dropped_on_finalize() {
+        let dir = std::env::temp_dir().join(format!("act-{}.db", uuid::Uuid::new_v4()));
+        let store = ActivityStore::open_for_daemon(&dir, 30).unwrap();
+        let start = Utc::now() - chrono::Duration::hours(2);
+
+        // 1) Zero-length blip: Open then immediate Close → row deleted.
+        store
+            .apply(&TickAction::Open(WorkSession {
+                id: "blip".into(),
+                started_at: start,
+                last_input_at: start,
+            }))
+            .unwrap();
+        store
+            .apply(&TickAction::Close { id: "blip".into() })
+            .unwrap();
+
+        // 2) Real 20-minute session → survives the close.
+        store
+            .apply(&TickAction::Open(WorkSession {
+                id: "real".into(),
+                started_at: start,
+                last_input_at: start,
+            }))
+            .unwrap();
+        store
+            .apply(&TickAction::Extend {
+                id: "real".into(),
+                last_input_at: start + chrono::Duration::minutes(20),
+            })
+            .unwrap();
+        store
+            .apply(&TickAction::Close { id: "real".into() })
+            .unwrap();
+
+        // 3) Rotate away from a blip: closed side dropped, new side open.
+        store
+            .apply(&TickAction::Open(WorkSession {
+                id: "blip2".into(),
+                started_at: start + chrono::Duration::minutes(30),
+                last_input_at: start + chrono::Duration::minutes(30),
+            }))
+            .unwrap();
+        let rotated = store
+            .apply(&TickAction::Rotate {
+                close_id: "blip2".into(),
+                open: WorkSession {
+                    id: "after-rotate".into(),
+                    started_at: start + chrono::Duration::minutes(50),
+                    last_input_at: start + chrono::Duration::minutes(50),
+                },
+            })
+            .unwrap();
+        assert_eq!(rotated.unwrap().id, "after-rotate");
+
+        // 4) Startup finalize drops a short leftover open session too.
+        //    ("after-rotate" is still open at 0 seconds here.)
+        store.close_open_sessions().unwrap();
+
+        let ids: Vec<String> = {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id FROM work_sessions ORDER BY started_at")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            vec!["real".to_string()],
+            "only the real session survives"
+        );
+
+        // Reader-mode stores (min = 0) never delete: closing a blip keeps it.
+        let reader = ActivityStore::open(&dir).unwrap();
+        store
+            .apply(&TickAction::Open(WorkSession {
+                id: "blip3".into(),
+                started_at: start,
+                last_input_at: start,
+            }))
+            .unwrap();
+        reader
+            .apply(&TickAction::Close { id: "blip3".into() })
+            .unwrap();
+        let n: i64 = {
+            let conn = reader.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM work_sessions WHERE id='blip3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(n, 1, "min=0 store must not delete anything");
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
     /// Helper: write a closed session [start, end] directly.
     fn put_session(store: &ActivityStore, id: &str, start: DateTime<Utc>, end: DateTime<Utc>) {
         store
@@ -1261,7 +1399,9 @@ mod tests {
     fn open_for_daemon_finalizes_open_sessions_but_readers_do_not() {
         let dir = std::env::temp_dir().join(format!("act-{}.db", uuid::Uuid::new_v4()));
         {
-            let store = ActivityStore::open_for_daemon(&dir).unwrap();
+            // min_session_secs = 0: this test is about finalize-vs-reader
+            // semantics, not the short-session filter.
+            let store = ActivityStore::open_for_daemon(&dir, 0).unwrap();
             let now = Utc::now();
             store
                 .apply(&TickAction::Open(WorkSession {
@@ -1279,7 +1419,7 @@ mod tests {
 
         // Daemon startup still finalizes the prior run's open session
         // so downtime is never resumed into the same span.
-        let daemon = ActivityStore::open_for_daemon(&dir).unwrap();
+        let daemon = ActivityStore::open_for_daemon(&dir, 0).unwrap();
         assert!(daemon.current_open().unwrap().is_none());
         let _ = std::fs::remove_file(&dir);
     }

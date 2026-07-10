@@ -144,13 +144,70 @@ impl Daemon {
             info!("Dream worker disabled ([dream] enabled = false)");
         }
 
+        // Contradiction lint — periodic flag-only pass over each active
+        // project's decisions (see src/lint.rs). Deliberately its own
+        // worker + config, NOT hidden inside dream (which defaults off):
+        // the candidate layer is pure embedding math and safe everywhere;
+        // LLM confirmation engages only when [llm] is enabled.
+        if self.config.lint.enabled {
+            let lint_storage = storage.clone();
+            let lint_cfg = self.config.lint.clone();
+            let llm_cfg = self.config.llm.clone();
+            info!(
+                "Lint worker starting (interval={}s, similarity={:.2}, llm={})",
+                lint_cfg.interval_secs, lint_cfg.similarity, llm_cfg.enabled
+            );
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                    lint_cfg.interval_secs.max(60),
+                ));
+                loop {
+                    ticker.tick().await;
+                    let storage = lint_storage.clone();
+                    let llm_cfg = llm_cfg.clone();
+                    let sim = lint_cfg.similarity;
+                    let res = tokio::task::spawn_blocking(move || {
+                        let backend = if llm_cfg.enabled {
+                            crate::graph::extractor_llm::OllamaBackend::new(&llm_cfg).ok()
+                        } else {
+                            None
+                        };
+                        crate::lint::run_lint_pass(
+                            &storage,
+                            backend
+                                .as_ref()
+                                .map(|b| b as &dyn crate::graph::extractor_llm::LlmBackend),
+                            sim,
+                        )
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(stats)) if stats.confirmed > 0 || stats.candidates_new > 0 => {
+                            info!(
+                                "Lint: {} confirmed, {} new candidates, {} dismissed",
+                                stats.confirmed, stats.candidates_new, stats.dismissed
+                            );
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::warn!("Lint pass failed: {e}"),
+                        Err(e) => tracing::warn!("Lint join error: {e}"),
+                    }
+                }
+            });
+        } else {
+            info!("Lint worker disabled ([lint] enabled = false)");
+        }
+
         // Work-activity sampler. Reads system idle time on a tick and
         // accumulates accurate daily "time worked" into a separate
         // activity.db (never touches memory.db). Disabled via
         // `[activity] enabled = false`. Failure to open the activity DB
         // is non-fatal — the rest of the daemon runs regardless.
         if self.config.activity.enabled {
-            match crate::activity::ActivityStore::open_for_daemon(&self.config.activity_db_path()) {
+            match crate::activity::ActivityStore::open_for_daemon(
+                &self.config.activity_db_path(),
+                self.config.activity.min_session_secs,
+            ) {
                 Ok(store) => {
                     let activity_store = std::sync::Arc::new(store);
                     crate::activity_worker::spawn_worker(
@@ -241,8 +298,14 @@ impl Daemon {
             });
         }
 
-        // Start API server (unix socket — for MCP and CLI clients)
-        let api = ApiServer::new(self.config.daemon.socket_path.clone(), storage.clone());
+        // Start API server (unix socket — for MCP and CLI clients). Shares
+        // the daemon's embedder so /embed serves MCP processes from the ONE
+        // resident model copy instead of each loading its own.
+        let api = ApiServer::new(
+            self.config.daemon.socket_path.clone(),
+            storage.clone(),
+            embedder.clone(),
+        );
         tokio::spawn(async move {
             if let Err(e) = api.start().await {
                 error!("API server error: {e}");

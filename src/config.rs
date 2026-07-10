@@ -26,6 +26,44 @@ pub struct Config {
     pub activity: ActivityConfig,
     #[serde(default)]
     pub graph: GraphConfig,
+    #[serde(default)]
+    pub lint: LintConfig,
+}
+
+/// Contradiction lint — periodic pass that flags decisions semantically
+/// reversed by newer ones (see src/lint.rs). Flag-only: verdicts land in
+/// an audit table; memories are never mutated. Runs without an LLM too
+/// (pairs stay 'candidate'), so it is safe to keep enabled by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LintConfig {
+    #[serde(default = "default_lint_enabled")]
+    pub enabled: bool,
+    /// Seconds between lint passes.
+    #[serde(default = "default_lint_interval_secs")]
+    pub interval_secs: u64,
+    /// Cosine similarity at which a decision pair becomes a candidate.
+    #[serde(default = "default_lint_similarity")]
+    pub similarity: f32,
+}
+
+impl Default for LintConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_lint_enabled(),
+            interval_secs: default_lint_interval_secs(),
+            similarity: default_lint_similarity(),
+        }
+    }
+}
+
+fn default_lint_enabled() -> bool {
+    true
+}
+fn default_lint_interval_secs() -> u64 {
+    1800
+}
+fn default_lint_similarity() -> f32 {
+    0.65
 }
 
 /// User-specific graph extraction vocabulary, merged ON TOP of the generic
@@ -447,6 +485,15 @@ pub struct ActivityConfig {
     /// session closes at the last input ("you stepped away").
     #[serde(default = "default_activity_idle_threshold_secs")]
     pub idle_threshold_secs: u64,
+    /// Sessions shorter than this (seconds) are dropped when they close
+    /// instead of being kept. Filters phantom blips: some peripherals /
+    /// utilities reset the system idle counter for an instant (observed
+    /// as exactly-15-minute 0-second "sessions"), which pollutes session
+    /// counts while adding no time. Deliberately tiny by default — blips
+    /// measure 0-2s, while a genuine quick check-in (10-20s) must keep
+    /// counting toward daily totals. 0 disables the filter.
+    #[serde(default = "default_activity_min_session_secs")]
+    pub min_session_secs: u64,
 }
 
 impl Default for ActivityConfig {
@@ -455,6 +502,7 @@ impl Default for ActivityConfig {
             enabled: default_activity_enabled(),
             sample_interval_secs: default_activity_sample_secs(),
             idle_threshold_secs: default_activity_idle_threshold_secs(),
+            min_session_secs: default_activity_min_session_secs(),
         }
     }
 }
@@ -467,6 +515,12 @@ fn default_activity_sample_secs() -> u64 {
 }
 fn default_activity_idle_threshold_secs() -> u64 {
     180 // 3 minutes
+}
+fn default_activity_min_session_secs() -> u64 {
+    // Phantom idle-counter blips are 0-2s; 5s catches them with margin
+    // while never eating a real 10-20s check-in (Codex review point:
+    // short honest work must keep counting toward totals).
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -553,6 +607,7 @@ impl Default for Config {
             dream: DreamConfig::default(),
             activity: ActivityConfig::default(),
             graph: GraphConfig::default(),
+            lint: LintConfig::default(),
         }
     }
 }

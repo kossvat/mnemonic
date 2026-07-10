@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::embedding::{Embedder, create_embedder};
+use crate::embedding::Embedder;
 use crate::event::{EventSource, MemoryEntry, MemoryType};
 use crate::output::whisper::Whisper;
 use crate::scoring::ImportanceScorer;
@@ -48,7 +48,21 @@ impl McpServer {
 
     pub fn run(&self) -> Result<()> {
         let storage = Storage::open(&self.config.storage.db_path)?;
-        let embedder = create_embedder()?;
+        // Embedding strategy (memory-reviewed with Codex):
+        // 1. Ask the DAEMON over its unix socket — it already holds the one
+        //    resident model copy, so this process never loads ~2 GB.
+        // 2. If the daemon is unreachable, fall back to a lazy in-process
+        //    model (loaded only when an embed actually happens).
+        // 3. If the daemon's vectors don't match the store's dimension
+        //    (split-brain after an upgrade), fail hard — never mix vectors.
+        let expected_dim = {
+            let dims = storage.active_embedding_dims();
+            if dims.len() == 1 { Some(dims[0]) } else { None }
+        };
+        let embedder = crate::embedding::daemon_client::FallbackEmbedder::new(
+            self.config.daemon.socket_path.clone(),
+            expected_dim,
+        );
         let scorer = ImportanceScorer::default();
         // Same sinks + peer attribution as the daemon's event loop, so a
         // memory saved over MCP is indistinguishable from one the daemon
@@ -80,7 +94,7 @@ impl McpServer {
             if let Some(out) = self.response_for_line(
                 &line,
                 &storage,
-                &*embedder,
+                &embedder,
                 &scorer,
                 attributor.as_ref(),
                 &sinks,
@@ -392,32 +406,46 @@ impl McpServer {
         let mut entry = MemoryEntry::new(title, content, mt.clone(), EventSource::Socket);
         entry.tags = tag_list;
 
-        // Embedding + dedup + scoring
+        // Embedding + dedup + scoring. Only the EMBEDDING text is truncated:
+        // e5 attends to ~512 tokens anyway, so a few KB carries the full
+        // semantic signal, and staying far under the daemon's /embed caps
+        // means a large-but-valid memory can never be rejected with HTTP 400
+        // (Codex review: the memory itself must always be savable in full).
         let embed_text = format!("{} {}", title, content);
-        if let Ok(emb) = embedder.embed(&embed_text) {
-            // `?`: a dimension-mismatch error (model swapped without a reembed) must
-            // abort the save, not fall through and write a mixed-dim vector.
-            if let Some(sim) = storage.is_duplicate(&emb, self.config.classifier.dedup_threshold)? {
-                return Ok(json!({
-                    "status": "skipped",
-                    "reason": "duplicate",
-                    "similarity": sim
-                }));
-            }
+        let embed_text = truncate_for_embedding(&embed_text, EMBED_TEXT_MAX_BYTES);
+        match embedder.embed(embed_text) {
+            Ok(emb) => {
+                // `?`: a dimension-mismatch error (model swapped without a reembed) must
+                // abort the save, not fall through and write a mixed-dim vector.
+                if let Some(sim) =
+                    storage.is_duplicate(&emb, self.config.classifier.dedup_threshold)?
+                {
+                    return Ok(json!({
+                        "status": "skipped",
+                        "reason": "duplicate",
+                        "similarity": sim
+                    }));
+                }
 
-            if let Ok(score) = scorer.score(
-                &emb,
-                &crate::event::EventKind::Custom("mcp".into()),
-                &mt,
-                &storage.conn,
-            ) {
-                entry.importance = score;
-            }
+                if let Ok(score) = scorer.score(
+                    &emb,
+                    &crate::event::EventKind::Custom("mcp".into()),
+                    &mt,
+                    &storage.conn,
+                ) {
+                    entry.importance = score;
+                }
 
-            storage.save_with_embedding(&entry, Some(&emb))?;
-        } else {
-            entry.importance = 0.7;
-            storage.save(&entry)?;
+                storage.save_with_embedding(&entry, Some(&emb))?;
+            }
+            // Non-retryable embed failures (dimension split-brain, daemon 400
+            // e.g. text over the /embed caps) must abort the save — silently
+            // saving unembedded would hide the error from vector search/dedup.
+            Err(e) if crate::embedding::daemon_client::is_hard_failure(&e) => return Err(e),
+            Err(_) => {
+                entry.importance = 0.7;
+                storage.save(&entry)?;
+            }
         }
 
         // Peer attribution — same fallback regime as the daemon's loop
@@ -478,6 +506,9 @@ impl McpServer {
             .ok_or_else(|| anyhow::anyhow!("Missing 'query'"))?;
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
 
+        // Same truncation as the save path: keeps oversized queries under
+        // the daemon /embed caps (and e5 wouldn't attend past ~512 tokens).
+        let query = truncate_for_embedding(query, EMBED_TEXT_MAX_BYTES);
         let emb = embedder.embed_query(query)?;
         let results = storage.find_similar(&emb, limit)?;
         let entries: Vec<Value> = results
@@ -596,6 +627,25 @@ fn entry_to_json(entry: &MemoryEntry) -> Value {
     })
 }
 
+/// Max bytes of text sent to the embedder. e5 attends to ~512 tokens, so
+/// this loses no retrieval signal, and it stays far under the daemon's
+/// /embed request caps (64 KiB text / 32 texts) so a large-but-valid
+/// memory can never be bounced with HTTP 400.
+const EMBED_TEXT_MAX_BYTES: usize = 8 * 1024;
+
+/// Truncate to at most `max_bytes`, backing up to a UTF-8 char boundary so
+/// multi-byte text (Cyrillic notes!) never panics the slice.
+fn truncate_for_embedding(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +668,25 @@ mod tests {
         let storage = Storage::open(&config.storage.db_path).unwrap();
         let sinks = crate::output::build_sinks(&config);
         (McpServer::new(config), storage, sinks)
+    }
+
+    /// Only the EMBEDDING text is capped — never the saved memory. The cut
+    /// must respect UTF-8 char boundaries (Cyrillic is 2 bytes/char).
+    #[test]
+    fn truncate_for_embedding_respects_utf8_boundaries() {
+        // Under the cap: untouched.
+        assert_eq!(truncate_for_embedding("abcdef", 10), "abcdef");
+        // ASCII: exact cut.
+        assert_eq!(truncate_for_embedding("abcdef", 4), "abcd");
+        // Cyrillic: byte 5 lands mid-char, must back up to a boundary.
+        let ru = "привет"; // 12 bytes, 2 per char
+        let cut = truncate_for_embedding(ru, 5);
+        assert_eq!(cut, "пр");
+        assert!(ru.starts_with(cut));
+        // Oversized input always lands at or under the cap, non-empty.
+        let big = "я".repeat(EMBED_TEXT_MAX_BYTES); // 2x the cap in bytes
+        let cut = truncate_for_embedding(&big, EMBED_TEXT_MAX_BYTES);
+        assert!(cut.len() <= EMBED_TEXT_MAX_BYTES && !cut.is_empty());
     }
 
     /// JSON-RPC 2.0: requests without an id are notifications and MUST NOT

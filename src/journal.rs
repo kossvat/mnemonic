@@ -88,7 +88,7 @@ pub struct JournalDay {
 
 /// Words that mark a memory as a forward-looking follow-up / TODO. Matched
 /// case-insensitively against the title (English + the way User writes them).
-const FOLLOWUP_MARKERS: &[&str] = &[
+pub(crate) const FOLLOWUP_MARKERS: &[&str] = &[
     "todo",
     "follow-up",
     "follow up",
@@ -446,7 +446,7 @@ fn strip_commit_prefix(s: &str) -> &str {
 
 /// First non-empty line, commit-prefix stripped, whitespace-collapsed and
 /// length-capped — commit messages and multi-line notes become one tidy row.
-fn clean_line(s: &str) -> String {
+pub(crate) fn clean_line(s: &str) -> String {
     let first = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let first = strip_commit_prefix(first.trim());
     let collapsed = first.split_whitespace().collect::<Vec<_>>().join(" ");

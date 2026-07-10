@@ -1,5 +1,8 @@
+pub mod daemon_client;
+
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Fixed-size embedding vector (256-dim hash-based)
 pub const EMBED_DIMS: usize = 256;
@@ -17,6 +20,20 @@ pub trait Embedder: Send + Sync {
     fn embed_query(&self, text: &str) -> Result<Embedding> {
         self.embed(text)
     }
+
+    /// Stable identifier of the underlying model, surfaced over the daemon's
+    /// /embed and /status endpoints so clients can detect split-brain (daemon
+    /// and MCP built against different models) instead of silently mixing
+    /// incompatible vectors.
+    fn model_id(&self) -> &'static str {
+        "unknown"
+    }
+
+    /// Output dimension when statically known (None when it would require
+    /// loading the model to find out).
+    fn dim_hint(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Hash-based embedder using weighted SimHash + TF-IDF-like features.
@@ -32,6 +49,14 @@ impl HashEmbedder {
 impl Embedder for HashEmbedder {
     fn embed(&self, text: &str) -> Result<Embedding> {
         Ok(hash_embed(text))
+    }
+
+    fn model_id(&self) -> &'static str {
+        "hash-simhash-v1"
+    }
+
+    fn dim_hint(&self) -> Option<usize> {
+        Some(EMBED_DIMS)
     }
 }
 
@@ -82,6 +107,14 @@ impl Embedder for NeuralEmbedder {
     fn embed_query(&self, text: &str) -> Result<Embedding> {
         self.embed_prefixed(format!("query: {text}"))
     }
+
+    fn model_id(&self) -> &'static str {
+        "intfloat/multilingual-e5-base"
+    }
+
+    fn dim_hint(&self) -> Option<usize> {
+        Some(768)
+    }
 }
 
 /// Create the best available embedder based on compiled features.
@@ -105,6 +138,85 @@ pub fn create_embedder() -> Result<Box<dyn Embedder>> {
 
     tracing::info!("Using hash embedder (256-dim)");
     Ok(Box::new(HashEmbedder::new()))
+}
+
+/// An `Embedder` that defers model construction until the first embed call.
+///
+/// The neural model (multilingual-e5-base via ONNX Runtime) costs ~1.4 GB of
+/// transient RSS to load. The MCP server spawns one process per Claude Code
+/// session, and most tool calls (context, recent, status, graph) never embed,
+/// so loading eagerly at startup made every session spike ~1.4 GB for nothing.
+/// Wrapping the embedder here loads the model only when a search or save
+/// actually needs it, once, and never for embed-free sessions.
+type EmbedderBuilder = Box<dyn Fn() -> Result<Box<dyn Embedder>> + Send + Sync>;
+
+pub struct LazyEmbedder {
+    inner: OnceLock<Box<dyn Embedder>>,
+    builder: EmbedderBuilder,
+}
+
+impl LazyEmbedder {
+    /// Defers to `create_embedder` on first use.
+    pub fn new() -> Self {
+        Self::from_builder(create_embedder)
+    }
+
+    /// Construct with a custom builder (used by tests to inject a cheap
+    /// embedder and observe when construction actually happens).
+    pub(crate) fn from_builder(
+        builder: impl Fn() -> Result<Box<dyn Embedder>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: OnceLock::new(),
+            builder: Box::new(builder),
+        }
+    }
+
+    /// Get the real embedder, building it on first use. Idempotent and
+    /// race-safe: if two callers init at once, one wins and both see it.
+    fn get(&self) -> Result<&dyn Embedder> {
+        if let Some(e) = self.inner.get() {
+            return Ok(e.as_ref());
+        }
+        let built = (self.builder)()?;
+        // set() fails only if another thread already initialised it — fine,
+        // we re-read below either way.
+        let _ = self.inner.set(built);
+        Ok(self
+            .inner
+            .get()
+            .expect("embedder was just initialised")
+            .as_ref())
+    }
+}
+
+impl Default for LazyEmbedder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Embedder for LazyEmbedder {
+    fn embed(&self, text: &str) -> Result<Embedding> {
+        self.get()?.embed(text)
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Embedding> {
+        self.get()?.embed_query(text)
+    }
+
+    /// Delegates when already built; never forces a model load just to
+    /// answer metadata.
+    fn model_id(&self) -> &'static str {
+        self.inner
+            .get()
+            .map(|e| e.model_id())
+            .unwrap_or("lazy-unloaded")
+    }
+
+    fn dim_hint(&self) -> Option<usize> {
+        self.inner.get().and_then(|e| e.dim_hint())
+    }
 }
 
 /// Generate a 256-dim embedding from text using feature hashing (SimHash-style).
@@ -277,5 +389,38 @@ mod tests {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![0.0, 1.0, 0.0];
         assert!(cosine_similarity(&a, &b).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lazy_embedder_builds_once_on_first_use() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let lazy = LazyEmbedder::from_builder(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(HashEmbedder::new()) as Box<dyn Embedder>)
+        });
+
+        // Constructing the wrapper must NOT build the underlying embedder.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "embedder must not be built until first embed"
+        );
+
+        let a = lazy.embed("hello world").unwrap();
+        assert_eq!(a.len(), EMBED_DIMS);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "built on first embed");
+
+        // Second call (and embed_query) reuses the same instance.
+        let _ = lazy.embed_query("hello world").unwrap();
+        let _ = lazy.embed("again").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "embedder built once and reused"
+        );
     }
 }

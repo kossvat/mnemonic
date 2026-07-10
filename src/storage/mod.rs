@@ -520,7 +520,27 @@ impl Storage {
                 UPDATE conclusions
                    SET support_count = support_count - 1
                  WHERE id = OLD.conclusion_id;
-            END;",
+            END;
+
+            -- Semantic contradiction lint (design-reviewed): AUDIT table,
+            -- deliberately separate from memories.superseded_by — that
+            -- column means retrieval-hidden dedup consolidation, while a
+            -- confirmed conflict is a historically-reversed decision that
+            -- must stay visible in history and only be excluded from
+            -- standing-decision surfaces (digests / Key Decisions).
+            CREATE TABLE IF NOT EXISTS decision_conflicts (
+                old_id TEXT NOT NULL,
+                new_id TEXT NOT NULL,
+                project TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'candidate',
+                confidence REAL,
+                reason TEXT,
+                checked_at TEXT NOT NULL DEFAULT (datetime('now')),
+                checker_version INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (old_id, new_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_decision_conflicts_status
+                ON decision_conflicts(status);",
         )?;
 
         // Peers and sessions. Today every memory is anonymous: the daemon
@@ -2371,6 +2391,277 @@ impl Storage {
             })
             .collect();
 
+        Ok(rows)
+    }
+
+    /// Active (non-superseded, non-session-summary) memories linked to a
+    /// project entity by NAME, newest first, with access data for
+    /// decay-effective ranking. Feeds the project digest builder — name (not
+    /// entity UUID) keys the lookup so graph rebuilds can't orphan it.
+    ///
+    /// Decisions and feedback are NEVER truncated by the recency limit
+    /// (review point): a busy project with hundreds of fresh notes must not
+    /// evict the durable old decisions that still govern it — `limit` only
+    /// bounds the note/other tail.
+    pub fn project_digest_pool(
+        &self,
+        project_name: &str,
+        limit: usize,
+    ) -> Result<Vec<RankedEntry>> {
+        let mut rows = self.project_pool_query(
+            project_name,
+            "AND m.memory_type IN ('decision', 'feedback')",
+            10_000,
+        )?;
+        rows.extend(self.project_pool_query(
+            project_name,
+            "AND m.memory_type NOT IN ('decision', 'feedback', 'session_summary')",
+            limit,
+        )?);
+        // Callers rely on newest-first ordering (the digest's Latest section).
+        rows.sort_by(|a, b| b.entry.timestamp.cmp(&a.entry.timestamp));
+        Ok(rows)
+    }
+
+    fn project_pool_query(
+        &self,
+        project_name: &str,
+        type_clause: &str,
+        limit: usize,
+    ) -> Result<Vec<RankedEntry>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let sql = format!(
+            "SELECT m.id, m.timestamp, m.title, m.content, m.memory_type, m.tags, m.source,
+                    m.importance, m.metadata, COALESCE(m.access_count, 0), m.last_accessed_at
+             FROM memories m
+             JOIN memory_entities me ON me.memory_id = m.id
+             JOIN entities e ON e.id = me.entity_id
+             WHERE e.name = ?1 AND e.entity_type = 'project'
+               AND m.superseded_by IS NULL
+               {type_clause}
+             ORDER BY m.timestamp DESC
+             LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<RankedEntry> = stmt
+            .query_map(params![project_name, limit as i64], |row| {
+                let storage_row = StorageRow {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    title: row.get(2)?,
+                    content: row.get(3)?,
+                    memory_type: row.get(4)?,
+                    tags: row.get(5)?,
+                    source: row.get(6)?,
+                    importance: row.get(7)?,
+                    metadata: row.get(8)?,
+                };
+                let access_count: i64 = row.get(9)?;
+                let last_accessed_at: Option<String> = row.get(10)?;
+                Ok((storage_row, access_count, last_accessed_at))
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|(row, access_count, last_accessed_at)| {
+                let entry = row.into_memory_entry().ok()?;
+                let last_active = last_accessed_at
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or(entry.timestamp);
+                Some(RankedEntry {
+                    entry,
+                    access_count: access_count.max(0) as u32,
+                    last_active,
+                })
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// Project names ranked by WEIGHTED recent activity: decisions and
+    /// feedback linked in the last `days` count 3, notes 1, session
+    /// summaries 0. Recency breaks ties. Design-review point: lifetime
+    /// mention_count alone would pin long-dead projects to the top.
+    ///
+    /// `min_real_mems` applies the caller's noise floor IN SQL (lifetime
+    /// count of active non-summary memories), so sub-floor projects can
+    /// never crowd buildable ones out of the LIMIT (review point).
+    pub fn active_projects_weighted(
+        &self,
+        days: i64,
+        limit: usize,
+        min_real_mems: usize,
+        offset: usize,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let mut stmt = conn.prepare(
+            "SELECT e.name,
+                    SUM(CASE m.memory_type
+                        WHEN 'decision' THEN 3
+                        WHEN 'feedback' THEN 3
+                        WHEN 'session_summary' THEN 0
+                        ELSE 1 END) AS w,
+                    MAX(m.timestamp) AS latest
+             FROM entities e
+             JOIN memory_entities me ON me.entity_id = e.id
+             JOIN memories m ON m.id = me.memory_id
+             WHERE e.entity_type = 'project'
+               AND m.superseded_by IS NULL
+               AND m.timestamp >= ?1
+             GROUP BY e.id, e.name
+             HAVING w > 0
+                AND (SELECT COUNT(*)
+                     FROM memory_entities me2
+                     JOIN memories m2 ON m2.id = me2.memory_id
+                     WHERE me2.entity_id = e.id
+                       AND m2.superseded_by IS NULL
+                       AND m2.memory_type != 'session_summary') >= ?3
+             ORDER BY w DESC, latest DESC
+             LIMIT ?2 OFFSET ?4",
+        )?;
+        let names: Vec<String> = stmt
+            .query_map(
+                params![cutoff, limit as i64, min_real_mems as i64, offset as i64],
+                |r| r.get::<_, String>(0),
+            )?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(names)
+    }
+
+    /// Projects that actually have something for the contradiction lint to
+    /// compare: at least two active decisions WITH embeddings. Ranked by
+    /// freshest decision so projects with new (possibly reversing)
+    /// decisions are checked first — a weighted-activity ranking would let
+    /// note-heavy projects starve them out of the per-pass limit.
+    pub fn projects_with_decision_pairs(&self, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT e.name
+             FROM entities e
+             JOIN memory_entities me ON me.entity_id = e.id
+             JOIN memories m ON m.id = me.memory_id
+             WHERE e.entity_type = 'project'
+               AND m.memory_type = 'decision'
+               AND m.superseded_by IS NULL
+               AND m.embedding IS NOT NULL
+             GROUP BY e.id, e.name
+             HAVING COUNT(*) >= 2
+             ORDER BY MAX(m.timestamp) DESC
+             LIMIT ?1",
+        )?;
+        let names: Vec<String> = stmt
+            .query_map([limit as i64], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(names)
+    }
+
+    /// Active decisions of a project WITH their stored embeddings — the
+    /// contradiction lint compares these pairwise. Content rides along
+    /// (review point): titles can be generic ("Dependency change: ...")
+    /// while the actual reversal lives in the body, and a judge deciding
+    /// from the title alone would confirm/dismiss from incomplete text.
+    pub fn project_decisions_with_embeddings(
+        &self,
+        project_name: &str,
+        limit: usize,
+    ) -> Result<Vec<DecisionRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.title, m.content, m.timestamp, m.embedding
+             FROM memories m
+             JOIN memory_entities me ON me.memory_id = m.id
+             JOIN entities e ON e.id = me.entity_id
+             WHERE e.name = ?1 AND e.entity_type = 'project'
+               AND m.memory_type = 'decision'
+               AND m.superseded_by IS NULL
+               AND m.embedding IS NOT NULL
+             ORDER BY m.timestamp DESC
+             LIMIT ?2",
+        )?;
+        let rows: Vec<DecisionRow> = stmt
+            .query_map(params![project_name, limit as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(id, title, content, ts, blob)| DecisionRow {
+                id,
+                title,
+                content,
+                timestamp: ts,
+                embedding: embedding_from_bytes(&blob),
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// Status of a recorded conflict pair, if any ('candidate' /
+    /// 'confirmed' / 'dismissed'). Used to avoid re-judging pairs.
+    pub fn conflict_status(&self, old_id: &str, new_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let status = conn
+            .query_row(
+                "SELECT status FROM decision_conflicts WHERE old_id = ?1 AND new_id = ?2",
+                params![old_id, new_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        Ok(status)
+    }
+
+    /// Record / update a conflict pair verdict.
+    pub fn upsert_conflict(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        project: &str,
+        status: &str,
+        confidence: Option<f32>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute(
+            "INSERT INTO decision_conflicts
+                 (old_id, new_id, project, status, confidence, reason, checked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+             ON CONFLICT(old_id, new_id) DO UPDATE SET
+                 status = excluded.status,
+                 confidence = excluded.confidence,
+                 reason = excluded.reason,
+                 checked_at = excluded.checked_at",
+            params![old_id, new_id, project, status, confidence, reason],
+        )?;
+        Ok(())
+    }
+
+    /// All CONFIRMED contradictions as (old_id, new_id) — surfaces consult
+    /// this to hide reversed decisions from standing-decision lists while
+    /// the memories themselves stay untouched.
+    ///
+    /// A pair only acts while BOTH sides are still alive (review point): if
+    /// the replacement is later forgotten or superseded, suppressing the old
+    /// decision would erase the only remaining guidance — the joins drop
+    /// such stale audit rows from the result automatically.
+    pub fn confirmed_conflicts(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT dc.old_id, dc.new_id FROM decision_conflicts dc
+             JOIN memories mo ON mo.id = dc.old_id AND mo.superseded_by IS NULL
+             JOIN memories mn ON mn.id = dc.new_id AND mn.superseded_by IS NULL
+             WHERE dc.status = 'confirmed'",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(rows)
     }
 
@@ -5644,6 +5935,18 @@ pub struct MergeReport {
     #[allow(dead_code)] // surfaced via Debug + reserved for future progress UI
     pub mentions_summed: usize,
     pub alias_dropped: bool,
+}
+
+/// One active project decision with its embedding — the unit the
+/// contradiction lint compares pairwise. `timestamp` stays a raw RFC3339
+/// string; the lint parses it for chronological ordering.
+#[derive(Debug, Clone)]
+pub struct DecisionRow {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub timestamp: String,
+    pub embedding: Embedding,
 }
 
 /// Memory entry plus the bookkeeping needed to compute its effective score.
