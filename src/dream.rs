@@ -38,7 +38,6 @@
 //! exists; batch runs skip already-summarized sessions.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
 use crate::event::{EventSource, MemoryEntry, MemoryType};
@@ -396,32 +395,10 @@ fn count_by_type(memories: &[MemoryEntry]) -> Vec<(String, usize)> {
     pairs
 }
 
-/// Parse a session timestamp string into UTC. Sessions opened by
-/// the storage helpers use SQLite's `datetime('now')` which produces
-/// `YYYY-MM-DD HH:MM:SS` (space delimiter, no timezone) and is
-/// implicitly UTC. Sessions touched via `open_or_reuse_session_for_key`
-/// use chrono's `to_rfc3339()`, producing the standard form with
-/// timezone. This helper accepts both so duration math and date
-/// extraction don't silently fall over when the live DB has mixed
-/// timestamp formats — Codex caught this exact gap on the live DB
-/// where `Duration:` was missing from summaries because the rows
-/// were in SQLite format and only RFC3339 was being tried.
-pub fn parse_session_timestamp(s: &str) -> Option<DateTime<Utc>> {
-    // RFC3339 first (newer rows + manual code paths via to_rfc3339).
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
-    }
-    // SQLite default: "%Y-%m-%d %H:%M:%S" in UTC.
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return Some(naive.and_utc());
-    }
-    // SQLite sub-second variant (rarer but possible after a UPDATE
-    // with datetime('now', 'subsec')).
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
-        return Some(naive.and_utc());
-    }
-    None
-}
+/// Session timestamp parsing lives in `storage` (the lib tree) so the
+/// leaderboard query can share it; re-exported here because dream's
+/// callers and tests historically import it from this module.
+pub use crate::storage::parse_session_timestamp;
 
 /// Render `started_at → ended_at` as a duration string. Returns
 /// None for ongoing sessions (no ended_at) or malformed timestamps.
@@ -436,13 +413,7 @@ fn session_duration(session: &Session) -> Option<String> {
         // negative duration. Caller drops the field.
         return None;
     }
-    if secs < 60 {
-        Some(format!("{secs}s"))
-    } else if secs < 3600 {
-        Some(format!("{}m {}s", secs / 60, secs % 60))
-    } else {
-        Some(format!("{}h {}m", secs / 3600, (secs % 3600) / 60))
-    }
+    Some(crate::storage::human_duration(secs))
 }
 
 #[cfg(test)]

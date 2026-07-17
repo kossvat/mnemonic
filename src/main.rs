@@ -72,12 +72,15 @@ fn init_logging(log_file: Option<&std::path::Path>) {
             return;
         }
     }
-    // Interactive mode: log to stderr
+    // Interactive mode: log to stderr. fmt() defaults to STDOUT, which
+    // silently corrupted machine-readable output — `session leaderboard
+    // --json | jq` received INFO lines before the JSON (review point).
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("mnemonic=info")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 }
 
@@ -677,6 +680,18 @@ enum SessionCommands {
     Show {
         /// Session id (full UUID or unambiguous prefix, min 8 chars).
         id: String,
+    },
+    /// Longest completed sessions, longest first — the same data the
+    /// widget's Records page shows. `--json` prints the HTTP endpoint's
+    /// exact payload shape; the widget uses it as a fallback when the
+    /// dashboard HTTP API is disabled (the default config).
+    Leaderboard {
+        /// Max rows (clamped to 1..=50).
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+        /// Print machine-readable JSON: {"sessions": [...]}.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -3164,6 +3179,42 @@ fn run_session_command(config: &Config, sub: SessionCommands) -> Result<()> {
                     m.timestamp.format("%Y-%m-%d %H:%M"),
                     m.memory_type,
                     m.title
+                );
+            }
+        }
+        SessionCommands::Leaderboard { limit, json } => {
+            let rows = storage.longest_sessions(limit.clamp(1, 50))?;
+            if json {
+                // Exact same payload shape as GET /api/leaderboard/sessions
+                // — the widget parses both interchangeably.
+                let payload: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "session_id": r.session_id,
+                            "started_at": r.started_at,
+                            "duration_seconds": r.duration_seconds,
+                            "duration_human": storage::human_duration(r.duration_seconds),
+                            "top_project": r.top_project,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::json!({ "sessions": payload }));
+                return Ok(());
+            }
+            if rows.is_empty() {
+                println!("No completed sessions yet.");
+                return Ok(());
+            }
+            println!("Longest sessions:");
+            for (i, r) in rows.iter().enumerate() {
+                println!(
+                    "  {:>2}. {:>9}  {}  {}  {}",
+                    i + 1,
+                    storage::human_duration(r.duration_seconds),
+                    &r.session_id[..8.min(r.session_id.len())],
+                    r.started_at,
+                    r.top_project.as_deref().unwrap_or("-")
                 );
             }
         }

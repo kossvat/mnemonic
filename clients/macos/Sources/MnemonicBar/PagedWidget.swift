@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// Swipeable card-deck popover — 4 pages (Work / Projects / Memory / Share).
+/// Swipeable card-deck popover — 5 pages (Work / Projects / Journal /
+/// Records / Share).
 /// macOS has no TabView .page, so this is a custom horizontal deck: an HStack
 /// of full-width pages offset by drag, snapping to the nearest page. A
 /// persistent header (brand + status + nav icons) sits above; custom amber
@@ -34,14 +35,15 @@ struct PagedContainerView: View {
     }()
     @State private var resizeBase: CGFloat = 0
 
-    private let pageCount = 4
+    private let pageCount = 5
     private let deckWidth: CGFloat = 336
     private let minHeight: CGFloat = 420
     private let maxHeight: CGFloat = 840
 
     private var d: WidgetData { service.data }
     private let navIcons = [("clock", "Work"), ("folder", "Projects"),
-                            ("book.pages", "Journal"), ("square.and.arrow.up", "Share")]
+                            ("book.pages", "Journal"), ("trophy", "Records"),
+                            ("square.and.arrow.up", "Share")]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -93,13 +95,16 @@ struct PagedContainerView: View {
                 // scrolls (Codex: the Work page was clipping under the
                 // dots). Padding lives inside the ScrollView so it scrolls too.
                 pageScroll(pad: EdgeInsets()) {
-                    MenuBarView(service: service, inDeck: true, onShare: { goto(3) })
+                    MenuBarView(service: service, inDeck: true, onShare: { goto(4) })
                 }.frame(width: w)
                 pageScroll(pad: EdgeInsets(top: 6, leading: 16, bottom: 16, trailing: 16)) {
                     ProjectsPageView(data: d, onOpenApp: { service.openDashboard() })
                 }.frame(width: w)
                 pageScroll(pad: EdgeInsets(top: 6, leading: 16, bottom: 16, trailing: 16)) {
                     JournalPageView(service: service)
+                }.frame(width: w)
+                pageScroll(pad: EdgeInsets(top: 6, leading: 16, bottom: 16, trailing: 16)) {
+                    RecordsPageView(service: service, isActive: page == 3)
                 }.frame(width: w)
                 pageScroll(pad: EdgeInsets()) {
                     ShareComposerView(data: d, service: service, inPage: true)

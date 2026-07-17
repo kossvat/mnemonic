@@ -488,6 +488,14 @@ class MnemonicService: ObservableObject {
         return j
     }
 
+    /// Run the mnemonic CLI and parse its stdout as a JSON object. The
+    /// fallback path for pages whose HTTP endpoint is unavailable — the
+    /// dashboard API is disabled in the default config, and only the
+    /// daemon owner's machine has it turned on.
+    func cliObject(_ args: [String]) -> [String: Any]? {
+        parseObject(runCommand(args: args))
+    }
+
     private func parseArray(_ out: String) -> [[String: Any]]? {
         guard let i = out.firstIndex(of: "["),
               let data = String(out[i...]).data(using: .utf8),

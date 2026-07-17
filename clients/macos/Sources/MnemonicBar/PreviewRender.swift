@@ -49,11 +49,19 @@ enum PreviewRender {
         let yLabelF = DateFormatter(); yLabelF.dateFormat = "EEE · MMM d"
         let yLabel = yLabelF.string(from: Calendar.current.date(byAdding: .day, value: -1, to: Date()) ?? Date())
 
+        // Records: fetch + parse synchronously so the page renders content,
+        // not its loading state (same reasoning as the journal above).
+        let records: [SessionRecord]? = service
+            .httpObject("/api/leaderboard/sessions?limit=10")
+            .flatMap { $0["sessions"] as? [[String: Any]] }
+            .map { $0.compactMap(SessionRecord.fromJSON) }
+
         let pagePad = EdgeInsets(top: 6, leading: 16, bottom: 16, trailing: 16)
         let pages: [(String, AnyView)] = [
             ("deck-work", AnyView(PagedContainerView(service: service, previewPage: 0))),
             ("page-projects", AnyView(ProjectsPageView(data: service.data, onOpenApp: {}).padding(pagePad))),
             ("page-journal", AnyView(JournalPageView(service: service, previewDay: journalDay).padding(pagePad))),
+            ("page-records", AnyView(RecordsPageView(service: service, previewRecords: records).padding(pagePad))),
             ("page-share", AnyView(ShareComposerView(data: service.data, service: service, inPage: true))),
             ("share-card-yesterday", AnyView(
                 ShareCardView(data: service.data, mode: .today, tone: .dark, includeMemory: false,

@@ -4999,6 +4999,165 @@ impl Storage {
         Ok(row)
     }
 
+    /// Longest COMPLETED sessions, newest-format-agnostic. Durations are
+    /// computed in Rust via `parse_session_timestamp` (the live DB carries
+    /// mixed SQLite `datetime('now')` and RFC3339 rows — SQL-side julianday
+    /// math would silently misorder any format it can't parse). Open
+    /// sessions (`ended_at IS NULL`), malformed timestamps, and negative
+    /// durations (clock skew / hand-edited rows) are dropped, not guessed.
+    ///
+    /// `top_project` comes from `project_signals_in_window` over the padded
+    /// session window — the SAME signal the attribution worker uses. It is
+    /// deliberately NOT derived from `memories.session_id` joins (Codex P1):
+    /// in the watcher flow the only memories carrying a session_id are
+    /// corrections/conversation decisions, and `reconcile_memory_projects`
+    /// classifies those as meta and strips their project links, so that
+    /// join is empty on production data.
+    pub fn longest_sessions(&self, limit: usize) -> Result<Vec<SessionRecordRow>> {
+        // Mirror the attribution worker's window constants: memories often
+        // land a few minutes after the work burst, and a project below the
+        // real-memory floor is extractor noise, not a leaderboard winner.
+        const SIGNAL_PAD_MINUTES: i64 = 10;
+        const MIN_PROJECT_MEMS: i64 = 2;
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // A session's parsed time span. ALL sessions are collected (open
+        // included) — open ones can't rank, but their start still bounds
+        // a neighbour's signal pad below.
+        struct SessionSpan {
+            id: String,
+            started_at_raw: String,
+            start: chrono::DateTime<chrono::Utc>,
+            end: Option<chrono::DateTime<chrono::Utc>>,
+        }
+        let all: Vec<SessionSpan> = {
+            let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            let mut stmt = conn.prepare("SELECT id, started_at, ended_at FROM sessions")?;
+            let raw = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            raw.into_iter()
+                .filter_map(|(id, started_at, ended_at)| {
+                    let start = parse_session_timestamp(&started_at)?;
+                    // Genuinely OPEN rows stay (their start bounds a
+                    // neighbour's pad), but a COMPLETED row with a
+                    // malformed or skewed end is dropped entirely — its
+                    // bogus timestamps must not win prev_end/next_start
+                    // and truncate a valid session's signal window
+                    // (review point).
+                    let end = match ended_at.as_deref() {
+                        None => None,
+                        Some(raw_end) => {
+                            let e = parse_session_timestamp(raw_end)?;
+                            if e < start {
+                                return None;
+                            }
+                            Some(e)
+                        }
+                    };
+                    Some(SessionSpan {
+                        id,
+                        started_at_raw: started_at,
+                        start,
+                        end,
+                    })
+                })
+                .collect()
+        };
+        // (row, parsed start, parsed end) — completed sessions only.
+        let mut rows: Vec<(
+            SessionRecordRow,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        )> = all
+            .iter()
+            .filter_map(|span| {
+                let end = span.end?;
+                let secs = end.signed_duration_since(span.start).num_seconds();
+                if secs < 0 {
+                    return None;
+                }
+                Some((
+                    SessionRecordRow {
+                        session_id: span.id.clone(),
+                        started_at: span.started_at_raw.clone(),
+                        duration_seconds: secs,
+                        top_project: None,
+                    },
+                    span.start,
+                    end,
+                ))
+            })
+            .collect();
+        // Longest first; started_at DESC breaks ties deterministically.
+        rows.sort_by(|a, b| {
+            b.0.duration_seconds
+                .cmp(&a.0.duration_seconds)
+                .then_with(|| b.0.started_at.cmp(&a.0.started_at))
+        });
+        rows.truncate(limit);
+
+        // Fill top_project per row (bounded by the clamped limit). The
+        // signal pad is clamped to the midpoint toward the nearest
+        // neighbouring session on each side — the same idea the
+        // attribution worker applies to work-session pads — so a memory
+        // saved between two sessions counts toward the closer one only,
+        // and back-to-back sessions can't leak signal into each other
+        // (review point). Core overlaps (truly concurrent sessions) keep
+        // window semantics: the label is the window's dominant project.
+        // Signal failures degrade to "no project", never an error — the
+        // ranking itself must not depend on the graph being healthy.
+        let pad = chrono::Duration::minutes(SIGNAL_PAD_MINUTES);
+        let mut out = Vec::with_capacity(rows.len());
+        for (mut row, start, end) in rows {
+            let prev_end = all
+                .iter()
+                .filter(|span| span.id != row.session_id)
+                .filter_map(|span| span.end)
+                .filter(|e| *e <= start)
+                .max();
+            let next_start = all
+                .iter()
+                .filter(|span| span.id != row.session_id)
+                .map(|span| span.start)
+                .filter(|s| *s >= end)
+                .min();
+            let mut lo = start - pad;
+            if let Some(pe) = prev_end {
+                lo = lo.max(pe + (start - pe) / 2);
+            }
+            let mut hi = end + pad;
+            if let Some(ns) = next_start {
+                hi = hi.min(end + (ns - end) / 2);
+            }
+            // The pad may shrink to nothing, but never inverts the core.
+            lo = lo.min(start);
+            hi = hi.max(end);
+            let mut signals = self
+                .project_signals_in_window(lo, hi, MIN_PROJECT_MEMS)
+                .unwrap_or_default();
+            signals.sort_by(|a, b| {
+                b.weight
+                    .partial_cmp(&a.weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.project_key.cmp(&b.project_key))
+            });
+            row.top_project = signals
+                .first()
+                .and_then(|s| self.entity_name(&s.project_key).ok().flatten());
+            out.push(row);
+        }
+        Ok(out)
+    }
+
     /// All session ids whose UUID starts with `prefix`. Used by the CLI
     /// `session show` to support short ids (first 8+ chars) without
     /// silently grabbing the first match — the caller checks `.len() ==
@@ -5810,6 +5969,57 @@ impl Peer {
     /// `display_name` isn't set.
     pub fn label(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// One leaderboard row from `longest_sessions` — a completed session with
+/// its computed duration and the project that dominated it (if any).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionRecordRow {
+    pub session_id: String,
+    pub started_at: String,
+    pub duration_seconds: i64,
+    pub top_project: Option<String>,
+}
+
+/// Parse a session timestamp string into UTC. Sessions opened by
+/// the storage helpers use SQLite's `datetime('now')` which produces
+/// `YYYY-MM-DD HH:MM:SS` (space delimiter, no timezone) and is
+/// implicitly UTC. Sessions touched via `open_or_reuse_session_for_key`
+/// use chrono's `to_rfc3339()`, producing the standard form with
+/// timezone. This helper accepts both so duration math and date
+/// extraction don't silently fall over when the live DB has mixed
+/// timestamp formats — Codex caught this exact gap on the live DB
+/// where `Duration:` was missing from summaries because the rows
+/// were in SQLite format and only RFC3339 was being tried.
+pub fn parse_session_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // RFC3339 first (newer rows + manual code paths via to_rfc3339).
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // SQLite default: "%Y-%m-%d %H:%M:%S" in UTC.
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(naive.and_utc());
+    }
+    // SQLite sub-second variant (rarer but possible after a UPDATE
+    // with datetime('now', 'subsec')).
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(naive.and_utc());
+    }
+    None
+}
+
+/// Render a non-negative second count the way session summaries do
+/// ("42s" / "12m 3s" / "3h 40m"). Shared by dream's session summaries and
+/// the session leaderboard endpoint so durations read the same everywhere.
+pub fn human_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -7211,6 +7421,187 @@ mod tests {
         assert_eq!(
             s1_after.ended_at, s1_again.ended_at,
             "ended_at must not move on a double-close"
+        );
+    }
+
+    /// Leaderboard: longest completed sessions first, mixed timestamp
+    /// formats both parsed, open / clock-skewed rows excluded, and
+    /// top_project = the strongest attribution-window signal (NOT
+    /// memories.session_id joins — those are empty in the watcher flow,
+    /// Codex P1). A single-memory project stays under the noise floor.
+    #[test]
+    fn longest_sessions_orders_filters_and_attributes() {
+        let storage = Storage::open(&tmp_db()).unwrap();
+        let peer_id = storage.upsert_peer("claude", None, "agent").unwrap();
+        let mk = |label: &str| {
+            storage
+                .open_session(&peer_id, Some(label), "claude-code")
+                .unwrap()
+        };
+        let long = mk("long"); // 3h, SQLite format
+        let mid = mk("mid"); // 40m, RFC3339 format
+        let short = mk("short"); // 90s
+        let _open = mk("open"); // stays open — excluded
+        let skew = mk("skew"); // ends before it starts — excluded
+        {
+            let conn = storage.conn.lock().unwrap();
+            for (id, start, end) in [
+                (&long, "2026-07-01 10:00:00", "2026-07-01 13:00:00"),
+                (
+                    &mid,
+                    "2026-07-01T10:00:00+00:00",
+                    "2026-07-01T10:40:00+00:00",
+                ),
+                (&short, "2026-07-01 10:00:00", "2026-07-01 10:01:30"),
+                (&skew, "2026-07-02 10:00:00", "2026-07-02 09:00:00"),
+            ] {
+                conn.execute(
+                    "UPDATE sessions SET started_at = ?2, ended_at = ?3 WHERE id = ?1",
+                    params![id, start, end],
+                )
+                .unwrap();
+            }
+        }
+        // Project signal INSIDE the long session's window (11:00-11:30 —
+        // also outside the mid session's padded 09:50-10:50 window):
+        // demoapp gets 2 memories (clears the floor), sideproj only 1
+        // (extractor-noise floor keeps it out). No session_id links on
+        // purpose — production memories don't carry usable ones.
+        let demo = storage
+            .upsert_entity(&crate::graph::Entity {
+                name: "demoapp".into(),
+                entity_type: crate::graph::EntityType::Project,
+            })
+            .unwrap();
+        let side = storage
+            .upsert_entity(&crate::graph::Entity {
+                name: "sideproj".into(),
+                entity_type: crate::graph::EntityType::Project,
+            })
+            .unwrap();
+        let link = |title: &str, ts: &str, entity: &str| {
+            let m = crate::event::MemoryEntry::new(
+                title,
+                "body",
+                MemoryType::Note,
+                EventSource::Socket,
+            );
+            storage.save(&m).unwrap();
+            storage.link_memory_entity(&m.id, entity).unwrap();
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE memories SET timestamp = ?2 WHERE id = ?1",
+                params![m.id, ts],
+            )
+            .unwrap();
+        };
+        link("work note 1", "2026-07-01T11:00:00+00:00", &demo);
+        link("work note 2", "2026-07-01T11:30:00+00:00", &demo);
+        link("side note", "2026-07-01T11:15:00+00:00", &side);
+
+        let rows = storage.longest_sessions(10).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![long.as_str(), mid.as_str(), short.as_str()],
+            "longest first; open + skewed rows excluded"
+        );
+        assert_eq!(rows[0].duration_seconds, 3 * 3600);
+        assert_eq!(rows[1].duration_seconds, 40 * 60);
+        assert_eq!(rows[2].duration_seconds, 90);
+        assert_eq!(rows[0].top_project.as_deref(), Some("demoapp"));
+        assert!(
+            rows[1].top_project.is_none(),
+            "no project memories → no top_project"
+        );
+        assert_eq!(storage.longest_sessions(1).unwrap().len(), 1);
+        assert!(storage.longest_sessions(0).unwrap().is_empty());
+    }
+
+    /// The signal pad is clamped to the midpoint toward the neighbouring
+    /// session: a memory saved shortly AFTER session A ends counts toward
+    /// A only — session B starting 10 minutes later must not inherit it
+    /// through its own pre-pad (Codex P1, cross-session contamination).
+    #[test]
+    fn longest_sessions_signal_pad_clamps_to_neighbour_midpoint() {
+        let storage = Storage::open(&tmp_db()).unwrap();
+        let peer_id = storage.upsert_peer("claude", None, "agent").unwrap();
+        let a = storage
+            .open_session(&peer_id, Some("a"), "claude-code")
+            .unwrap();
+        let b = storage
+            .open_session(&peer_id, Some("b"), "claude-code")
+            .unwrap();
+        let ghost = storage
+            .open_session(&peer_id, Some("ghost"), "claude-code")
+            .unwrap();
+        {
+            let conn = storage.conn.lock().unwrap();
+            // A 10:00-11:00, B 11:10-11:20 — gap midpoint is 11:05.
+            conn.execute(
+                "UPDATE sessions SET started_at = '2026-07-01 10:00:00',
+                                     ended_at   = '2026-07-01 11:00:00' WHERE id = ?1",
+                params![a],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions SET started_at = '2026-07-01 11:10:00',
+                                     ended_at   = '2026-07-01 11:20:00' WHERE id = ?1",
+                params![b],
+            )
+            .unwrap();
+            // An INVALID completed span (ends before it starts) sitting in
+            // the gap. If it survived into the neighbour set, its 11:03
+            // start would clamp A's post-pad to 11:01:30 and steal the
+            // wrap-up memories below (review point: invalid completed
+            // spans must not bound valid sessions).
+            conn.execute(
+                "UPDATE sessions SET started_at = '2026-07-01 11:03:00',
+                                     ended_at   = '2026-07-01 09:00:00' WHERE id = ?1",
+                params![ghost],
+            )
+            .unwrap();
+        }
+        // Two project memories land 1-2 minutes after A ends: inside A's
+        // clamped post-pad (up to 11:05), OUTSIDE B's clamped pre-pad
+        // (from 11:05). An unclamped ±10min pad would hand them to BOTH.
+        let proj = storage
+            .upsert_entity(&crate::graph::Entity {
+                name: "gapproj".into(),
+                entity_type: crate::graph::EntityType::Project,
+            })
+            .unwrap();
+        for (title, ts) in [
+            ("wrapup note 1", "2026-07-01T11:01:00+00:00"),
+            ("wrapup note 2", "2026-07-01T11:02:00+00:00"),
+        ] {
+            let m = crate::event::MemoryEntry::new(
+                title,
+                "body",
+                MemoryType::Note,
+                EventSource::Socket,
+            );
+            storage.save(&m).unwrap();
+            storage.link_memory_entity(&m.id, &proj).unwrap();
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE memories SET timestamp = ?2 WHERE id = ?1",
+                params![m.id, ts],
+            )
+            .unwrap();
+        }
+
+        let rows = storage.longest_sessions(10).unwrap();
+        let row_a = rows.iter().find(|r| r.session_id == a).unwrap();
+        let row_b = rows.iter().find(|r| r.session_id == b).unwrap();
+        assert_eq!(
+            row_a.top_project.as_deref(),
+            Some("gapproj"),
+            "the closer session owns the wrap-up memories"
+        );
+        assert!(
+            row_b.top_project.is_none(),
+            "the later session must not inherit its neighbour's signal"
         );
     }
 

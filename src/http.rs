@@ -109,6 +109,7 @@ fn router(state: AppState) -> Router {
         .route("/api/activity/day", get(handle_activity_day))
         .route("/api/activity/projects", get(handle_activity_projects))
         .route("/api/journal", get(handle_journal))
+        .route("/api/leaderboard/sessions", get(handle_session_leaderboard))
         .route("/api/search", post(handle_search))
         // Write endpoints — Phase 4b. All idempotent or guarded by
         // explicit confirm/apply/dry_run flags. None of these are streaming yet;
@@ -491,6 +492,43 @@ async fn handle_journal(
     let digest = crate::journal::collect(&state.storage, act, day)
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::to_value(digest).unwrap_or_default()))
+}
+
+#[derive(Deserialize)]
+struct LeaderboardQuery {
+    /// Number of rows; defaults to 10, clamped to 1..=50.
+    limit: Option<usize>,
+}
+
+/// GET /api/leaderboard/sessions?limit=10 — the longest COMPLETED sessions,
+/// longest first: `{"sessions": [{session_id, started_at, duration_seconds,
+/// duration_human, top_project}]}`. Wrapped in an object (not a bare array)
+/// because the widget's httpObject client parses top-level JSON objects
+/// only — and it leaves room for response metadata later. Open sessions
+/// and malformed rows are excluded by the storage query; `top_project` is
+/// null when no project memory is linked to the session.
+async fn handle_session_leaderboard(
+    State(state): State<AppState>,
+    Query(q): Query<LeaderboardQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = q.limit.unwrap_or(10).clamp(1, 50);
+    let rows = state
+        .storage
+        .longest_sessions(limit)
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let payload: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "session_id": r.session_id,
+                "started_at": r.started_at,
+                "duration_seconds": r.duration_seconds,
+                "duration_human": crate::storage::human_duration(r.duration_seconds),
+                "top_project": r.top_project,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "sessions": payload })))
 }
 
 /// GET /api/activity/day?date=YYYY-MM-DD — one day's detail + session
