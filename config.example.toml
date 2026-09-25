@@ -1,0 +1,51 @@
+# Mnemonic Configuration
+# Copy to ~/.config/mnemonic/config.toml and customize
+
+[daemon]
+pid_file = "~/.mnemonic/mnemonic.pid"
+socket_path = "~/.mnemonic/mnemonic.sock"
+log_file = "~/.mnemonic/daemon.log"
+
+[watchers]
+# Directories to watch for file changes
+watch_paths = [
+    ".",                    # current working directory
+    "~/.claude-flow",       # claude-flow sessions/insights
+]
+# File extensions to track
+extensions = ["rs", "ts", "js", "py", "md", "toml", "json", "yaml"]
+# Paths to ignore (glob patterns)
+ignore_patterns = [
+    "target/",
+    "node_modules/",
+    ".git/objects/",
+    ".git/logs/",
+    "*.lock",
+]
+# Debounce interval for file events (milliseconds)
+debounce_ms = 500
+
+[classifier]
+# Minimum importance score to save a memory (0.0 - 1.0)
+# Lower = save more, higher = save only important stuff
+importance_threshold = 0.4
+# Cosine similarity threshold for deduplication (0.0 - 1.0)
+# Higher = stricter dedup (only near-identical skipped)
+dedup_threshold = 0.92
+
+[storage]
+# SQLite database path
+db_path = "~/.mnemonic/memory.db"
+
+[output]
+# Write to Claude Code memory files (~/.claude/projects/)
+memory_files_enabled = true
+memory_files_path = "~/.claude/projects"
+
+# Write to Obsidian vault (disabled by default — works fine without it)
+obsidian_enabled = false
+obsidian_path = "~/Documents/Obsidian/Vault"
+
+# Batch write interval (seconds)
+# Events are collected and processed in batches
+batch_interval_secs = 5

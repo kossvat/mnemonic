@@ -1,0 +1,123 @@
+[
+  {
+    "title": "Datewise tokenizer rewrite",
+    "content": "Decision: Datewise, the open-source date parsing library, drops its regex matcher for a hand-written tokenizer in Rust. The tokenizer is part of the core crate and every new format is covered by cargo-fuzz.",
+    "memory_type": "decision",
+    "expected_entities": ["datewise", "regex", "tokenizer", "rust", "cargo-fuzz"],
+    "expected_relations": [
+      ["tokenizer", "regex", "replaces"],
+      ["tokenizer", "datewise", "part_of"],
+      ["datewise", "rust", "uses"],
+      ["datewise", "cargo-fuzz", "uses"]
+    ]
+  },
+  {
+    "title": "Pantry Planner offline storage",
+    "content": "Pantry Planner keeps recipes in SQLite on the phone and syncs them through Supabase when online. The shopping list feature depends on the unit converter to merge quantities.",
+    "memory_type": "note",
+    "expected_entities": ["pantry-planner", "sqlite", "supabase", "shopping-list", "unit-converter"],
+    "expected_relations": [
+      ["pantry-planner", "sqlite", "uses"],
+      ["pantry-planner", "supabase", "uses"],
+      ["shopping-list", "pantry-planner", "part_of"],
+      ["shopping-list", "unit-converter", "depends_on"]
+    ]
+  },
+  {
+    "title": "Soil Probe firmware sampling loop",
+    "content": "Soil Probe firmware reads the capacitive moisture sensor over I2C every ten minutes and buffers samples in a ring buffer. A low battery reading blocks the nightly OTA update.",
+    "memory_type": "note",
+    "expected_entities": ["soil-probe", "moisture-sensor", "i2c", "ring-buffer", "low-battery", "ota-update"],
+    "expected_relations": [
+      ["soil-probe", "moisture-sensor", "depends_on"],
+      ["soil-probe", "i2c", "uses"],
+      ["ring-buffer", "soil-probe", "part_of"],
+      ["low-battery", "ota-update", "blocks"]
+    ]
+  },
+  {
+    "title": "Quillpress template engine switch",
+    "content": "Quillpress, a static site generator, moves its templates from Handlebars to Tera. Markdown parsing stays on pulldown-cmark, and preview builds still deploy to Cloudflare Pages.",
+    "memory_type": "decision",
+    "expected_entities": ["quillpress", "handlebars", "tera", "pulldown-cmark", "cloudflare"],
+    "expected_relations": [
+      ["tera", "handlebars", "replaces"],
+      ["quillpress", "tera", "uses"],
+      ["quillpress", "pulldown-cmark", "uses"],
+      ["quillpress", "cloudflare", "depends_on"]
+    ]
+  },
+  {
+    "title": "Rookery search improvements",
+    "content": "Rookery, the hobby chess engine, now searches with negamax and a transposition table keyed by Zobrist hashing. The opening book ships inside the engine binary, and GUIs talk to it over UCI.",
+    "memory_type": "decision",
+    "expected_entities": ["rookery", "negamax", "transposition-table", "zobrist-hashing", "opening-book", "uci"],
+    "expected_relations": [
+      ["rookery", "negamax", "uses"],
+      ["rookery", "transposition-table", "uses"],
+      ["transposition-table", "zobrist-hashing", "depends_on"],
+      ["opening-book", "rookery", "part_of"],
+      ["rookery", "uci", "uses"]
+    ]
+  },
+  {
+    "title": "Linkweaver backlink indexing correction",
+    "content": "Correction from the maintainer: Linkweaver, the backlink plugin for Joplin, must update its backlink index incrementally. A full rescan on every save blocks typing in large notebooks.",
+    "memory_type": "feedback",
+    "expected_entities": ["linkweaver", "joplin", "backlink-index", "full-rescan"],
+    "expected_relations": [
+      ["linkweaver", "joplin", "depends_on"],
+      ["linkweaver", "backlink-index", "uses"],
+      ["full-rescan", "linkweaver", "blocks"]
+    ]
+  },
+  {
+    "title": "Flashdeck scheduler ownership",
+    "content": "Flashdeck, a spaced repetition trainer, swaps its Leitner boxes for the SM-2 algorithm. The scheduler module now uses SM-2, and the mobile team owns the sync engine.",
+    "memory_type": "decision",
+    "expected_entities": ["flashdeck", "leitner-boxes", "sm-2", "scheduler", "mobile-team", "sync-engine"],
+    "expected_relations": [
+      ["sm-2", "leitner-boxes", "replaces"],
+      ["scheduler", "sm-2", "uses"],
+      ["scheduler", "flashdeck", "part_of"],
+      ["mobile-team", "sync-engine", "owns"]
+    ]
+  },
+  {
+    "title": "Nightsift session wrap-up",
+    "content": "Session summary: Nightsift, the astrophotography stacking tool, now aligns exposures with OpenCV feature matching and writes FITS output. Dark frame subtraction is part of the pipeline and depends on the calibration library.",
+    "memory_type": "session_summary",
+    "expected_entities": ["nightsift", "opencv", "fits", "dark-frame-subtraction", "calibration-library"],
+    "expected_relations": [
+      ["nightsift", "opencv", "uses"],
+      ["nightsift", "fits", "uses"],
+      ["dark-frame-subtraction", "nightsift", "part_of"],
+      ["dark-frame-subtraction", "calibration-library", "depends_on"]
+    ]
+  },
+  {
+    "title": "Tabtamer sync token storage",
+    "content": "Security: Tabtamer, a tab-grouping browser extension, kept its sync token in localStorage. It now stores the token in storage.session instead, and the content script can no longer read it.",
+    "memory_type": "security",
+    "expected_entities": ["tabtamer", "sync-token", "localstorage", "storage-session", "content-script"],
+    "expected_relations": [
+      ["storage-session", "localstorage", "replaces"],
+      ["tabtamer", "storage-session", "uses"],
+      ["tabtamer", "sync-token", "uses"],
+      ["content-script", "tabtamer", "part_of"]
+    ]
+  },
+  {
+    "title": "Gridsmith solver port",
+    "content": "Gridsmith, a crossword generator, is being ported from Python to Rust. The fill solver depends on a trie built from the word list, and the Python prototype stays only for comparison runs.",
+    "memory_type": "note",
+    "expected_entities": ["gridsmith", "python", "rust", "fill-solver", "trie", "word-list"],
+    "expected_relations": [
+      ["gridsmith", "rust", "uses"],
+      ["fill-solver", "gridsmith", "part_of"],
+      ["fill-solver", "trie", "depends_on"],
+      ["trie", "word-list", "depends_on"],
+      ["gridsmith", "python", "related_to"]
+    ]
+  }
+]

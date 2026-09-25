@@ -1,0 +1,497 @@
+<!--
+  Source for widget-hero.png — the Mnemonic widget README hero (4 cards: Work / Projects / Journal / Share).
+  DEMO DATA ONLY — no real user data. Edit the card content below, then re-render from this directory:
+
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+      --headless --screenshot=widget-hero.png --window-size=1540,800 \
+      --force-device-scale-factor=2 --hide-scrollbars \
+      file://$PWD/widget-hero.html
+
+  1540x800 @2x -> 3080x1600 PNG. Bump --window-size if you change card count/height.
+  Design tokens mirror clients/macos/Sources/MnemonicBar/WidgetTheme.swift (dark theme, amber #F2A35E).
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  /* ===== Mnemonic widget v3 "Hybrid" — design tokens (dark), ported 1:1 from WidgetTheme.swift ===== */
+  :root{
+    --bg:#1C1C1E; --text:#F5F5F7;
+    --sub:rgba(235,235,245,.62); --ter:rgba(235,235,245,.32);
+    --sep:rgba(255,255,255,.10); --fill:rgba(255,255,255,.05); --btnFill:rgba(255,255,255,.08);
+    --accent:#F2A35E; --accentSoft:rgba(242,163,94,.75);
+    --barIdle:rgba(235,235,245,.16); --track:rgba(118,118,128,.30); --thumb:#5B5B5E;
+    --working:#30D158; --feedback:#FF6B6B;
+    font-family:-apple-system,"SF Pro Text","SF Pro Display","Helvetica Neue",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  html{background:#161617}
+  body{
+    background:
+      radial-gradient(1100px 520px at 50% -8%, rgba(242,163,94,.10), transparent 60%),
+      radial-gradient(900px 700px at 50% 120%, rgba(99,102,241,.10), transparent 60%),
+      linear-gradient(160deg,#242428 0%,#161617 70%);
+    padding:56px 52px; width:max-content;
+  }
+  .row{display:flex; gap:30px; align-items:stretch}
+
+  /* ---- popover shell ---- */
+  .card{
+    width:336px; background:var(--bg); border-radius:18px;
+    border:1px solid rgba(255,255,255,.08);
+    box-shadow:0 30px 60px -18px rgba(0,0,0,.65), 0 2px 10px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.04);
+    color:var(--text); display:flex; flex-direction:column; overflow:hidden;
+  }
+  .pad{padding:14px 15px}
+  svg{display:block}
+  .ico{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+
+  /* ---- deck header ---- */
+  .hdr{display:flex;align-items:center;gap:9px;padding:13px 14px 10px}
+  .brand{font-size:13.5px;font-weight:700;letter-spacing:-.2px}
+  .status{display:flex;align-items:center;gap:6px;color:var(--sub);font-size:12.5px;font-weight:600}
+  .dot{width:7px;height:7px;border-radius:50%}
+  .pulse{position:relative}
+  .pulse::after{content:"";position:absolute;inset:-3px;border-radius:50%;border:1.5px solid rgba(48,209,88,.5)}
+  .nav{margin-left:auto;display:flex;gap:1px}
+  .nav .b{width:27px;height:27px;border-radius:7px;display:grid;place-items:center;color:var(--ter)}
+  .nav .b.on{color:var(--accent);background:var(--fill)}
+  .nav .ico{width:15px;height:15px}
+
+  /* ---- bottom page dots ---- */
+  .dots{display:flex;gap:7px;justify-content:center;align-items:center;padding:10px 0 12px}
+  .grab{width:34px;height:4px;border-radius:2px;background:var(--barIdle);margin:0 auto 9px}
+  .pd{width:6px;height:6px;border-radius:3px;background:var(--barIdle)}
+  .pd.on{width:17px;background:var(--accent)}
+
+  .body{flex:1}
+
+  /* ---- generic ---- */
+  .eyebrow{font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--ter)}
+  .seg{display:inline-flex;gap:2px;padding:2px;border-radius:8px;background:var(--track)}
+  .seg .s{font-size:12px;font-weight:600;color:var(--sub);padding:4px 10px;border-radius:6.5px;display:flex;align-items:center;gap:5px}
+  .seg .s.on{color:#fff;background:var(--thumb);box-shadow:0 1px 1px rgba(0,0,0,.18)}
+  .seg .s .ico{width:11px;height:11px;stroke-width:2}
+  .iconbtn{width:28px;height:28px;border-radius:7px;background:var(--btnFill);display:grid;place-items:center;color:var(--sub)}
+  .iconbtn .ico{width:14px;height:14px}
+
+  /* ===== WORK ===== */
+  .hero-n{font-size:46px;font-weight:700;letter-spacing:-1.8px;font-variant-numeric:tabular-nums;line-height:1}
+  .hero-u{font-size:21px;font-weight:600;color:var(--sub)}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}
+  .chip{font-size:11px;font-weight:500;color:var(--sub);background:var(--fill);border-radius:8px;padding:3px 9px}
+  .chip b{color:var(--text);font-weight:700;font-variant-numeric:tabular-nums}
+  .panel{background:var(--fill);border:1px solid var(--sep);border-radius:14px;padding:12px 13px 13px}
+
+  .chart{height:116px;display:flex;align-items:flex-end;gap:0;padding-top:10px}
+  .col{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
+  .bar{width:52%;border-radius:4px;background:var(--barIdle)}
+  .bar.on{background:var(--accent)}
+  .blab{font-size:11px;font-weight:500;color:var(--ter);margin-top:6px}
+  .blab.on{color:var(--accent);font-weight:700}
+  .blab.tod{color:var(--sub);font-weight:700}
+
+  .sep{height:1px;background:var(--sep);margin:11px 0}
+  .ddetail .top{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;font-weight:700;letter-spacing:-.2px}
+  .ddetail .stats{display:flex;gap:14px;margin-top:7px;font-size:11.5px}
+  .ddetail .stats b{color:var(--sub);font-weight:600}
+  .ddetail .stats span{color:var(--ter);font-weight:500}
+  .lane{position:relative;height:9px;border-radius:5px;background:var(--barIdle);margin-top:13px}
+  .blk{position:absolute;top:0;height:9px;border-radius:5px;background:var(--accent)}
+  .ticks{position:relative;height:14px;margin-top:4px}
+  .tick{position:absolute;font-size:10.5px;font-weight:700;color:var(--sub);font-variant-numeric:tabular-nums;transform:translateX(-50%)}
+
+  .acts{display:flex;gap:8px}
+  .pbtn{flex:1;height:38px;border-radius:10px;background:var(--accent);color:#fff;font-size:14px;font-weight:600;letter-spacing:-.2px;display:flex;align-items:center;justify-content:center;gap:7px}
+  .pbtn .ico{stroke:#fff;width:14px;height:14px;stroke-width:2}
+  .sbtn{height:38px;border-radius:10px;background:var(--btnFill);color:var(--text);font-size:14px;font-weight:600;letter-spacing:-.2px;display:flex;align-items:center;gap:7px;padding:0 14px}
+  .sbtn .ico{width:14px;height:14px;stroke-width:2}
+  .obtn{width:38px;height:38px;border-radius:10px;background:var(--btnFill);color:var(--sub);display:grid;place-items:center}
+
+  .memcard{background:var(--fill);border:1px solid var(--sep);border-radius:12px}
+  .mem-h{display:flex;align-items:center;padding:9px 13px 0}
+  .mem-h .lbl{font-size:10px;font-weight:700;letter-spacing:.6px;color:var(--ter)}
+  .mem-h .tot{margin-left:auto;font-size:10.5px;font-weight:600;color:var(--ter);font-variant-numeric:tabular-nums;padding-right:10px}
+  .mem-h .va{font-size:11.5px;font-weight:600;color:var(--accent)}
+  .mem-row{display:flex;gap:10px;padding:8px 13px 11px;align-items:flex-start}
+  .mem-ic{width:26px;height:26px;border-radius:7px;background:rgba(255,255,255,.05);display:grid;place-items:center;flex:none;margin-top:1px}
+  .mem-ic .ico{width:14px;height:14px;stroke-width:1.7}
+  .mem-tt{flex:1;min-width:0}
+  .mem-tt .t1{display:flex;align-items:baseline;gap:8px}
+  .mem-tt .ttl{font-size:13px;font-weight:600;letter-spacing:-.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+  .mem-tt .ago{font-size:11px;font-weight:500;color:var(--ter);flex:none}
+  .mem-tt .snip{font-size:12px;color:var(--sub);line-height:1.45;margin-top:3px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .chev{color:var(--ter);margin-top:3px}
+  .chev .ico{width:11px;height:11px;stroke-width:2.2}
+
+  /* ===== PROJECTS ===== */
+  .ptitle{font-size:19px;font-weight:700;letter-spacing:-.4px}
+  .psub{font-size:11.5px;font-weight:500;color:var(--ter)}
+  .psub b{color:var(--sub);font-weight:700;font-variant-numeric:tabular-nums}
+  .prow{display:flex;gap:11px;align-items:center;padding:10px 2px}
+  .prow + .prow{border-top:1px solid var(--sep)}
+  .pmain{flex:1;min-width:0}
+  .pr1{display:flex;align-items:baseline;gap:8px}
+  .pname{font-size:14px;font-weight:600;letter-spacing:-.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+  .pdur{font-size:13.5px;font-weight:700;font-variant-numeric:tabular-nums}
+  .cdot{width:6px;height:6px;border-radius:50%;flex:none}
+  .pr2{display:flex;align-items:center;gap:10px;margin-top:7px}
+  .sbar{flex:1;height:6px;border-radius:3px;background:var(--barIdle);overflow:hidden}
+  .sfill{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accentSoft),var(--accent))}
+  .pmem{font-size:11px;font-weight:600;color:var(--ter);font-variant-numeric:tabular-nums;flex:none}
+  .puna{color:var(--sub)}
+
+  /* ===== JOURNAL ===== */
+  .jtitle{font-size:19px;font-weight:700;letter-spacing:-.4px}
+  .jsub{font-size:11.5px;font-weight:600;color:var(--ter);margin-top:2px}
+  .jnav{display:flex;align-items:center;gap:5px}
+  .jnav .nb{width:25px;height:25px;border-radius:7px;background:var(--fill);display:grid;place-items:center;color:var(--text)}
+  .jnav .nb.off{color:rgba(235,235,245,.18)}
+  .jnav .nb .ico{width:11px;height:11px;stroke-width:2.4}
+  .jnav .lbl{font-size:11.5px;font-weight:700;color:var(--sub);min-width:60px;text-align:center}
+  .jcard{background:var(--fill);border:1px solid var(--sep);border-radius:12px;padding:12px}
+  .jsec{display:flex;align-items:center;gap:6px;font-size:10.5px;font-weight:700;letter-spacing:.6px;color:var(--ter)}
+  .jsec .ico{width:11px;height:11px;stroke-width:2}
+  .jsum{font-size:13px;font-weight:500;color:var(--sub);line-height:1.5;margin-top:8px}
+  .jpname{display:flex;align-items:baseline;gap:7px}
+  .jpname .n{font-size:13.5px;font-weight:700;letter-spacing:-.2px;flex:1}
+  .jpname .d{font-size:12.5px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums}
+  .jev{display:flex;gap:7px;margin-top:5px}
+  .jev .tm{font-size:10.5px;font-weight:700;color:var(--ter);font-variant-numeric:tabular-nums;width:42px;flex:none}
+  .jev .bullet{color:rgba(235,235,245,.4);font-weight:700}
+  .jev .tx{font-size:12px;font-weight:500;color:var(--sub);line-height:1.4}
+  .jitem{display:flex;gap:9px;align-items:flex-start;padding:9px 0}
+  .jitem + .jitem{border-top:1px solid var(--sep)}
+  .jitem .ico{width:14px;height:14px;flex:none;margin-top:1px;stroke-width:1.8}
+  .jitem .t{font-size:12.5px;font-weight:600;color:var(--text);line-height:1.35}
+  .jmore{font-size:11.5px;font-weight:700;color:var(--ter);padding:8px 0 2px 25px}
+
+  /* ===== SHARE ===== */
+  .shdr{display:flex;align-items:center;margin-bottom:13px}
+  .stitle{font-size:17px;font-weight:700;letter-spacing:-.2px}
+  .tone{width:28px;height:28px;border-radius:8px;background:var(--btnFill);display:grid;place-items:center;color:var(--sub);margin-left:auto}
+  .tone .ico{width:13px;height:13px;stroke-width:2}
+  .seg-full{display:flex;width:100%;margin-bottom:14px}
+  .seg-full .s{flex:1;justify-content:center}
+  .preview{position:relative;height:356px;border:1px solid var(--sep);border-radius:12px;background:var(--fill);overflow:hidden;margin-bottom:14px;display:grid;place-items:center}
+  .scaler{width:202px;height:314px;position:relative}
+  .scard{width:360px;height:560px;border-radius:26px;background:#FFF4E4;border:1px solid rgba(0,0,0,.08);box-shadow:0 16px 34px rgba(0,0,0,.22);padding:29px 32px;display:flex;flex-direction:column;color:#21160E;transform:scale(.56);transform-origin:top left}
+  .sc-hd{display:flex;align-items:center;gap:10px}
+  .sc-logo{width:25px;height:25px;border-radius:7px;background:rgba(201,114,44,.10);display:grid;place-items:center;color:#C9722C}
+  .sc-logo .ico{width:14px;height:14px;stroke-width:2}
+  .sc-name{font-size:15px;font-weight:700;color:#21160E}
+  .sc-date{margin-left:auto;font-size:13px;font-weight:500;color:rgba(68,49,33,.68)}
+  .sc-lbl{font-size:12px;font-weight:700;letter-spacing:1.6px;color:#C9722C}
+  .sc-time{display:flex;align-items:baseline;gap:5px;margin:18px 0}
+  .sc-n{font-size:62px;font-weight:700;letter-spacing:-1.6px;font-variant-numeric:tabular-nums;line-height:1;color:#21160E}
+  .sc-u{font-size:27px;font-weight:600;color:rgba(68,49,33,.68)}
+  .sc-sub{font-size:14px;font-weight:600;color:rgba(68,49,33,.68)}
+  .sc-sess{margin-top:19px}
+  .sc-lane{position:relative;height:11px;border-radius:6px;background:rgba(0,0,0,.12);margin-top:10px}
+  .sc-blk{position:absolute;top:0;height:11px;border-radius:6px;background:#C9722C}
+  .sc-ticks{position:relative;height:16px;margin-top:6px}
+  .sc-tick{position:absolute;font-size:12px;font-weight:700;color:rgba(68,49,33,.68);font-variant-numeric:tabular-nums;transform:translateX(-50%)}
+  .sc-ft{margin-top:auto}
+  .sc-div{height:1px;background:rgba(0,0,0,.08);margin-bottom:17px}
+  .sc-tag{display:flex;align-items:center;justify-content:center;gap:6px;font-size:12px;font-weight:600;color:rgba(68,49,33,.68)}
+  .sc-d{width:4px;height:4px;border-radius:50%;background:#C9722C}
+  .sw{display:flex;align-items:center;background:var(--fill);border-radius:12px;padding:9px 12px;margin-bottom:14px}
+  .sw-t{font-size:13px;font-weight:600;color:var(--text)}
+  .sw-s{font-size:11.5px;font-weight:500;color:var(--ter);margin-top:1px}
+  .switch{margin-left:auto;width:38px;height:22px;border-radius:11px;background:rgba(120,120,128,.32);position:relative}
+  .switch::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3)}
+  .sbtns{display:flex;gap:9px}
+  .sbtn2{flex:1;height:38px;border-radius:10px;background:var(--btnFill);color:var(--text);font-size:13px;font-weight:600;display:flex;align-items:center;justify-content:center;gap:7px}
+  .sbtn2 .ico{width:13px;height:13px;stroke-width:2}
+</style>
+</head>
+<body>
+<div class="row">
+
+  <!-- ============ WORK ============ -->
+  <div class="card">
+    <div class="hdr">
+      <span class="brand">Mnemonic</span>
+      <span class="status"><span class="dot pulse" style="background:var(--working)"></span>Running</span>
+      <div class="nav">
+        <div class="b on"><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2z"/><path d="M8 3v18"/></svg></div>
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><path d="M12 15V4"/><path d="M8 8l4-4 4 4"/><path d="M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg></div>
+      </div>
+    </div>
+
+    <div class="body pad" style="padding-top:0">
+      <div class="eyebrow" style="margin-bottom:4px">WORKED TODAY</div>
+      <div style="display:flex;align-items:baseline;gap:2px;margin-bottom:7px">
+        <span class="hero-n">4</span><span class="hero-u" style="margin-right:6px">h</span>
+        <span class="hero-n">12</span><span class="hero-u">m</span>
+      </div>
+      <div class="status" style="margin-bottom:8px"><span class="dot" style="background:var(--working)"></span>In session · 52m</div>
+      <div class="chips" style="margin-bottom:14px">
+        <span class="chip"><b>20h 02m</b> this week</span>
+        <span class="chip"><b style="color:var(--working)">+2h 30m</b> vs avg · Best Wed</span>
+      </div>
+
+      <div class="panel" style="margin-bottom:13px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:11px">
+          <div class="seg"><span class="s on">Week</span><span class="s">Month</span></div>
+          <div class="iconbtn"><svg class="ico" viewBox="0 0 24 24"><path d="M12 15V4"/><path d="M8 8l4-4 4 4"/><path d="M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg></div>
+          <div style="margin-left:auto" class="seg">
+            <span class="s on"><svg class="ico" viewBox="0 0 24 24"><path d="M5 20V10M12 20V4M19 20v-7"/></svg></span>
+            <span class="s"><svg class="ico" viewBox="0 0 24 24"><path d="M3 12c3-7 5-7 8 0s5 7 8 0"/></svg></span>
+          </div>
+        </div>
+
+        <div class="chart">
+          <div class="col"><div class="bar" style="height:21%"></div><div class="blab">F</div></div>
+          <div class="col"><div class="bar" style="height:3px"></div><div class="blab">S</div></div>
+          <div class="col"><div class="bar" style="height:69%"></div><div class="blab">S</div></div>
+          <div class="col"><div class="bar" style="height:79%"></div><div class="blab">M</div></div>
+          <div class="col"><div class="bar" style="height:43%"></div><div class="blab">T</div></div>
+          <div class="col"><div class="bar" style="height:100%"></div><div class="blab">W</div></div>
+          <div class="col"><div class="bar on" style="height:83%"></div><div class="blab on tod">T</div></div>
+        </div>
+
+        <div class="sep"></div>
+        <div class="ddetail">
+          <div class="top"><span>Today</span><span>4h 12m</span></div>
+          <div class="stats"><span><b>6</b> sessions</span><span><b>1h 20m</b> longest</span><span><b>9:30a</b> span</span></div>
+          <div class="lane">
+            <div class="blk" style="left:18.75%;width:9%"></div>
+            <div class="blk" style="left:31%;width:3%"></div>
+            <div class="blk" style="left:42%;width:13%"></div>
+            <div class="blk" style="left:57%;width:2.4%"></div>
+            <div class="blk" style="left:62%;width:7%"></div>
+            <div class="blk" style="left:78%;width:6%"></div>
+          </div>
+          <div class="ticks">
+            <span class="tick" style="left:18.75%">9a</span>
+            <span class="tick" style="left:37.5%">12p</span>
+            <span class="tick" style="left:56.25%">3p</span>
+            <span class="tick" style="left:75%">6p</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="acts" style="margin-bottom:13px">
+        <div class="pbtn"><svg class="ico" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/></svg>Open App</div>
+        <div class="sbtn"><svg class="ico" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Add Memory</div>
+        <div class="obtn"><svg class="ico" viewBox="0 0 24 24" style="width:16px;height:16px;stroke-width:2.4"><circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/></svg></div>
+      </div>
+
+      <div class="memcard">
+        <div class="mem-h"><span class="lbl">LATEST MEMORY</span><span class="tot">312 total</span><span class="va">View all →</span></div>
+        <div class="mem-row">
+          <div class="mem-ic"><svg class="ico" viewBox="0 0 24 24" style="stroke:var(--working)"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.6.6 1 1.2 1 2.5h6c0-1.3.4-1.9 1-2.5A6 6 0 0 0 12 3z"/></svg></div>
+          <div class="mem-tt">
+            <div class="t1"><span class="ttl">Use Argon2id for password hashing</span><span class="ago">1h ago</span></div>
+            <div class="snip">Decision: replaced bcrypt with Argon2id in the auth service — better resistance to GPU cracking, tuned to ~80ms.</div>
+          </div>
+          <div class="chev"><svg class="ico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="dots-wrap"><div class="grab"></div>
+      <div class="dots"><span class="pd on"></span><span class="pd"></span><span class="pd"></span><span class="pd"></span></div>
+    </div>
+  </div>
+
+  <!-- ============ PROJECTS ============ -->
+  <div class="card">
+    <div class="hdr">
+      <span class="brand">Mnemonic</span>
+      <span class="status"><span class="dot pulse" style="background:var(--working)"></span>Running</span>
+      <div class="nav">
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>
+        <div class="b on"><svg class="ico" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2z"/><path d="M8 3v18"/></svg></div>
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><path d="M12 15V4"/><path d="M8 8l4-4 4 4"/><path d="M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg></div>
+      </div>
+    </div>
+
+    <div class="body" style="padding:6px 16px 16px">
+      <div style="display:flex;align-items:center;margin-bottom:12px">
+        <span class="ptitle">Projects</span>
+        <div class="seg" style="margin-left:auto"><span class="s">Today</span><span class="s on">Week</span></div>
+      </div>
+      <div class="psub" style="margin-bottom:6px"><b>12h 05m</b> attributed this week · 4 projects</div>
+
+      <div class="prow">
+        <div class="pmain">
+          <div class="pr1"><span class="pname">acme-api</span><span class="pdur">6h 40m</span><span class="cdot" style="background:var(--working)"></span></div>
+          <div class="pr2"><div class="sbar"><div class="sfill" style="width:100%"></div></div><span class="pmem">84 mem</span></div>
+        </div>
+        <div class="chev"><svg class="ico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></div>
+      </div>
+      <div class="prow">
+        <div class="pmain">
+          <div class="pr1"><span class="pname">web-client</span><span class="pdur">3h 15m</span><span class="cdot" style="background:var(--accent)"></span></div>
+          <div class="pr2"><div class="sbar"><div class="sfill" style="width:49%"></div></div><span class="pmem">41 mem</span></div>
+        </div>
+        <div class="chev"><svg class="ico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></div>
+      </div>
+      <div class="prow">
+        <div class="pmain">
+          <div class="pr1"><span class="pname">mobile-app</span><span class="pdur">1h 30m</span><span class="cdot" style="background:var(--accent)"></span></div>
+          <div class="pr2"><div class="sbar"><div class="sfill" style="width:22%"></div></div><span class="pmem">23 mem</span></div>
+        </div>
+        <div class="chev"><svg class="ico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></div>
+      </div>
+      <div class="prow">
+        <div class="pmain">
+          <div class="pr1"><span class="pname">infra-scripts</span><span class="pdur">40m</span><span class="cdot" style="background:var(--accent)"></span></div>
+          <div class="pr2"><div class="sbar"><div class="sfill" style="width:10%"></div></div><span class="pmem">12 mem</span></div>
+        </div>
+        <div class="chev"><svg class="ico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></div>
+      </div>
+      <div class="prow">
+        <div class="pmain">
+          <div class="pr1"><span class="pname puna">Unattributed</span><span class="pdur" style="color:var(--ter)">5h 20m</span></div>
+          <div class="pr2"><div class="sbar" style="opacity:.45"><div class="sfill" style="width:80%"></div></div><span class="pmem">low signal</span></div>
+        </div>
+        <div class="chev"><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 3 2.4c-.6.2-1 .7-1 1.6"/><path d="M12 17h.01"/></svg></div>
+      </div>
+    </div>
+
+    <div class="dots-wrap"><div class="grab"></div>
+      <div class="dots"><span class="pd"></span><span class="pd on"></span><span class="pd"></span><span class="pd"></span></div>
+    </div>
+  </div>
+
+  <!-- ============ JOURNAL ============ -->
+  <div class="card">
+    <div class="hdr">
+      <span class="brand">Mnemonic</span>
+      <span class="status"><span class="dot pulse" style="background:var(--working)"></span>Running</span>
+      <div class="nav">
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+        <div class="b on"><svg class="ico" viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2z"/><path d="M8 3v18"/></svg></div>
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><path d="M12 15V4"/><path d="M8 8l4-4 4 4"/><path d="M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg></div>
+      </div>
+    </div>
+
+    <div class="body" style="padding:6px 16px 16px">
+      <div style="display:flex;align-items:flex-start;margin-bottom:12px">
+        <div><div class="jtitle">Journal</div><div class="jsub">Wed, Mar 12</div></div>
+        <div class="jnav" style="margin-left:auto">
+          <div class="nb"><svg class="ico" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></div>
+          <span class="lbl">Yesterday</span>
+          <div class="nb off"><svg class="ico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></div>
+        </div>
+      </div>
+
+      <div class="jcard" style="margin-bottom:12px">
+        <div class="jsec"><svg class="ico" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>SUMMARY</div>
+        <div class="jsum">6h 40m on acme-api — shipped JWT refresh-token rotation and fixed the rate-limiter. 4 decisions, 2 follow-ups.</div>
+      </div>
+
+      <div class="jcard" style="margin-bottom:12px">
+        <div class="jsec" style="margin-bottom:6px"><svg class="ico" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>BY PROJECT</div>
+        <div class="jpname"><span class="n">acme-api</span><span class="d">6h 40m</span><span class="cdot" style="background:var(--working)"></span></div>
+        <div class="jev"><span class="tm">09:42</span><span class="bullet">·</span><span class="tx">Added refresh-token rotation to the auth service</span></div>
+        <div class="jev"><span class="tm">13:15</span><span class="bullet">·</span><span class="tx">Fixed rate-limiter dropping request bursts under load</span></div>
+        <div class="jev"><span class="tm">16:50</span><span class="bullet">·</span><span class="tx">Migrated the session store to Redis with WAL fallback</span></div>
+      </div>
+
+      <div class="jcard">
+        <div class="jsec" style="margin-bottom:5px"><svg class="ico" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11"/><path d="M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"/></svg>DECISIONS &amp; FOLLOW-UPS</div>
+        <div class="jitem"><svg class="ico" viewBox="0 0 24 24" style="stroke:var(--working)"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.6.6 1 1.2 1 2.5h6c0-1.3.4-1.9 1-2.5A6 6 0 0 0 12 3z"/></svg><span class="t">Use Argon2id for password hashing (was bcrypt)</span></div>
+        <div class="jitem"><svg class="ico" viewBox="0 0 24 24" style="stroke:var(--working)"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.6.6 1 1.2 1 2.5h6c0-1.3.4-1.9 1-2.5A6 6 0 0 0 12 3z"/></svg><span class="t">Cache user lookups for 60s to cut database load</span></div>
+        <div class="jitem"><svg class="ico" viewBox="0 0 24 24" style="stroke:var(--working)"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.6.6 1 1.2 1 2.5h6c0-1.3.4-1.9 1-2.5A6 6 0 0 0 12 3z"/></svg><span class="t">Adopt cursor pagination for the activity feed</span></div>
+        <div class="jmore">+1 more decision</div>
+        <div class="jitem"><svg class="ico" viewBox="0 0 24 24" style="stroke:var(--accent)"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></svg><span class="t">Add an integration test for token refresh</span></div>
+      </div>
+    </div>
+
+    <div class="dots-wrap"><div class="grab"></div>
+      <div class="dots"><span class="pd"></span><span class="pd"></span><span class="pd on"></span><span class="pd"></span></div>
+    </div>
+  </div>
+
+  <!-- ============ SHARE ============ -->
+  <div class="card">
+    <div class="hdr">
+      <span class="brand">Mnemonic</span>
+      <span class="status"><span class="dot pulse" style="background:var(--working)"></span>Running</span>
+      <div class="nav">
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+        <div class="b"><svg class="ico" viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2z"/><path d="M8 3v18"/></svg></div>
+        <div class="b on"><svg class="ico" viewBox="0 0 24 24"><path d="M12 15V4"/><path d="M8 8l4-4 4 4"/><path d="M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg></div>
+      </div>
+    </div>
+
+    <div class="body" style="padding:6px 16px 16px">
+      <div class="shdr">
+        <span class="stitle">Share work summary</span>
+        <div class="tone"><svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg></div>
+      </div>
+
+      <div class="seg seg-full">
+        <span class="s on">Today</span><span class="s">Week</span><span class="s">Clean</span>
+      </div>
+
+      <div class="preview">
+        <div class="scaler">
+          <div class="scard">
+            <div class="sc-hd">
+              <div class="sc-logo"><svg class="ico" viewBox="0 0 24 24"><path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-1 5.4V15a3 3 0 0 0 4 2.8M15 4a3 3 0 0 1 3 3 3 3 0 0 1 1 5.4V15a3 3 0 0 1-4 2.8M12 4v14"/></svg></div>
+              <span class="sc-name">Mnemonic</span>
+              <span class="sc-date">Wed · Mar 12</span>
+            </div>
+            <div style="flex:1;min-height:46px"></div>
+            <div>
+              <div class="sc-lbl">WORKED TODAY</div>
+              <div class="sc-time"><span class="sc-n">4</span><span class="sc-u">h</span><span class="sc-n">12</span><span class="sc-u">m</span></div>
+              <div class="sc-sub">6 sessions · longest 1h 20m</div>
+              <div class="sc-sess">
+                <div class="sc-lbl">TODAY'S SESSIONS</div>
+                <div class="sc-lane">
+                  <div class="sc-blk" style="left:18.75%;width:9%"></div>
+                  <div class="sc-blk" style="left:31%;width:3%"></div>
+                  <div class="sc-blk" style="left:42%;width:13%"></div>
+                  <div class="sc-blk" style="left:57%;width:2.4%"></div>
+                  <div class="sc-blk" style="left:62%;width:7%"></div>
+                  <div class="sc-blk" style="left:78%;width:6%"></div>
+                </div>
+                <div class="sc-ticks">
+                  <span class="sc-tick" style="left:18.75%">9a</span>
+                  <span class="sc-tick" style="left:37.5%">12p</span>
+                  <span class="sc-tick" style="left:56.25%">3p</span>
+                  <span class="sc-tick" style="left:75%">6p</span>
+                </div>
+              </div>
+            </div>
+            <div style="flex:1;min-height:0"></div>
+            <div class="sc-ft">
+              <div class="sc-div"></div>
+              <div class="sc-tag"><span class="sc-d"></span>tracked with Mnemonic</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sw">
+        <div><div class="sw-t">Include latest memory</div><div class="sw-s">Off</div></div>
+        <div class="switch"></div>
+      </div>
+
+      <div class="sbtns">
+        <div class="pbtn" style="flex:1.2"><svg class="ico" viewBox="0 0 24 24"><path d="M12 4v10M8 11l4 4 4-4M5 20h14"/></svg>Save Image</div>
+        <div class="sbtn2"><svg class="ico" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg>Copy</div>
+        <div class="sbtn2"><svg class="ico" viewBox="0 0 24 24"><path d="M12 15V4"/><path d="M8 8l4-4 4 4"/><path d="M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg>Share</div>
+      </div>
+    </div>
+
+    <div class="dots-wrap"><div class="grab"></div>
+      <div class="dots"><span class="pd"></span><span class="pd"></span><span class="pd"></span><span class="pd on"></span></div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
