@@ -480,7 +480,35 @@ of this codebase.
 
 - It indexes your Claude Code transcripts (`~/.claude/projects/**/*.jsonl`), your Codex CLI transcripts (`~/.codex/sessions/**/*.jsonl` and `~/.codex/archived_sessions/`), and git activity into a local SQLite store. **Excerpts of your conversations are stored verbatim** in `~/.mnemonic/memory.db` — treat that file as sensitive. It's created mode `0600` inside a `0700` directory. Codex transcript capture can be disabled with `watchers.codex_enabled = false` in config.
 - The activity tracker reads **only a system idle-seconds counter** — no keystrokes, no window titles, no screenshots, and it needs no Accessibility permission.
-- It does not intentionally read `~/.env`, SSH/AWS credentials, or the keychain. Do not paste secrets into agent chats: if a secret appears in a captured transcript, the local database may preserve that excerpt.
+- It does not intentionally read `~/.env`, SSH/AWS credentials, or the keychain. Do not paste secrets into agent chats: what mnemonic recognizes of a secret it redacts before it stores the excerpt (see [Secret redaction](#secret-redaction)), and it does not recognize every secret.
+
+### Secret redaction
+
+Before text is classified, embedded or stored, mnemonic removes what is marked private and replaces what it recognizes as a credential with a fixed marker:
+
+- everything between `<private>` and `</private>` becomes `[REDACTED:private]`;
+- a recognized credential becomes `[REDACTED:credential]`: a private key block, a token with a known provider prefix, a JWT, a bearer token, a password in a URL, and a value kept under a credential name (`password=`, `api_key:`, `TOKEN=` and the like).
+
+This is policy version 1. It works on your machine, by shape, with no model and no network.
+
+A memory is redacted as it reads: a title and a content that are each harmless and read as a credential together (`password:` over a long value) are redacted together.
+
+**What it does not do.** A clean result means that nothing was recognized, not that nothing is secret. There is no entropy test: a secret in a shape the policy does not know is stored as it is. A value under a credential name is masked when it is 20 characters or longer and mixes letters and digits; a call (`password=f(x)`) and a dotted path are left alone, and a bare `key` or a lowercase `*_key` is not a credential name, since mnemonic uses those for ids.
+
+**Names are refused, not rewritten.** Text is redacted and kept. What identifies something (an id, a project, a subject, a key, a graph name, a path) is not: a name that holds a credential is refused with the code `SENSITIVE_CONTENT`, because a rewritten name would point at something else. This is stricter than before: a save, a fact, a follow-up or a graph write that names something by a credential now fails. A shared publication or observation is refused whole, never rewritten, since every agent of the project reads it as it is. An error says the code and not what was refused.
+
+**What a model writes is input too.** Dream summaries, generated conclusions and consolidated memories are redacted before they are shown, embedded or stored. A graph that a model extracted is refused when it names something by a credential, and only the accepted structure is cached. A failed generation leaves a fixed code (`BACKEND_FAILED`, `GENERATED_JSON_INVALID`, ...), never the error's text. Search queries and context topics are redacted before they reach the embedder.
+
+**Everything that writes has to be this version.** The guarantee holds for what this version writes. An older `mnemonic` that still runs (a daemon, an MCP server in an open session, a second machine on the same store) writes as it always did. Upgrade and restart all of them.
+
+**What was stored before stays as it is.** Rows, vectors, the full-text index, caches, backups, exported files and what a sink already wrote are not rewritten by this version, and reading them shows what they hold. To see what an existing store holds, scan a closed copy of it:
+
+```bash
+sqlite3 ~/.mnemonic/memory.db "VACUUM INTO 'snapshot.db'"
+mnemonic redact scan --db snapshot.db
+```
+
+The scanner reads the one file it is given and changes nothing: it selects no profile, loads no configuration or model, and writes no journal beside the file. It refuses a file that has a `-wal`, `-shm` or `-journal` beside it, so give it a copy, not the live store. The report is JSON and says where and what class of thing, never what: a table, a column, a row number, and counts by class. It holds no id, no key and no value of the snapshot. Exit code `0` means everything was read and nothing was found, `2` that something was found, `1` that not everything could be read (an unknown table or column, a value that does not decode, a file that changed), whatever was found. Bytes of vectors and of the full-text index's own tables are not scanned. A field is judged by itself. Delete the snapshot when you are done: it is a full copy of your store.
 
 ### Network surface (the menu-bar widget)
 

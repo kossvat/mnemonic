@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::event::{Event, EventKind, EventSource};
+use crate::redaction;
 
 pub struct GitWatcher {
     repo_path: PathBuf,
@@ -52,6 +53,37 @@ impl GitWatcher {
             insertions: stats.insertions(),
             deletions: stats.deletions(),
         })
+    }
+
+    /// The event for a new commit, or `None` when it cannot be admitted
+    /// (a message past the metadata size limit). Its message is prepared
+    /// before it is formatted, copied into metadata or logged: a commit
+    /// message can carry a pasted token as easily as a chat turn can.
+    fn commit_event(info: &CommitInfo) -> Option<Event> {
+        let message = redaction::redact_text(info.message.trim());
+        let content = format!(
+            "Git commit: {} (+{} -{} in {} files)",
+            message.value, info.insertions, info.deletions, info.files_changed,
+        );
+        let event = Event::new(EventSource::GitWatcher, EventKind::GitCommit, &content)
+            .with_metadata(serde_json::json!({
+                "commit_id": info.id,
+                "message": message.value,
+                "files_changed": info.files_changed,
+                "insertions": info.insertions,
+                "deletions": info.deletions,
+            }));
+        // Nothing left to redact; this records what the pass above did.
+        match redaction::prepare_event(event, redaction::STRUCTURAL_KEYS) {
+            Ok(mut prepared) => {
+                prepared.absorb(&message);
+                Some(prepared.into_event())
+            }
+            Err(code) => {
+                warn!("git watcher: a commit was refused ({})", code.code());
+                None
+            }
+        }
     }
 }
 
@@ -102,26 +134,10 @@ impl super::Watcher for GitWatcher {
                 let current_id = Self::get_head_commit_id(&repo);
 
                 if current_id != last_commit_id {
-                    if let Some(info) = Self::extract_commit_info(&repo) {
-                        let content = format!(
-                            "Git commit: {} (+{} -{} in {} files)",
-                            info.message.trim(),
-                            info.insertions,
-                            info.deletions,
-                            info.files_changed,
-                        );
-
-                        let event =
-                            Event::new(EventSource::GitWatcher, EventKind::GitCommit, &content)
-                                .with_metadata(serde_json::json!({
-                                    "commit_id": info.id,
-                                    "message": info.message.trim(),
-                                    "files_changed": info.files_changed,
-                                    "insertions": info.insertions,
-                                    "deletions": info.deletions,
-                                }));
-
-                        debug!("New commit detected: {}", info.message.trim());
+                    if let Some(info) = Self::extract_commit_info(&repo)
+                        && let Some(event) = Self::commit_event(&info)
+                    {
+                        debug!("New commit detected: {}", event.content);
 
                         if tx.send(event).await.is_err() {
                             return; // Channel closed
@@ -140,6 +156,39 @@ impl super::Watcher for GitWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pasted key in a commit message is masked before the message is
+    /// formatted, copied into metadata or logged; the commit id stays.
+    #[test]
+    fn redaction_ingress_git_commit_message_is_prepared() {
+        let value: String = "a1B2c3D4e5F6".chars().cycle().take(32).collect();
+        let info = CommitInfo {
+            id: "0123456789abcdef0123456789abcdef01234567".into(),
+            message: format!("feat: wire the api\n\nOPENAI_API_KEY={value}\n"),
+            files_changed: 2,
+            insertions: 3,
+            deletions: 1,
+        };
+        let event = GitWatcher::commit_event(&info).unwrap();
+        let text = format!("{} {}", event.content, event.metadata);
+        assert!(!text.contains(&value));
+        assert!(event.content.starts_with("Git commit: feat: wire the api"));
+        assert!(event.content.ends_with("(+3 -1 in 2 files)"));
+        assert_eq!(event.metadata["commit_id"], info.id);
+        assert_eq!(
+            event.metadata[crate::redaction::SUMMARY_KEY]["counts"]["credential_assignment"],
+            1
+        );
+        assert!(crate::redaction::check_event(&event, crate::redaction::STRUCTURAL_KEYS).is_ok());
+
+        // A message past the metadata size limit is skipped, not a panic in
+        // the watcher task.
+        let oversized = CommitInfo {
+            message: "a".repeat(17 << 20),
+            ..info
+        };
+        assert!(GitWatcher::commit_event(&oversized).is_none());
+    }
 
     #[test]
     fn local_head_and_diff_stats_follow_two_commits() {

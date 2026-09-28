@@ -1,4 +1,5 @@
 pub mod canonical;
+pub mod dedupe;
 pub mod extractor;
 pub mod extractor_llm;
 

@@ -20,6 +20,20 @@ use crate::watcher::files::FileWatcher;
 use crate::watcher::git::GitWatcher;
 use crate::watcher::scope::ProjectScope;
 
+/// The classifier cuts a title out of the content, and a cut can turn a
+/// clean text into a credential shape (`password=f(` loses the `(` that
+/// made it code). Prepare its result again, keeping the summary admission
+/// wrote, before it is embedded, scored or written.
+fn prepare_classified(entry: crate::event::MemoryEntry) -> Option<crate::event::MemoryEntry> {
+    match crate::redaction::reprepare_entry(entry, crate::redaction::STRUCTURAL_KEYS) {
+        Ok(prepared) => Some(prepared.into_entry()),
+        Err(code) => {
+            warn!("classified memory refused ({})", code.code());
+            None
+        }
+    }
+}
+
 fn record_ingress_skip(storage: &Storage, seq: Option<i64>, reason: SkipReason) {
     if let Some(seq) = seq
         && let Err(e) =
@@ -507,51 +521,17 @@ impl Daemon {
                 Some(event) = rx.recv() => {
                     // Urgent events bypass batching
                     if event.kind == crate::event::EventKind::UserCorrection {
-                        if let Some(entry) = classifier.classify(&event) {
-                            let emb = {
-                                let text = format!("{} {}", entry.title, entry.content);
-                                embedder.embed(&text).ok()
-                            };
-                            if let Err(e) = storage.save_with_embedding(&entry, emb.as_ref()) {
-                                error!("Storage save error: {e}");
-                                // Don't enqueue extraction or invoke sinks
-                                // for a row that didn't make it into the DB.
-                                // The worker would just see Ok(None) and
-                                // dequeue silently; sinks would write to
-                                // disk referencing a non-existent memory.
-                                continue;
-                            }
-                            // Peer attribution + session link. Turn-aware
-                            // when the memory carries `role` metadata
-                            // from the conversation watcher; jsonl_path
-                            // metadata also routes to SessionTracker.
-                            // Errors logged at warn; never block save flow.
-                            if let Some(att) = attributor.as_ref() {
-                                att.attribute(&storage, &entry, session_tracker.as_ref());
-                            }
-                            // Knowledge-graph extraction. Async path (default)
-                            // just enqueues the id and lets the background
-                            // worker do the LLM round-trip. Sync path retains
-                            // the legacy in-line extract for users who turn
-                            // async off or run without an event loop.
-                            if async_extraction {
-                                if let Err(e) = storage.enqueue_extraction(&entry.id) {
-                                    warn!("Enqueue extraction error: {e}");
-                                }
-                            } else {
-                                let extraction = graph_extractor.extract(&entry);
-                                if (!extraction.entities.is_empty() || !extraction.edges.is_empty())
-                                    && let Err(e) = storage.save_graph(&entry.id, &extraction.entities, &extraction.edges) {
-                                        warn!("Graph save error: {e}");
-                                    }
-                            }
-                            for sink in &sinks {
-                                if let Err(e) = sink.write(&entry) {
-                                    warn!("Sink {} error: {e}", sink.name());
-                                }
-                            }
-                            info!("URGENT saved: {} [{}]", entry.title, entry.memory_type);
-                        }
+                        self.process_urgent(
+                            &event,
+                            &classifier,
+                            &storage,
+                            &sinks,
+                            &*embedder,
+                            &*graph_extractor,
+                            async_extraction,
+                            attributor.as_ref(),
+                            session_tracker.as_ref(),
+                        );
                     } else {
                         batch.push((None, event));
                     }
@@ -607,6 +587,70 @@ impl Daemon {
         std::process::exit(0);
     }
 
+    /// An urgent event (a correction) is stored at once, past the batch.
+    /// The entry is prepared like any other, and what is embedded, stored
+    /// and handed to the sinks is the prepared one. An entry the store
+    /// does not take reaches no sink.
+    #[allow(clippy::too_many_arguments)]
+    fn process_urgent(
+        &self,
+        event: &Event,
+        classifier: &impl Classifier,
+        storage: &Storage,
+        sinks: &[Box<dyn OutputSink>],
+        embedder: &dyn Embedder,
+        graph_extractor: &dyn EntityExtractor,
+        async_extraction: bool,
+        attributor: Option<&PeerAttributor>,
+        session_tracker: Option<&std::sync::Mutex<SessionTracker>>,
+    ) {
+        let Some(entry) = classifier.classify(event).and_then(prepare_classified) else {
+            return;
+        };
+        let emb = {
+            let text = format!("{} {}", entry.title, entry.content);
+            embedder.embed(&text).ok()
+        };
+        if let Err(e) = storage.save_with_embedding(&entry, emb.as_ref()) {
+            error!("Storage save error: {e}");
+            // Don't enqueue extraction or invoke sinks for a row that
+            // didn't make it into the DB. The worker would just see
+            // Ok(None) and dequeue silently; sinks would write to disk
+            // referencing a non-existent memory.
+            return;
+        }
+        // Peer attribution + session link. Turn-aware when the memory
+        // carries `role` metadata from the conversation watcher;
+        // jsonl_path metadata also routes to SessionTracker. Errors
+        // logged at warn; never block save flow.
+        if let Some(att) = attributor {
+            att.attribute(storage, &entry, session_tracker);
+        }
+        // Knowledge-graph extraction. Async path (default) just enqueues
+        // the id and lets the background worker do the LLM round-trip.
+        // Sync path retains the legacy in-line extract for users who turn
+        // async off or run without an event loop.
+        if async_extraction {
+            if let Err(e) = storage.enqueue_extraction(&entry.id) {
+                warn!("Enqueue extraction error: {e}");
+            }
+        } else {
+            let extraction = graph_extractor.extract(&entry);
+            if (!extraction.entities.is_empty() || !extraction.edges.is_empty())
+                && let Err(e) =
+                    storage.save_graph(&entry.id, &extraction.entities, &extraction.edges)
+            {
+                warn!("Graph save error: {e}");
+            }
+        }
+        for sink in sinks {
+            if let Err(e) = sink.write(&entry) {
+                warn!("Sink {} error: {e}", sink.name());
+            }
+        }
+        info!("URGENT saved: {} [{}]", entry.title, entry.memory_type);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn process_batch(
         &self,
@@ -629,7 +673,17 @@ impl Daemon {
         let mut low_importance = 0;
 
         for (ingress_seq, event) in batch {
-            match classifier.classify(event) {
+            let classified = match classifier.classify(event) {
+                Some(entry) => match prepare_classified(entry) {
+                    Some(entry) => Some(entry),
+                    None => {
+                        record_ingress_skip(storage, *ingress_seq, SkipReason::Rejected);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            match classified {
                 Some(mut entry) => {
                     // Generate embedding
                     let text = format!("{} {}", entry.title, entry.content);
@@ -2091,3 +2145,7 @@ mod lifecycle_tests {
 #[cfg(test)]
 #[path = "daemon_ingress_tests.rs"]
 mod ingress_tests;
+
+#[cfg(test)]
+#[path = "daemon_outputs_tests.rs"]
+mod outputs_tests;

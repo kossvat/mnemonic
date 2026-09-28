@@ -66,10 +66,82 @@ fn hold_back_proposals(conn: &Connection, slot: &str, target: &str, predicate: &
     Ok(())
 }
 
+/// Where the rows of a slot are about to be filed: the keys they will be
+/// found by and the names they will be shown under.
+struct Destination {
+    scope_key: String,
+    subject_key: String,
+    predicate: String,
+    qualifier_key: String,
+    /// Scope, subject, predicate and qualifier as they will be shown.
+    shown: [String; 4],
+}
+
+/// The rows of `slot` are about to be filed at `to`. Each of them is judged
+/// as the statement it will be there, by the judgement a statement made
+/// today gets: what a move makes of a fact must be something that could
+/// have been stated. So a project renamed to `token` cannot show the
+/// values of its facts as credentials, and a subject renamed to `Bearer`
+/// cannot make one of a predicate. A value stored before the policy that
+/// the policy refuses holds its facts where they are until it is erased.
+fn admit_move(conn: &Connection, slot: &str, to: &Destination) -> Result<()> {
+    use super::admit::{check, check_resolved};
+    let mut stmt = conn.prepare(
+        "SELECT value FROM fact_values
+          WHERE slot_id = ?1 AND kind = 'value' AND status <> 'rejected'",
+    )?;
+    let values: Vec<String> = stmt
+        .query_map([slot], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let [scope, subject, predicate, qualifier] = &to.shown;
+    let resolved = store::Resolved {
+        scope_key: to.scope_key.clone(),
+        scope: scope.clone(),
+        subject_key: to.subject_key.clone(),
+        subject_target: None,
+        predicate: to.predicate.clone(),
+        qualifier_key: to.qualifier_key.clone(),
+        labels: Vec::new(),
+    };
+    // The slot by its names alone, then with each value it holds.
+    for value in std::iter::once(None).chain(values.iter().map(|v| Some(v.as_str()))) {
+        let statement = store::FactWrite {
+            project: Some(scope.as_str()).filter(|s| !s.is_empty()),
+            subject,
+            predicate,
+            qualifier: Some(qualifier.as_str()).filter(|q| !q.is_empty()),
+            value,
+            actor: "graph",
+            ..Default::default()
+        };
+        check(&statement)
+            .and_then(|()| check_resolved(&statement, &resolved))
+            .map_err(|refused| crate::redaction::state::refused("rekey", refused.code))?;
+    }
+    Ok(())
+}
+
 /// Move the facts about `old` (as a subject, and as a project) to `new`.
 /// A slot that already exists under the new name takes the moved values:
 /// the chain re-derives by time, so the newest value stays current.
+///
+/// All of it or none: the names are judged first, and every move is judged
+/// where it happens, against the store as the moves before it left it (a
+/// name that is both a subject and a project moves a slot twice, and only
+/// the second move shows where its values land). A refusal undoes the
+/// moves already made, whatever transaction the caller runs.
 pub fn rekey_in_tx(conn: &Connection, old: &str, new: &str) -> Result<()> {
+    crate::graph::canonical::admit_renamed("rekey", [old, new])?;
+    conn.execute_batch("SAVEPOINT fact_rekey")?;
+    let moved = move_facts(conn, old, new);
+    conn.execute_batch(match moved {
+        Ok(()) => "RELEASE fact_rekey",
+        Err(_) => "ROLLBACK TO fact_rekey; RELEASE fact_rekey",
+    })?;
+    moved
+}
+
+fn move_facts(conn: &Connection, old: &str, new: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     for column in ["subject_key", "scope_key"] {
         let (from, to) = if column == "subject_key" {
@@ -99,15 +171,45 @@ pub fn rekey_in_tx(conn: &Connection, old: &str, new: &str) -> Result<()> {
             } else {
                 (to.clone(), subject)
             };
-            let existing: Option<String> = conn
+            let names = |r: &rusqlite::Row<'_>| -> rusqlite::Result<[String; 4]> {
+                Ok([r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?])
+            };
+            // The slot the rows would join, with the names it keeps.
+            let existing: Option<(String, [String; 4])> = conn
                 .query_row(
-                    "SELECT id FROM fact_slots WHERE scope_key = ?1 AND subject_key = ?2
-                       AND predicate = ?3 AND qualifier_key = ?4",
+                    "SELECT id, scope, subject, predicate_label, qualifier FROM fact_slots
+                      WHERE scope_key = ?1 AND subject_key = ?2 AND predicate = ?3
+                        AND qualifier_key = ?4",
                     params![scope, subject, predicate, qualifier],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, names(r)?)),
                 )
                 .optional()?;
-            match existing {
+            let shown = match &existing {
+                Some((_, kept)) => kept.clone(),
+                // Its own names, with the one that changes.
+                None => {
+                    let mut own = conn.query_row(
+                        "SELECT id, scope, subject, predicate_label, qualifier FROM fact_slots
+                          WHERE id = ?1",
+                        [&slot],
+                        names,
+                    )?;
+                    own[if column == "subject_key" { 1 } else { 0 }] = new.to_owned();
+                    own
+                }
+            };
+            admit_move(
+                conn,
+                &slot,
+                &Destination {
+                    scope_key: scope.clone(),
+                    subject_key: subject.clone(),
+                    predicate: predicate.clone(),
+                    qualifier_key: qualifier.clone(),
+                    shown,
+                },
+            )?;
+            match existing.map(|(target, _)| target) {
                 Some(target) => {
                     // Both ways: which name is kept must not decide whether a
                     // proposal escapes review (review point).

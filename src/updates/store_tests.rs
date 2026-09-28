@@ -192,3 +192,77 @@ fn a_link_needs_two_live_memories() {
     };
     assert!(insert(&conn, &own).is_err());
 }
+
+/// A link that holds what the redaction policy refuses is not written,
+/// and the memories it would join stay as they are.
+#[test]
+fn redaction_state_update_link_that_holds_a_credential_is_not_written() {
+    let token: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+    let storage = store();
+    let old = memory(&storage, "the plan is five a month", 10);
+    let new = memory(&storage, "the plan is six a month", 0);
+    // A memory stored before the policy, filed under a credential.
+    {
+        let conn = storage.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, timestamp, title, content, memory_type, tags, source,
+                importance, metadata)
+             VALUES (?1, '2026-01-02T03:04:05Z', 't', 'c', 'note', '[]', '\"Manual\"', 0.5, 'null')",
+            [&token],
+        )
+        .unwrap();
+    }
+    let (was, now) = (value("rate:5", "five"), value("rate:6", "six"));
+    let between = |was: &Value, now: &Value, new_id: &str, old_id: &str| Link {
+        new_id: new_id.into(),
+        old_id: old_id.into(),
+        rule: Rule::ValueDiff,
+        class: Class::Money,
+        was: vec![was.clone()],
+        now: vec![now.clone()],
+        similarity: Some(0.97),
+        actor: "test",
+    };
+    let refused = [
+        between(&value("rate:5", &token), &now, &new, &old),
+        between(&was, &value("rate:6", &token), &new, &old),
+        between(&value(&token, "five"), &now, &new, &old),
+        between(&was, &now, &new, &token),
+        between(&was, &now, &token, &old),
+    ];
+    for link in &refused {
+        let conn = storage.conn.lock().unwrap();
+        assert!(!insert(&conn, link).unwrap());
+    }
+    assert!(links(&storage).is_empty());
+    let mut named = between(&was, &now, &new, &old);
+    named.actor = Box::leak(token.clone().into_boxed_str());
+    assert!(!insert(&storage.conn.lock().unwrap(), &named).unwrap());
+    assert!(links(&storage).is_empty());
+
+    let admitted = between(&was, &now, &new, &old);
+    assert!(insert(&storage.conn.lock().unwrap(), &admitted).unwrap());
+    assert!(links(&storage).len() == 1);
+}
+
+/// What a duplicate reaffirms is kept under the id of a memory and as a
+/// time: not under an id the policy refuses, and nothing that is not a time.
+#[test]
+fn redaction_state_reaffirmation_is_kept_under_an_admitted_id_at_a_time() {
+    let token: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+    let at = "2026-01-02T03:04:05+00:00";
+    let storage = store();
+    let id = memory(&storage, "the plan is five a month", 10);
+    let conn = storage.conn.lock().unwrap();
+    let held = || -> i64 {
+        conn.query_row("SELECT count(*) FROM memory_reaffirmed", [], |r| r.get(0))
+            .unwrap()
+    };
+    reaffirm(&conn, &token, at).unwrap();
+    assert!(held() == 0);
+    let error = reaffirm(&conn, &id, &token).unwrap_err();
+    assert!(!format!("{error:#} {error:?}").contains(&token));
+    assert!(held() == 0);
+    reaffirm(&conn, &id, at).unwrap();
+    assert!(held() == 1);
+}

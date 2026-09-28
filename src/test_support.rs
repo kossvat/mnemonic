@@ -95,6 +95,52 @@ impl crate::embedding::Embedder for ConstEmbedder {
     }
 }
 
+/// An embedder that keeps every text it is given, for a test to read what
+/// reached the model. One made with `failing` refuses every text, and says
+/// the text in its error, as a model backend may.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct RecordingEmbedder {
+    texts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    fails: bool,
+}
+
+#[cfg(test)]
+impl RecordingEmbedder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn failing() -> Self {
+        Self {
+            fails: true,
+            ..Self::default()
+        }
+    }
+
+    /// Every text given so far, in order.
+    pub fn texts(&self) -> Vec<String> {
+        self.texts.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl crate::embedding::Embedder for RecordingEmbedder {
+    fn embed(&self, text: &str) -> anyhow::Result<crate::embedding::Embedding> {
+        self.texts.lock().unwrap().push(text.to_string());
+        if self.fails {
+            anyhow::bail!("embedder failed on: {text}");
+        }
+        let mut vector = vec![0.0; crate::embedding::EMBED_DIMS];
+        vector[0] = 1.0;
+        Ok(vector)
+    }
+
+    fn model_id(&self) -> &'static str {
+        "recording-test"
+    }
+}
+
 /// What `legacy_facts_fixture` seeded: every row, and each chain's current
 /// value as (subject, predicate, value).
 #[cfg(test)]

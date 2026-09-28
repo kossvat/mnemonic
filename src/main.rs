@@ -25,9 +25,11 @@ mod lint;
 mod mcp;
 mod output;
 mod profile;
+mod redaction;
 mod reflection;
 mod reranker;
 mod retrieval;
+mod scan;
 mod scoring;
 mod semantic_attribution;
 mod shared;
@@ -47,6 +49,14 @@ use tracing_subscriber::EnvFilter;
 use config::Config;
 use daemon::Daemon;
 use event::{EventSource, MemoryEntry, MemoryType};
+
+/// The file a context is written to, as the caller named it. A path
+/// identifies a file: one the redaction policy refuses is not used and
+/// not shown, and no other file is written in its place.
+fn context_output(path: &str) -> Result<std::path::PathBuf> {
+    redaction::state::admit_identities("context output", [path])?;
+    Ok(std::path::PathBuf::from(path))
+}
 
 fn init_logging(log_file: Option<&std::path::Path>) {
     if let Some(path) = log_file {
@@ -262,6 +272,11 @@ enum Commands {
     Mcp,
     /// Publish project context and serve a restricted agent MCP (separate DB)
     Shared(shared::SharedArgs),
+    /// Inspect stored data against the redaction policy
+    Redact {
+        #[command(subcommand)]
+        command: scan::RedactCommands,
+    },
     /// Generate default config file
     Init {
         /// Capture Claude Code and Codex transcripts, but only from sessions
@@ -898,9 +913,35 @@ enum DreamCommands {
     },
 }
 
+/// What a command failed with is shown prepared, like any text: an error
+/// can say back what the command line gave it.
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("Error: {}", redaction::state::said_in_full(&error));
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
+    // A command line of the scanner that cannot be read is answered in
+    // fixed words and with the scanner's own code for bad input: what it
+    // was given is a path, and 2 is its code for findings.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if error.use_stderr() && scan::is_scan_invocation(std::env::args_os().skip(1)) =>
+        {
+            eprintln!("{}", scan::USAGE);
+            std::process::exit(1);
+        }
+        Err(error) => error.exit(),
+    };
+    // The scanner reads the one file it is given: before a profile is
+    // selected and before any configuration, store, model or sink.
+    if let Commands::Redact { command } = &cli.command {
+        std::process::exit(scan::run(command));
+    }
     // The restricted shared service must not load private configuration,
     // private vocabulary, models, sinks, or the owner's memory database.
     if let Commands::Shared(args) = &cli.command {
@@ -927,6 +968,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Shared(_) => unreachable!("shared command is handled before private config"),
+        Commands::Redact { .. } => unreachable!("the scanner is handled before private config"),
         Commands::Start { daemon: bg } => {
             // Liveness-aware start: distinguish genuine running from
             // stale-PID-after-crash. Codex's review found that the
@@ -1123,7 +1165,8 @@ async fn main() -> Result<()> {
             let results = st.search(&text, limit)?;
 
             if results.is_empty() {
-                println!("No results for: {text}");
+                // What was asked for is shown prepared, like any text.
+                println!("No results for: {}", redaction::state::said_of(&text));
             } else {
                 println!("Found {} results:\n", results.len());
                 for entry in &results {
@@ -1186,7 +1229,11 @@ async fn main() -> Result<()> {
                 _ => MemoryType::Note,
             };
 
-            let tag_list: Vec<String> = tags
+            // One string until it is split: a private region may span a
+            // comma, and a fragment of one is still private.
+            let tags_redacted = redaction::redact_text(&tags);
+            let tag_list: Vec<String> = tags_redacted
+                .value
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -1196,9 +1243,24 @@ async fn main() -> Result<()> {
             entry.tags = tag_list;
 
             let st = storage::Storage::open(&config.storage.db_path)?;
+            let refused =
+                |code: redaction::RedactionError| anyhow::anyhow!("save refused ({})", code.code());
             if let Some(project) = project.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                // Judged raw, before it is resolved: canonicalizing a name can
+                // drop the very syntax that made it a credential.
+                redaction::check_identity(project).map_err(refused)?;
                 updates::plan::set_project(&st, &mut entry, project)?;
             }
+            // Admission: nothing below, the printed title included, sees the
+            // text as it arrived; the resolved project is judged again here.
+            let mut prepared =
+                redaction::prepare_entry(entry, redaction::STRUCTURAL_KEYS).map_err(refused)?;
+            prepared.absorb(&tags_redacted);
+            if prepared.summary().changed() {
+                println!("Redacted: {}", prepared.summary().to_json()["counts"]);
+            }
+            let mut entry = prepared.into_entry();
+            let title = entry.title.clone();
             let mut linked = None;
 
             // Generate embedding, dedup check, and dynamic scoring
@@ -1286,6 +1348,8 @@ async fn main() -> Result<()> {
             let st = storage::Storage::open(&config.storage.db_path)?;
 
             let embedder = embedding::create_embedder()?;
+            // A query is new text: embedded and shown prepared.
+            let text = redaction::redact_text(&text).value;
             let query_emb = embedder.embed_query(&text)?;
             let results = st.find_similar(&query_emb, limit)?;
 
@@ -1316,7 +1380,10 @@ async fn main() -> Result<()> {
             if removed {
                 println!("Forgot memory {}", &id[..8.min(id.len())]);
             } else {
-                println!("No memory with id `{id}` (already gone or never existed)");
+                println!(
+                    "No memory with id `{}` (already gone or never existed)",
+                    redaction::state::shown(&id)
+                );
             }
         }
         Commands::IngestHistory { since, apply } => {
@@ -1349,6 +1416,12 @@ async fn main() -> Result<()> {
             println!("  no message id:        {}", report.without_id);
             println!("  no timestamp:         {}", report.undated);
             println!("  copied by /compact:   {}", report.repeated);
+            if report.refused > 0 {
+                println!("  path refused:         {}", report.refused);
+            }
+            if report.refused_turns > 0 {
+                println!("  key refused:          {}", report.refused_turns);
+            }
             if let Some(floor) = &report.floor {
                 println!(
                     "\nThis store was capturing before durable ingress existed, so history\n\
@@ -1375,7 +1448,7 @@ async fn main() -> Result<()> {
             // Default output: project memory dir / CONTEXT.md
             let explicit_output = output.is_some();
             let output_path = match output {
-                Some(p) => std::path::PathBuf::from(p),
+                Some(p) => context_output(&p)?,
                 None => {
                     let cwd = std::env::current_dir()?;
                     let encoded = urlencoding::encode(&cwd.to_string_lossy()).to_string();
@@ -1543,9 +1616,15 @@ async fn main() -> Result<()> {
 
             // launchctl service — only meaningful on macOS, and only
             // if user opted into the LaunchAgent. The plist path is
-            // the conventional one we ship with the project.
+            // the conventional one we ship with the project. The
+            // LaunchAgent runs the default store; a profile daemon is
+            // started by hand, so probing launchd here would report the
+            // owner's service instead of this profile's.
+            let profile_home = profile::active()?;
             #[cfg(target_os = "macos")]
-            {
+            if profile_home.is_some() {
+                println!("- launchd: not used for isolated profiles");
+            } else {
                 let label = "com.kossvat.mnemonic.daemon";
                 let out = std::process::Command::new("launchctl").arg("list").output();
                 match out {
@@ -1582,21 +1661,30 @@ async fn main() -> Result<()> {
             // `cargo install` because `.local/bin` was higher in $PATH.
             // Surface the mismatch loudly so the user notices before
             // wasting another hour on "why is the new code not running".
+            // A profile is launched by absolute path and never by
+            // launchd, so both probes would only describe the owner's
+            // install.
             let current_exe = std::env::current_exe().ok();
-            let shell_resolved = std::process::Command::new("which")
-                .arg("mnemonic")
-                .output()
-                .ok()
-                .and_then(|o| {
-                    if o.status.success() {
-                        String::from_utf8(o.stdout)
-                            .ok()
-                            .map(|s| std::path::PathBuf::from(s.trim()))
-                    } else {
-                        None
-                    }
-                });
-            let launchctl_program = {
+            let shell_resolved = if profile_home.is_some() {
+                None
+            } else {
+                std::process::Command::new("which")
+                    .arg("mnemonic")
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        if o.status.success() {
+                            String::from_utf8(o.stdout)
+                                .ok()
+                                .map(|s| std::path::PathBuf::from(s.trim()))
+                        } else {
+                            None
+                        }
+                    })
+            };
+            let launchctl_program = if profile_home.is_some() {
+                None
+            } else {
                 #[cfg(target_os = "macos")]
                 {
                     let label = "com.kossvat.mnemonic.daemon";
@@ -1705,7 +1793,7 @@ async fn main() -> Result<()> {
             // Check config
             let home = dirs::home_dir().unwrap_or_default();
             let config_path = Config::config_path()?;
-            if let Some(profile_home) = profile::active()? {
+            if let Some(profile_home) = &profile_home {
                 println!("✓ Isolated profile: {}", profile_home.display());
             }
             if config_path.exists() {
@@ -1860,10 +1948,20 @@ async fn main() -> Result<()> {
             let result = st.graph_query(&entity)?;
 
             if !result.found {
-                println!("Entity '{}' not found in graph.", entity);
+                println!(
+                    "Entity '{}' not found in graph.",
+                    redaction::state::shown(&entity)
+                );
                 if let Some(canonical) = st.canonical_for_alias(&entity)? {
-                    println!("'{}' is an alias of '{}'.", entity, canonical);
-                    println!("\nTry: mnemonic graph {}", canonical);
+                    println!(
+                        "'{}' is an alias of '{}'.",
+                        redaction::state::shown(&entity),
+                        redaction::state::shown(&canonical)
+                    );
+                    println!(
+                        "\nTry: mnemonic graph {}",
+                        redaction::state::shown(&canonical)
+                    );
                 }
                 println!("\nTip: run 'mnemonic entities' to see known entities,");
                 println!("     or 'mnemonic backfill' to build graph from existing memories.");
@@ -1933,16 +2031,10 @@ async fn main() -> Result<()> {
             let st = storage::Storage::open(&config.storage.db_path)?;
             let all = st.recent(1000)?; // Get all memories
             let extractor = graph::extractor::RuleExtractor::new();
-            use graph::extractor::EntityExtractor;
 
-            let mut total_entities = 0;
-            let mut total_edges = 0;
-
-            for entry in &all {
-                let result = extractor.extract(entry);
-                st.replace_graph_and_reconcile_projects(entry, &result.entities, &result.edges)?;
-                total_entities += result.entities.len();
-                total_edges += result.edges.len();
+            let (total_entities, total_edges, refused) = backfill_graph(&st, &extractor, &all)?;
+            if refused > 0 {
+                println!("  Left as is: {refused} memories (SENSITIVE_CONTENT)");
             }
 
             let (entity_count, edge_count) = st.graph_stats()?;
@@ -2966,7 +3058,10 @@ fn run_peer_command(config: &Config, sub: PeerCommands) -> Result<()> {
             let peer = match storage.peer_by_name(&name)? {
                 Some(p) => p,
                 None => {
-                    println!("No peer named `{}`", name.to_lowercase());
+                    println!(
+                        "No peer named `{}`",
+                        redaction::state::shown(&name.to_lowercase())
+                    );
                     return Ok(());
                 }
             };
@@ -3019,7 +3114,7 @@ fn run_fact_command(config: &Config, sub: FactCommands) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&views)?);
             } else if views.is_empty() {
-                println!("No facts about `{subject}`");
+                println!("No facts about `{}`", redaction::state::shown(&subject));
             } else {
                 for view in &views {
                     println!("{}", facts::render::slot(view, history));
@@ -3138,6 +3233,12 @@ fn run_fact_command(config: &Config, sub: FactCommands) -> Result<()> {
                         audit.not_imported
                     );
                 }
+                if audit.held_back > 0 {
+                    println!(
+                        "Held back by the redaction policy (SENSITIVE_CONTENT): {}",
+                        audit.held_back
+                    );
+                }
                 if !audit.mismatched_current.is_empty() {
                     println!("Old current value differs: {:?}", audit.mismatched_current);
                 }
@@ -3154,6 +3255,39 @@ fn run_fact_command(config: &Config, sub: FactCommands) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What is printed when a memory's graph could not be written. The id is
+/// shown unless it is what the guard refused.
+fn graph_failure(id: &str, error: &anyhow::Error) -> String {
+    format!(
+        "replace_graph failed for {}: {error}",
+        redaction::state::shown(id)
+    )
+}
+
+/// Rebuild the graph of each memory. One whose graph the guard refuses (a
+/// name from a memory stored before the redaction policy) keeps the graph
+/// it had; the backfill goes on. Returns entity mentions, edges, and how
+/// many memories were left as they were.
+fn backfill_graph(
+    storage: &storage::Storage,
+    extractor: &dyn graph::extractor::EntityExtractor,
+    entries: &[event::MemoryEntry],
+) -> Result<(usize, usize, usize)> {
+    let (mut entities, mut edges, mut refused) = (0, 0, 0);
+    for entry in entries {
+        let result = extractor.extract(entry);
+        match storage.replace_graph_and_reconcile_projects(entry, &result.entities, &result.edges) {
+            Ok(()) => {
+                entities += result.entities.len();
+                edges += result.edges.len();
+            }
+            Err(e) if redaction::state::is_refused(&e) => refused += 1,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((entities, edges, refused))
 }
 
 /// Dispatch for `mnemonic conclusion ...`. Real semantics live in
@@ -3177,7 +3311,7 @@ fn run_conclusion_command(config: &Config, sub: ConclusionCommands) -> Result<()
                 println!(
                     "No {} conclusions for `{}`",
                     if history { "" } else { "current " },
-                    subject.to_lowercase()
+                    redaction::state::shown(&subject.to_lowercase())
                 );
                 return Ok(());
             }
@@ -3185,7 +3319,7 @@ fn run_conclusion_command(config: &Config, sub: ConclusionCommands) -> Result<()
                 "{} conclusion{} for `{}`{}",
                 rows.len(),
                 if rows.len() == 1 { "" } else { "s" },
-                subject.to_lowercase(),
+                redaction::state::shown(&subject.to_lowercase()),
                 if history {
                     " (full history, newest first)"
                 } else {
@@ -3243,6 +3377,8 @@ fn run_conclusion_command(config: &Config, sub: ConclusionCommands) -> Result<()
             limit,
             apply,
         } => {
+            // Before the subject reaches a prompt, a query or a message.
+            redaction::state::admit_identities("conclusion", [subject.as_str()])?;
             // Refuse when LLM is off in config — generating without
             // a backend would just dump a confusing error from the
             // network call. Surface the config gate explicitly.
@@ -3275,6 +3411,13 @@ fn run_conclusion_command(config: &Config, sub: ConclusionCommands) -> Result<()
                 println!(
                     "  · [{}] {}   (conf {:.2})",
                     c.kind, c.statement, c.confidence
+                );
+            }
+            if out.withheld > 0 {
+                println!(
+                    "  ({} more left out: {})",
+                    out.withheld,
+                    redaction::RedactionError::SensitiveContent
                 );
             }
             if !apply {
@@ -3362,7 +3505,10 @@ fn run_conclusion_command(config: &Config, sub: ConclusionCommands) -> Result<()
                     );
                 }
                 None => {
-                    println!("No conclusion with id `{full_id}`");
+                    println!(
+                        "No conclusion with id `{}`",
+                        redaction::state::shown(&full_id)
+                    );
                     return Ok(());
                 }
             }
@@ -3384,6 +3530,8 @@ fn run_conclusion_command(config: &Config, sub: ConclusionCommands) -> Result<()
 /// must be ≥ 8 chars and resolve to exactly one row. Ambiguous
 /// matches error loudly so destructive operations stay explicit.
 fn resolve_conclusion_id_prefix(storage: &storage::Storage, prefix: &str) -> Result<String> {
+    // The messages below name the prefix: only one the policy admits.
+    redaction::state::admit_identities("conclusion", [prefix])?;
     if prefix.len() >= 36 {
         return Ok(prefix.to_string());
     }
@@ -3529,7 +3677,10 @@ fn run_session_command(config: &Config, sub: SessionCommands) -> Result<()> {
                 let p = match storage.peer_by_name(name)? {
                     Some(p) => p,
                     None => {
-                        println!("No peer named `{}`", name.to_lowercase());
+                        println!(
+                            "No peer named `{}`",
+                            redaction::state::shown(&name.to_lowercase())
+                        );
                         return Ok(());
                     }
                 };
@@ -3556,7 +3707,7 @@ fn run_session_command(config: &Config, sub: SessionCommands) -> Result<()> {
 
             if sessions.is_empty() {
                 let scope = if let Some(name) = &peer {
-                    format!("`{}`", name.to_lowercase())
+                    format!("`{}`", redaction::state::shown(&name.to_lowercase()))
                 } else if open {
                     "open".into()
                 } else {
@@ -3602,7 +3753,7 @@ fn run_session_command(config: &Config, sub: SessionCommands) -> Result<()> {
             let session = match storage.session_by_id(&full_id)? {
                 Some(s) => s,
                 None => {
-                    println!("No session with id `{full_id}`");
+                    println!("No session with id `{}`", redaction::state::shown(&full_id));
                     return Ok(());
                 }
             };
@@ -3700,14 +3851,16 @@ fn run_dream_command(config: &Config, sub: DreamCommands) -> Result<()> {
             // canonical summary causes skip. With `--regenerate`, we
             // explicitly forget the old one and produce a fresh one
             // — the canonical "upgrade heuristic to LLM" path.
+            let mut prior = None;
             if let Some(existing) = dream::summary_for_session(&storage, &full_id)? {
                 if regenerate {
-                    storage.forget_by_id(&existing.id)?;
+                    // Replaced only once the new summary is admitted.
                     println!(
-                        "Forgot prior summary {} for session {} — regenerating.",
+                        "Regenerating: prior summary {} for session {} is replaced when the new one is saved.",
                         &existing.id[..8.min(existing.id.len())],
                         &full_id[..8.min(full_id.len())]
                     );
+                    prior = Some(existing.id);
                 } else {
                     println!(
                         "Session {} already has a summary (memory {}). Skipping. \
@@ -3747,7 +3900,7 @@ fn run_dream_command(config: &Config, sub: DreamCommands) -> Result<()> {
             let emb = embedder
                 .embed(&format!("{} {}", summary.title, summary.content))
                 .ok();
-            storage.save_with_embedding(&summary, emb.as_ref())?;
+            dream::replace_summary(&storage, prior.as_deref(), &summary, emb.as_ref())?;
             println!(
                 "Saved session summary {} ({} bytes content)",
                 &summary.id[..8.min(summary.id.len())],
@@ -3849,25 +4002,19 @@ fn run_dream_command(config: &Config, sub: DreamCommands) -> Result<()> {
                 };
                 match summary_result {
                     Ok(summary) => {
-                        // Forget the prior summary AFTER we've
-                        // successfully generated the new one — this
-                        // way a failed generation doesn't leave the
-                        // session in a half-state. The order is:
-                        // generate → forget old → save new.
-                        if let Some(old_id) = prior
-                            && let Err(e) = storage.forget_by_id(old_id)
-                        {
-                            eprintln!(
-                                "  ✗ regenerate: failed to forget prior {} for session {}: {e}",
-                                &old_id[..8.min(old_id.len())],
-                                &s.id[..8.min(s.id.len())]
-                            );
-                            continue;
-                        }
+                        // The order is: generate, judge the new one, forget
+                        // the old, save the new. A failed generation or a
+                        // refused summary leaves the session with what it
+                        // has.
                         let emb = embedder
                             .embed(&format!("{} {}", summary.title, summary.content))
                             .ok();
-                        if let Err(e) = storage.save_with_embedding(&summary, emb.as_ref()) {
+                        if let Err(e) = dream::replace_summary(
+                            &storage,
+                            prior.as_deref(),
+                            &summary,
+                            emb.as_ref(),
+                        ) {
                             eprintln!("  ✗ save failed for session {}: {e}", &s.id[..8]);
                             continue;
                         }
@@ -3986,38 +4133,19 @@ fn dedupe_graph(config: &Config, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    let mut merged = 0usize;
-    let mut renamed = 0usize;
-    let mut total_edges = 0usize;
-    let mut total_links = 0usize;
-
-    for (canonical, variants) in plan {
-        let canonical_exists = variants.iter().any(|v| v == &canonical);
-
-        if !canonical_exists {
-            // Promote first variant to canonical. After rename, others merge.
-            let to_rename = variants.first().cloned().unwrap_or_default();
-            if storage.rename_entity(&to_rename, &canonical)? {
-                renamed += 1;
-            }
-        }
-
-        for variant in &variants {
-            if variant == &canonical {
-                continue;
-            }
-            let report = storage.merge_entities(&canonical, variant)?;
-            if report.alias_dropped {
-                merged += 1;
-                total_edges += report.edges_redirected;
-                total_links += report.memory_links_redirected;
-            }
-        }
+    let totals = graph::dedupe::apply(
+        &storage,
+        plan.iter().map(|(c, v)| (c.as_str(), v.as_slice())),
+    )?;
+    if totals.refused > 0 {
+        println!(
+            "Left as is: {} entities (SENSITIVE_CONTENT)",
+            totals.refused
+        );
     }
-
     println!(
-        "\nDone: {merged} aliases merged, {renamed} promoted, \
-         {total_edges} edges redirected, {total_links} memory links redirected"
+        "\nDone: {} aliases merged, {} promoted, {} edges redirected, {} memory links redirected",
+        totals.merged, totals.renamed, totals.edges_redirected, totals.memory_links_redirected
     );
     Ok(())
 }
@@ -4190,7 +4318,7 @@ fn reextract(
         if let Err(e) =
             storage.replace_graph_and_reconcile_projects(&entry, &result.entities, &result.edges)
         {
-            eprintln!("replace_graph failed for {id}: {e}");
+            eprintln!("{}", graph_failure(id, &e));
         } else {
             entities_added += n_e;
             edges_added += n_r;
@@ -4358,7 +4486,7 @@ fn reextract_pending(
                     &result.entities,
                     &result.edges,
                 ) {
-                    eprintln!("replace_graph failed for {id}: {e}");
+                    eprintln!("{}", graph_failure(id, &e));
                 } else {
                     succeeded += 1;
                 }
@@ -4759,5 +4887,60 @@ fn wait_for_daemon_ready(config: &Config, timeout: std::time::Duration) -> Resul
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod state_redaction_tests {
+    use super::*;
+    use crate::event::{EventSource, MemoryEntry, MemoryType};
+    use crate::graph::extractor::{EntityExtractor, ExtractionResult};
+    use crate::graph::{Entity, EntityType};
+
+    /// Names the memory's title as an entity: a stand-in for an extractor
+    /// reading a memory stored before the redaction policy.
+    struct TitleExtractor;
+    impl EntityExtractor for TitleExtractor {
+        fn extract(&self, entry: &MemoryEntry) -> ExtractionResult {
+            ExtractionResult {
+                entities: vec![Entity {
+                    name: entry.title.clone(),
+                    entity_type: EntityType::Concept,
+                }],
+                edges: vec![],
+            }
+        }
+    }
+
+    /// A refusal does not name what it refused: a memory stored before
+    /// the policy can have an id that is the credential.
+    #[test]
+    fn redaction_state_graph_failure_does_not_name_a_refused_id() {
+        let id = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let error = redaction::state::admit_identities("graph write", [id.as_str()]).unwrap_err();
+        let line = graph_failure(&id, &error);
+        assert!(line.contains("SENSITIVE_CONTENT") && !line.contains(&id));
+        assert!(graph_failure("m-1", &error).contains("for m-1:"));
+    }
+
+    /// One memory's refused graph does not end the backfill.
+    #[test]
+    fn redaction_state_backfill_leaves_a_refused_graph_and_goes_on() {
+        let dir = crate::test_support::temp_dir("mnemonic-backfill-");
+        let storage = storage::Storage::open(&dir.path().join("memory.db")).unwrap();
+        let note =
+            |title: &str| MemoryEntry::new(title, "body", MemoryType::Note, EventSource::Manual);
+        let clean = [note("alpha"), note("beta")];
+        for entry in &clean {
+            storage.save(entry).unwrap();
+        }
+        // Never stored under this title: the store would refuse it today.
+        let legacy = note(&["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat());
+        let entries = [clean[0].clone(), legacy, clean[1].clone()];
+        let totals = backfill_graph(&storage, &TitleExtractor, &entries).unwrap();
+        assert_eq!(totals, (2, 0, 1));
+        let mut names = storage.list_entity_names().unwrap();
+        names.sort();
+        assert_eq!(names, ["alpha", "beta"]);
     }
 }

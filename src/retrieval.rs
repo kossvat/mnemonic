@@ -160,6 +160,10 @@ pub fn hybrid_search(
     query: &str,
     opts: &HybridOptions,
 ) -> Result<Vec<HybridHit>> {
+    // A query is new text, whoever asks: every retriever is given the
+    // prepared one.
+    let query = &crate::redaction::redact_text(query).value;
+
     // --- Retriever 1: FTS5 / BM25 ---
     // FTS5 treats unquoted tokens with `-` as NOT; sanitize before MATCH.
     let fts_query = sanitize_fts_query(query);
@@ -246,6 +250,8 @@ pub fn hybrid_search_with_rerank(
         return hybrid_search(storage, embedder, query, opts);
     }
     let reranker = reranker.expect("checked above");
+    // The reranker is a model like the embedder.
+    let query = &crate::redaction::redact_text(query).value;
 
     // Run retrievers with a `rerank_top_n`-sized limit instead of `limit`,
     // so the reranker has enough candidates to actually move things around.
@@ -649,5 +655,56 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(s.label(), "bm25+graph");
+    }
+
+    /// Keeps the query it was given.
+    #[derive(Default)]
+    struct RecordingReranker(std::sync::Mutex<Vec<String>>);
+
+    impl crate::reranker::Reranker for RecordingReranker {
+        fn rerank(
+            &self,
+            query: &str,
+            documents: &[&str],
+        ) -> Result<Vec<crate::reranker::RerankScore>> {
+            self.0.lock().unwrap().push(query.to_string());
+            Ok((0..documents.len())
+                .map(|index| crate::reranker::RerankScore { index, score: 1.0 })
+                .collect())
+        }
+    }
+
+    /// A query is new text, whoever asks: the index, the embedder and the
+    /// reranker are given the prepared one.
+    #[test]
+    fn redaction_generated_search_gives_every_retriever_the_prepared_query() {
+        let token: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let db = crate::test_support::temp_path("mnemonic-retrieval-redaction-", "memory.db");
+        let storage = Storage::open(&db).unwrap();
+        let mut vector = vec![0.0; crate::embedding::EMBED_DIMS];
+        vector[0] = 1.0;
+        for title in ["the rollout is on friday", "the rollout moved to monday"] {
+            storage
+                .save_with_embedding(&mk(&uuid::Uuid::new_v4().to_string(), title), Some(&vector))
+                .unwrap();
+        }
+        let query = format!("rollout with {token}");
+
+        let embedder = crate::test_support::RecordingEmbedder::new();
+        let hits = hybrid_search(&storage, &embedder, &query, &HybridOptions::default()).unwrap();
+        assert!(hits.len() == 2);
+        let texts = embedder.texts();
+        assert!(texts.len() == 1 && !texts[0].contains(&token));
+        assert!(texts[0].contains(crate::redaction::CREDENTIAL_MARKER));
+
+        let reranker = RecordingReranker::default();
+        let opts = HybridOptions {
+            rerank: true,
+            ..HybridOptions::default()
+        };
+        hybrid_search_with_rerank(&storage, &embedder, Some(&reranker), &query, &opts).unwrap();
+        let asked = reranker.0.lock().unwrap().clone();
+        assert!(asked.len() == 1 && !asked[0].contains(&token));
+        assert!(embedder.texts().iter().all(|text| !text.contains(&token)));
     }
 }

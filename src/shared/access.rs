@@ -309,12 +309,14 @@ pub fn grant(request: &GrantRequest<'_>) -> Result<Grant> {
     }
     // Refuse to hand out a policy the server would reject.
     toml::from_str::<Policy>(&policy_toml)?.validate()?;
+    // The names as the key line joins them.
+    let comment = format!("mnemonic:{}:{agent_id}", request.project);
+    super::admit::identities([comment.as_str()])?;
 
     Ok(Grant {
         authorized_keys_line: format!(
-            "restrict,command=\"{}\" {key_type} {blob} mnemonic:{}:{agent_id}",
+            "restrict,command=\"{}\" {key_type} {blob} {comment}",
             forced_command(&bin, &db, &policy),
-            request.project
         ),
         agent_id,
         policy_path,
@@ -479,7 +481,12 @@ pub fn lint(request: &LintRequest<'_>) -> Result<Vec<String>> {
             continue;
         };
         match Policy::load(&policy_path) {
-            Err(error) => problem(format!("policy {}: {error}", policy_path.display())),
+            Err(error) => {
+                // The file is named after the agent id in it: shown only
+                // when the redaction policy admits the name.
+                let path = policy_path.display().to_string();
+                problem(format!("policy {}: {error}", super::admit::shown(&path)))
+            }
             Ok(policy) => {
                 if policy.version != 2 {
                     problem("policy is not version 2, so it names no person to revoke".into());

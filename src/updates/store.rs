@@ -66,7 +66,19 @@ pub const HISTORY_MEMBERS: &str = "SELECT new_id FROM memory_updates
 /// A later statement of the same value was dropped as a duplicate of `id`:
 /// keep when it was said, so a value backfilled from before that time
 /// cannot pass itself off as newer than it.
+///
+/// Not written under an id the redaction policy refuses (a memory stored
+/// before the policy can be filed under a credential, and the row would
+/// copy it); the duplicate is dropped all the same. What is kept is a time
+/// and nothing else.
 pub fn reaffirm(conn: &Connection, id: &str, at: &str) -> Result<()> {
+    ensure!(
+        crate::redaction::is_time(at),
+        "a statement is reaffirmed at a time"
+    );
+    if crate::redaction::check_identity(id).is_err() {
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO memory_reaffirmed (memory_id, at) VALUES (?1, ?2)
          ON CONFLICT(memory_id) DO UPDATE SET at = max(at, excluded.at)",
@@ -78,6 +90,7 @@ pub fn reaffirm(conn: &Connection, id: &str, at: &str) -> Result<()> {
 /// Memories saved under project `old` belong to `new` after a merge or a
 /// rename of the project entity.
 pub fn rekey_project(conn: &Connection, old: &str, new: &str) -> Result<()> {
+    crate::graph::canonical::admit_renamed("rekey", [old, new])?;
     conn.execute(
         "UPDATE memories
             SET metadata = json_set(metadata, '$.project', ?1, '$.project_key', ?2)
@@ -119,6 +132,16 @@ pub struct Link {
     pub actor: &'static str,
 }
 
+/// Whether the redaction policy admits all a link holds: what names its
+/// memories and its writer, and the values it explains itself by.
+fn admitted(link: &Link) -> bool {
+    let names = [link.new_id.as_str(), &link.old_id, link.actor];
+    crate::redaction::state::check_identities(names).is_ok()
+        && link.was.iter().chain(&link.now).all(|value| {
+            crate::redaction::is_clean(&value.key) && crate::redaction::is_clean(&value.surface)
+        })
+}
+
 fn values_json(values: &[Value]) -> String {
     json!(
         values
@@ -133,6 +156,13 @@ fn values_json(values: &[Value]) -> String {
 /// already there is left as it is. Returns whether a row was written.
 pub fn insert(conn: &Connection, link: &Link) -> Result<bool> {
     ensure!(link.new_id != link.old_id, "a memory cannot update itself");
+    // A link that holds what the redaction policy refuses is not written,
+    // and the memories it would join stay as they are: a memory stored
+    // before the policy can be filed under an id that is a credential,
+    // and what a link says of its values is read with every recall.
+    if !admitted(link) {
+        return Ok(false);
+    }
     let live: i64 = conn.query_row(
         "SELECT COUNT(*) FROM memories WHERE id IN (?1, ?2) AND superseded_by IS NULL",
         params![link.new_id, link.old_id],

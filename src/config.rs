@@ -750,7 +750,14 @@ impl Config {
             };
         };
 
-        let home = profile::prepare(home)?;
+        Self::load_profile(home, dirs::home_dir().as_deref())
+    }
+
+    /// Load an isolated profile's config, checked against `user_home`: the
+    /// owner's home directory, whose default store and agent folders the
+    /// profile must stay out of.
+    fn load_profile(home: &Path, user_home: Option<&Path>) -> Result<Self> {
+        let home = profile::prepare_for(home, user_home)?;
         let defaults = Self::profile_default(&home);
         let config_path = Self::profile_config_path(&home)?;
         let config = if config_path.exists() {
@@ -762,7 +769,7 @@ impl Config {
         } else {
             defaults
         };
-        config.ensure_profile_isolated(&home)?;
+        config.ensure_profile_isolated(&home, user_home)?;
         Ok(config)
     }
 
@@ -823,10 +830,10 @@ impl Config {
 
     /// Would this config keep the isolated profile at canonical `home` sealed?
     pub fn check_profile(&self, home: &Path) -> Result<()> {
-        self.ensure_profile_isolated(home)
+        self.ensure_profile_isolated(home, dirs::home_dir().as_deref())
     }
 
-    fn ensure_profile_isolated(&self, home: &Path) -> Result<()> {
+    fn ensure_profile_isolated(&self, home: &Path, user_home: Option<&Path>) -> Result<()> {
         let activity_db = self.activity_db_path();
         for (label, path) in [
             ("storage.db_path", &self.storage.db_path),
@@ -857,7 +864,7 @@ impl Config {
         }
         // Project roots narrow transcript capture to sessions that ran inside
         // them. A root that swallows the home directory narrows nothing.
-        let user_home = dirs::home_dir().unwrap_or_default();
+        let user_home = user_home.map(Path::to_path_buf).unwrap_or_default();
         let user_home_real = user_home
             .canonicalize()
             .unwrap_or_else(|_| user_home.clone());
@@ -1052,6 +1059,16 @@ mod tests {
             dir.canonicalize().unwrap()
         }
 
+        /// A stand-in owner home holding the agents' global folders, so the
+        /// checks below never depend on (or read) the real one.
+        fn fake_user_home(root: &Path) -> PathBuf {
+            let user = root.join("user");
+            for dir in [".claude/projects", ".codex/sessions"] {
+                std::fs::create_dir_all(user.join(dir)).unwrap();
+            }
+            user
+        }
+
         fn state_paths(config: &Config) -> Vec<PathBuf> {
             vec![
                 config.storage.db_path.clone(),
@@ -1159,9 +1176,9 @@ mod tests {
         #[test]
         fn copied_owner_config_is_refused_even_with_state_paths_fixed() {
             let root = profile_root("copied");
-            let home = profile::prepare(&root.join("client")).unwrap();
+            let user_home = fake_user_home(&root);
+            let home = profile::prepare_for(&root.join("client"), Some(&user_home)).unwrap();
             let config_path = home.join("config.toml");
-            let user_home = dirs::home_dir().unwrap();
 
             // Owner's sinks and watchers, state paths already moved inside.
             let mut copied = Config::profile_default(&home);
@@ -1169,7 +1186,7 @@ mod tests {
             copied.output.memory_files_path = user_home.join(".claude/projects");
             copied.save(&config_path).unwrap();
             assert!(
-                Config::load_for(Some(&home)).is_err(),
+                Config::load_profile(&home, Some(&user_home)).is_err(),
                 "sink outside the profile"
             );
 
@@ -1177,7 +1194,7 @@ mod tests {
             copied.watchers.watch_paths = vec![PathBuf::from(".")];
             copied.save(&config_path).unwrap();
             assert!(
-                Config::load_for(Some(&home)).is_err(),
+                Config::load_profile(&home, Some(&user_home)).is_err(),
                 "cwd-derived watch path"
             );
 
@@ -1186,13 +1203,13 @@ mod tests {
             copied.watchers.conversation_sessions_dir = Some(user_home.join(".claude/projects"));
             copied.save(&config_path).unwrap();
             assert!(
-                Config::load_for(Some(&home)).is_err(),
+                Config::load_profile(&home, Some(&user_home)).is_err(),
                 "global transcript folder"
             );
 
             // Enabling a sink without a path stays inside the profile.
             std::fs::write(&config_path, "[output]\nmemory_files_enabled = true\n").unwrap();
-            let config = Config::load_for(Some(&home)).unwrap();
+            let config = Config::load_profile(&home, Some(&user_home)).unwrap();
             assert!(config.output.memory_files_path.starts_with(&home));
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -1226,17 +1243,17 @@ mod tests {
         #[test]
         fn disabled_sink_path_and_aliased_transcript_dirs_are_refused() {
             let root = profile_root("alias");
-            let home = profile::prepare(&root.join("client")).unwrap();
+            let user_home = fake_user_home(&root);
+            let home = profile::prepare_for(&root.join("client"), Some(&user_home)).unwrap();
             let config_path = home.join("config.toml");
 
             // `context` writes CONTEXT.md here even with the sink off.
             let mut config = Config::profile_default(&home);
             config.output.memory_files_path = root.join("elsewhere");
             config.save(&config_path).unwrap();
-            assert!(Config::load_for(Some(&home)).is_err());
+            assert!(Config::load_profile(&home, Some(&user_home)).is_err());
 
             // Unscoped, no part of the agents' global folders is a dedicated dir.
-            let user_home = dirs::home_dir().unwrap();
             for dir in [
                 user_home.join(".codex/sessions/2026"),
                 user_home.join(".codex/archived_sessions"),
@@ -1245,10 +1262,14 @@ mod tests {
                 config.watchers.codex_enabled = true;
                 config.watchers.codex_sessions_dir = Some(dir.clone());
                 config.save(&config_path).unwrap();
-                assert!(Config::load_for(Some(&home)).is_err(), "{}", dir.display());
+                assert!(
+                    Config::load_profile(&home, Some(&user_home)).is_err(),
+                    "{}",
+                    dir.display()
+                );
             }
 
-            let global = dirs::home_dir().unwrap().join(".claude/projects");
+            let global = user_home.join(".claude/projects");
             let link = root.join("claude-link");
             std::os::unix::fs::symlink(&global, &link).unwrap();
             for dir in [
@@ -1256,14 +1277,15 @@ mod tests {
                 PathBuf::from("relative/sessions"),
                 link,
             ] {
-                if !global.exists() && dir.starts_with(&root) {
-                    continue; // symlink case needs the real folder to resolve
-                }
                 let mut config = Config::profile_default(&home);
                 config.watchers.conversation_enabled = true;
                 config.watchers.conversation_sessions_dir = Some(dir.clone());
                 config.save(&config_path).unwrap();
-                assert!(Config::load_for(Some(&home)).is_err(), "{}", dir.display());
+                assert!(
+                    Config::load_profile(&home, Some(&user_home)).is_err(),
+                    "{}",
+                    dir.display()
+                );
             }
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -1271,7 +1293,8 @@ mod tests {
         #[test]
         fn project_roots_unlock_the_global_transcript_folders() {
             let root = profile_root("roots");
-            let home = profile::prepare(&root.join("client")).unwrap();
+            let user_home = fake_user_home(&root);
+            let home = profile::prepare_for(&root.join("client"), Some(&user_home)).unwrap();
             let config_path = home.join("config.toml");
             let project = root.join("code/demoapp");
 
@@ -1284,12 +1307,11 @@ mod tests {
                 ),
             )
             .unwrap();
-            let config = Config::load_for(Some(&home)).unwrap();
+            let config = Config::load_profile(&home, Some(&user_home)).unwrap();
             assert_eq!(config.watchers.project_roots, vec![project.clone()]);
             assert!(config.watchers.conversation_sessions_dir.is_none());
 
             // A root that swallows the home directory is no scope at all.
-            let user_home = dirs::home_dir().unwrap();
             for bad in [
                 user_home.clone(),
                 PathBuf::from("/"),
@@ -1300,7 +1322,11 @@ mod tests {
                 config.watchers.conversation_enabled = true;
                 config.watchers.project_roots = vec![bad.clone()];
                 config.save(&config_path).unwrap();
-                assert!(Config::load_for(Some(&home)).is_err(), "{}", bad.display());
+                assert!(
+                    Config::load_profile(&home, Some(&user_home)).is_err(),
+                    "{}",
+                    bad.display()
+                );
             }
             std::fs::remove_dir_all(root).unwrap();
         }

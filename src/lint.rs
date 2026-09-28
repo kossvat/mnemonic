@@ -47,6 +47,12 @@ pub fn lint_project(
     similarity_threshold: f32,
 ) -> Result<LintStats> {
     let mut stats = LintStats::default();
+    // A project stored before the redaction policy under a name it
+    // refuses: no verdict on it could be recorded, so none is asked for
+    // (the judge would be called again for every pair, on every pass).
+    if crate::redaction::state::check_identities([project]).is_err() {
+        return Ok(stats);
+    }
     let decisions =
         storage.project_decisions_with_embeddings(project, MAX_DECISIONS_PER_PROJECT)?;
     if decisions.len() < 2 {
@@ -89,6 +95,12 @@ pub fn lint_project(
                 _ => {}
             }
 
+            // The same for a pair whose ids the policy refuses.
+            if crate::redaction::state::check_identities([old.id.as_str(), new.id.as_str()])
+                .is_err()
+            {
+                continue;
+            }
             match llm {
                 Some(backend) => {
                     match judge_pair(backend, &decision_text(old), &decision_text(new)) {
@@ -287,6 +299,73 @@ mod tests {
                 entity_type: EntityType::Project,
             })
             .unwrap()
+    }
+
+    /// A project stored before the redaction policy under a name it
+    /// refuses: its pairs are not judged and not recorded, the pass ends
+    /// well, and a clean project is judged as ever.
+    #[test]
+    fn redaction_state_lint_skips_a_refused_project_and_goes_on() {
+        let storage = tmp_storage();
+        let name = format!("password={}", "a1B2c3D4e5F6".repeat(3));
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO entities (id, name, entity_type, mention_count, first_seen, last_seen)
+                 VALUES ('legacy', ?1, 'project', 1, datetime('now'), datetime('now'))",
+                [&name],
+            )
+            .unwrap();
+        save_decision(&storage, "legacy", "Use Postgres", vec![1.0, 0.0, 0.1]);
+        save_decision(&storage, "legacy", "Switch to Redis", vec![0.98, 0.05, 0.1]);
+        let eid = project(&storage, "p");
+        save_decision(&storage, &eid, "Use SQLite", vec![1.0, 0.0, 0.1]);
+        save_decision(&storage, &eid, "Switch to DuckDB", vec![0.98, 0.05, 0.1]);
+
+        let llm = RecordingLlm {
+            answer: r#"{"contradicts": true, "confidence": 0.9, "reason": "r"}"#.into(),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        for judge in [None, Some(&llm as &dyn LlmBackend)] {
+            let stats = lint_project(&storage, &name, judge, 0.65).unwrap();
+            assert!(stats == LintStats::default(), "something was recorded");
+        }
+        // No verdict could be recorded, so none was asked for.
+        assert!(
+            llm.prompts.lock().unwrap().is_empty(),
+            "the judge was called"
+        );
+        let conn = storage.conn.lock().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM decision_conflicts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        // In a clean project, a decision whose id the policy refuses: its
+        // pairs are neither judged nor recorded, the other pair is.
+        let id = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        conn.execute(
+            "INSERT INTO memories (id, timestamp, title, content, memory_type, tags, source,
+                 importance, metadata, embedding)
+             VALUES (?1, ?2, 'Use MySQL', 'body', 'decision', '[]', '\"Socket\"', 0.5, 'null',
+                     ?3)",
+            rusqlite::params![
+                id,
+                chrono::Utc::now().to_rfc3339(),
+                crate::embedding::embedding_to_bytes(&[0.99, 0.02, 0.1]),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?1, ?2)",
+            [&id, &eid],
+        )
+        .unwrap();
+        drop(conn);
+        let stats = lint_project(&storage, "p", Some(&llm), 0.65).unwrap();
+        assert!(stats.confirmed == 1 && stats.candidates_new == 0);
+        assert!(llm.prompts.lock().unwrap().len() == 1, "one pair is judged");
     }
 
     #[test]

@@ -181,6 +181,85 @@ fn cli_requires_separate_explicit_store_and_preserves_private_database() {
     assert_eq!(body, "PRIVATE_CONTEXT");
 }
 
+/// The real binary, with a home of its own that holds nothing: a sensitive
+/// publish is refused by the fixed code, says nothing of what was sent,
+/// leaves the shared store without a record, and the home without a file.
+#[test]
+fn redaction_shared_cli_refuses_a_sensitive_publish_and_opens_no_private_store() {
+    let secret = ["sk-", "proj-", &"a1b2c3d4e5f6".repeat(4)].concat();
+    let temp = Temp::new();
+    let home = temp.0.join("home");
+    std::fs::create_dir(&home).unwrap();
+    let db = temp.0.join("shared.db");
+    let file = temp.0.join("brief.txt");
+    let run = |args: &[&str]| {
+        let out = command(&db)
+            .args(args)
+            .env("HOME", &home)
+            .env_remove("MNEMONIC_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .unwrap();
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), said)
+    };
+    let file_arg = file.to_str().unwrap();
+    std::fs::write(&file, format!("deploy with {secret} on friday")).unwrap();
+    let publish = [
+        "publish",
+        "--project",
+        "alpha",
+        "--key",
+        "brief",
+        "--title",
+        "Brief",
+        "--source",
+        "owner:fixture",
+        "--file",
+        file_arg,
+    ];
+    let (ok, said) = run(&publish);
+    assert!(!ok);
+    assert!(said.contains("SENSITIVE_CONTENT") && !said.contains(&secret));
+    // In what names the record, too.
+    std::fs::write(&file, "Reviewed project brief").unwrap();
+    let named = [
+        "publish",
+        "--project",
+        "alpha",
+        "--key",
+        &secret,
+        "--title",
+        "Brief",
+        "--source",
+        "owner:fixture",
+        "--file",
+        file_arg,
+    ];
+    let (ok, said) = run(&named);
+    assert!(!ok);
+    assert!(said.contains("SENSITIVE_CONTENT") && !said.contains(&secret));
+
+    let (ok, said) = run(&["context", "--project", "alpha"]);
+    assert!(ok);
+    let context: Value = serde_json::from_str(said.trim()).unwrap();
+    assert!(context["records"].as_array().unwrap().is_empty());
+    assert!(context["revision"] == 0);
+    // A safe publish is stored as ever.
+    let (ok, said) = run(&publish);
+    assert!(ok);
+    let record: Value = serde_json::from_str(said.trim()).unwrap();
+    assert!(record["content"] == "Reviewed project brief" && record["revision"] == 1);
+    assert!(
+        std::fs::read_dir(&home).unwrap().next().is_none(),
+        "the shared service wrote under the home directory"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_rejects_unsafe_database_and_policy_directories_before_creating_database() {

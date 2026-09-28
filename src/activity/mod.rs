@@ -336,7 +336,13 @@ impl ActivityStore {
     /// Apply a decided action to the store. Returns the new open
     /// session (if one is open after the action) so the worker can hold
     /// it in memory without a re-read.
+    ///
+    /// A session is written under the id the action brings: the store
+    /// judges it, whoever minted it.
     pub fn apply(&self, action: &TickAction) -> Result<Option<WorkSession>> {
+        if let TickAction::Open(new) | TickAction::Rotate { open: new, .. } = action {
+            crate::redaction::state::admit_identities("work session", [new.id.as_str()])?;
+        }
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         match action {
             TickAction::NoOp => Ok(None),
@@ -793,18 +799,26 @@ impl ActivityStore {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM project_attribution WHERE day = ?1", [&day_str])?;
+        let mut unattributed = result.unattributed_seconds;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO project_attribution (day, project_key, seconds, confidence)
                  VALUES (?1, ?2, ?3, ?4)",
             )?;
             for (k, secs, conf) in &result.per_project {
+                // A project key the redaction policy refuses (a name stored
+                // before it) is not written again: its time is counted, as
+                // unattributed, and the day is still recomputed.
+                if crate::redaction::state::check_identities([k.as_str()]).is_err() {
+                    unattributed += secs;
+                    continue;
+                }
                 stmt.execute(rusqlite::params![day_str, k, secs, conf.as_str()])?;
             }
         }
         tx.execute(
             "INSERT OR REPLACE INTO unattributed_time (day, seconds) VALUES (?1, ?2)",
-            rusqlite::params![day_str, result.unattributed_seconds],
+            rusqlite::params![day_str, unattributed],
         )?;
         tx.commit()?;
         Ok(())
@@ -1499,6 +1513,111 @@ mod tests {
         let db_mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(db_mode, 0o600);
+    }
+
+    /// A session is written under the id its action brings: one the policy
+    /// refuses opens nothing, alone or after a close, and the refusal does
+    /// not say it.
+    #[test]
+    fn redaction_state_work_session_is_not_opened_under_a_refused_id() {
+        let dir = crate::test_support::temp_path("act-", "activity.db");
+        let store = ActivityStore::open(&dir).unwrap();
+        let refused: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let now = Utc::now();
+        let session = |id: &str| WorkSession {
+            id: id.to_string(),
+            started_at: now,
+            last_input_at: now,
+        };
+        let held = || -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("SELECT count(*) FROM work_sessions", [], |r| r.get(0))
+                .unwrap()
+        };
+        store.apply(&TickAction::Open(session("a"))).unwrap();
+        for action in [
+            TickAction::Open(session(&refused)),
+            TickAction::Rotate {
+                close_id: "a".into(),
+                open: session(&refused),
+            },
+        ] {
+            let error = store.apply(&action).unwrap_err();
+            assert!(crate::redaction::state::is_refused(&error));
+            assert!(!format!("{error:#} {error:?}").contains(&refused));
+        }
+        assert!(held() == 1);
+        // What was refused closed nothing either.
+        assert!(
+            store
+                .current_open()
+                .unwrap()
+                .is_some_and(|open| open.id == "a")
+        );
+        let rotated = TickAction::Rotate {
+            close_id: "a".into(),
+            open: session("b"),
+        };
+        assert!(
+            store
+                .apply(&rotated)
+                .unwrap()
+                .is_some_and(|open| open.id == "b")
+        );
+        assert!(held() == 2);
+    }
+
+    /// A project key the redaction policy refuses (a name stored before it)
+    /// is not written again; its time is counted as unattributed and the
+    /// day's other rows are written as ever.
+    #[test]
+    fn redaction_state_attribution_counts_a_refused_key_as_unattributed() {
+        let dir = crate::test_support::temp_path("act-", "activity.db");
+        let store = ActivityStore::open(&dir).unwrap();
+        let today = Local::now().date_naive();
+        let at = |h, m| {
+            Local
+                .from_local_datetime(&today.and_hms_opt(h, m, 0).unwrap())
+                .earliest()
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        put_session(&store, "a", at(10, 0), at(10, 10));
+        put_session(&store, "b", at(12, 0), at(12, 10));
+        let refused = format!("password={}", "a1B2c3D4e5F6".repeat(3));
+        let noon = at(11, 0);
+        store
+            .recompute_day(
+                today,
+                &crate::attribution::AttribCfg::default(),
+                chrono::Duration::minutes(1),
+                &crate::attribution::CarryCfg::default(),
+                &[],
+                |start, _| {
+                    vec![crate::attribution::ProjectSignal {
+                        project_key: if start < noon {
+                            "demoapp".into()
+                        } else {
+                            refused.clone()
+                        },
+                        weight: 1.0,
+                    }]
+                },
+            )
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        let rows: Vec<(String, f64)> = conn
+            .prepare("SELECT project_key, seconds FROM project_attribution ORDER BY project_key")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![("demoapp".to_string(), 600.0)]);
+        let unattributed: f64 = conn
+            .query_row("SELECT seconds FROM unattributed_time", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unattributed, 600.0);
     }
 
     #[test]

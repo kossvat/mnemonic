@@ -43,13 +43,15 @@ pub struct Conflict {
 
 impl std::fmt::Display for Conflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A key the redaction policy refuses is not named: a record filed
+        // under one before the policy can still be withdrawn.
+        let key = super::admit::shown(&self.key);
         match self.current_revision {
             Some(revision) => write!(
                 f,
-                "revision conflict: key {} is now at revision {revision}; read it again",
-                self.key
+                "revision conflict: key {key} is now at revision {revision}; read it again"
             ),
-            None => write!(f, "revision conflict: key {} does not exist", self.key),
+            None => write!(f, "revision conflict: key {key} does not exist"),
         }
     }
 }

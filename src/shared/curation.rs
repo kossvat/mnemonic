@@ -60,8 +60,18 @@ pub(super) fn check_expected(
     .into())
 }
 
-/// Insert or replace one key at the project's next revision.
+/// Insert or replace one key at the project's next revision. The guard of
+/// every shared record: whatever path led here, the row is judged as it is
+/// about to be stored, before the project or its revision is touched.
 pub(super) fn write_record(conn: &Connection, new: &NewRecord<'_>) -> Result<SharedRecord> {
+    super::admit::identities(
+        [new.project_id, new.key]
+            .into_iter()
+            .chain(new.published_by)
+            .chain(new.origin_observation_id)
+            .chain(new.origin_writer_id),
+    )?;
+    super::admit::text(Some(new.key), new.title, new.content, new.source)?;
     conn.execute(
         "INSERT OR IGNORE INTO shared_projects(project_id) VALUES (?1)",
         [new.project_id],
@@ -118,6 +128,7 @@ impl SharedStore {
             expected != Expected::Any,
             "promote needs --expect-absent or --expect-revision"
         );
+        super::admit::identities([project_id, observation_id, key, actor])?;
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_pin(&tx, project_id)?;
@@ -132,13 +143,19 @@ impl SharedStore {
             )
             .optional()?
             .context("no such observation in this project")?;
+        // The observation as it is stored, judged again: it may have been
+        // stored before the policy, and what it holds would become shared
+        // truth. Before the retry below is answered.
+        super::admit::observation(&observation)?;
         let existing = get_record(&tx, project_id, key)?;
         if let Some(promoted_key) = &observation.promoted_key {
-            // Same request again: answer with what it produced the first time.
+            // Same request again: answer with what it produced the first
+            // time, the row as it is stored.
             if promoted_key == key
                 && let Some(record) = existing
                 && record.origin_observation_id.as_deref() == Some(observation_id)
             {
+                super::admit::record(&record)?;
                 return Ok(record);
             }
             bail!("observation was already promoted to key {promoted_key}");
@@ -189,6 +206,7 @@ impl SharedStore {
     /// holds another project, so an existing multi-project hub stays as is.
     pub fn pin_project(&self, project_id: &str) -> Result<()> {
         validate_slug(project_id, "project_id")?;
+        super::admit::identities([project_id])?;
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_pin(&tx, project_id)?;
@@ -235,6 +253,7 @@ impl SharedStore {
         validate_slug(project_id, "project_id")?;
         validate_slug(principal_id, "principal_id")?;
         validate_actor(actor)?;
+        super::admit::identities([project_id, principal_id].into_iter().chain(actor))?;
         let conn = self.lock()?;
         check_pin(&conn, project_id)?;
         Ok(conn.execute(

@@ -19,7 +19,7 @@
 use anyhow::Result;
 use serde::Serialize;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::embedding::{
@@ -74,6 +74,9 @@ pub struct ReflectionPlan {
     pub pool_size: usize,
     pub clusters: Vec<PlannedCluster>,
 }
+
+/// What the plan shows for a cluster whose canonical the store refused.
+pub const REFUSED_DRAFT: &str = "(left as is: memory write refused)";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlannedCluster {
@@ -153,6 +156,17 @@ pub fn run_reflection(
     config: &Config,
     opts: &ReflectionOptions,
 ) -> Result<ReflectionPlan> {
+    run_reflection_with(storage, config, opts, || create_embedder().ok())
+}
+
+/// `run_reflection` with the embedder supplied by the caller. It is built
+/// only in apply mode, so tests can pass a fake and never load the model.
+pub fn run_reflection_with(
+    storage: &Arc<Storage>,
+    config: &Config,
+    opts: &ReflectionOptions,
+    make_embedder: impl FnOnce() -> Option<Box<dyn Embedder>>,
+) -> Result<ReflectionPlan> {
     let synthesizer: Box<dyn Synthesizer> = Box::new(RuleSynthesizer);
 
     // Dry-run must not write to the DB (Codex P2a). We synthesize a
@@ -176,7 +190,7 @@ pub fn run_reflection(
     let mut applied = 0usize;
 
     let embedder: Option<Box<dyn Embedder>> = match opts.mode {
-        Mode::Apply => create_embedder().ok(),
+        Mode::Apply => make_embedder(),
         Mode::DryRun => None,
     };
     let _ = config; // reserved for future LLM-backed synthesizer
@@ -204,69 +218,90 @@ pub fn run_reflection(
 
         let (title, content) = synthesizer.synthesize(&member_entries);
 
+        // The canonical as it would be stored. Borrow the highest-importance
+        // memory type from the cluster so consolidated decisions stay
+        // decisions.
+        let memory_type = member_entries
+            .iter()
+            .map(|m| m.memory_type.clone())
+            .max_by_key(type_priority)
+            .unwrap_or(MemoryType::Note);
+        let draft = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now(),
+            title,
+            content,
+            memory_type,
+            tags: collect_tags(&member_entries),
+            source: EventSource::Manual,
+            importance: member_entries
+                .iter()
+                .map(|m| m.importance)
+                .fold(0.0_f32, f32::max)
+                .max(0.7),
+            metadata: serde_json::json!({
+                "consolidated_from": source_ids,
+                "run_id": run_id,
+            }),
+        };
+
+        // Until the canonical is prepared there is nothing to show.
         let mut cluster_record = PlannedCluster {
-            source_ids: source_ids.clone(),
+            source_ids: source_ids
+                .iter()
+                .map(|id| crate::redaction::state::shown(id).to_string())
+                .collect(),
             cosines: cosines.clone(),
-            draft_title: title.clone(),
-            draft_content: content.clone(),
+            draft_title: REFUSED_DRAFT.into(),
+            draft_content: REFUSED_DRAFT.into(),
             applied: false,
             canonical_id: None,
         };
 
-        if matches!(opts.mode, Mode::Apply) {
-            let canonical_id = uuid::Uuid::new_v4().to_string();
-            // Borrow the highest-importance memory type from the cluster so
-            // consolidated decisions stay decisions.
-            let memory_type = member_entries
-                .iter()
-                .map(|m| m.memory_type.clone())
-                .max_by_key(type_priority)
-                .unwrap_or(MemoryType::Note);
-
-            let canonical_entry = MemoryEntry {
-                id: canonical_id.clone(),
-                timestamp: chrono::Utc::now(),
-                title,
-                content: content.clone(),
-                memory_type,
-                tags: collect_tags(&member_entries),
-                source: EventSource::Manual,
-                importance: member_entries
-                    .iter()
-                    .map(|m| m.importance)
-                    .fold(0.0_f32, f32::max)
-                    .max(0.7),
-                metadata: serde_json::json!({
-                    "consolidated_from": source_ids,
-                    "run_id": run_id,
-                }),
-            };
-
-            let canonical_embedding = embedder
+        let written = canonical(draft, &source_ids).and_then(|(entry, changed)| {
+            cluster_record.draft_title = entry.title.clone();
+            cluster_record.draft_content = entry.content.clone();
+            if !matches!(opts.mode, Mode::Apply) {
+                return Ok(None);
+            }
+            // The vector of the text that is stored. A text that
+            // preparation changed is not what the members' vectors are
+            // of: without an embedder it gets none, not their mean.
+            let embedding = embedder
                 .as_ref()
-                .and_then(|e| {
-                    e.embed(&format!("{}\n{}", canonical_entry.title, content))
-                        .ok()
-                })
-                .unwrap_or(centroid);
-
+                .and_then(|e| e.embed(&format!("{}\n{}", entry.title, entry.content)).ok())
+                .or_else(|| (!changed).then_some(centroid));
             let cluster_pairs: Vec<(String, f32)> = source_ids
                 .iter()
                 .zip(cosines.iter())
                 .map(|(id, c)| (id.clone(), *c))
                 .collect();
-
-            // None: a source joined an update chain after the pool was read.
-            if let Some(canonical_id_written) = storage.apply_reflection(
-                &run_id,
-                &canonical_entry,
-                Some(&canonical_embedding),
-                &cluster_pairs,
-            )? {
+            storage.apply_reflection(&run_id, &entry, embedding.as_ref(), &cluster_pairs)
+        });
+        match written {
+            Ok(Some(canonical_id_written)) => {
                 cluster_record.applied = true;
                 cluster_record.canonical_id = Some(canonical_id_written);
                 applied += 1;
             }
+            // None: a dry run, or a source joined an update chain after
+            // the pool was read.
+            Ok(None) => {}
+            // A member stored before the redaction policy can be filed
+            // under an id the policy refuses, and a canonical names its
+            // members: that cluster is left as it is, the run goes on to
+            // the next one.
+            Err(e) if crate::storage::is_refused_write(&e) => {
+                warn!(
+                    "Reflection: a cluster of {} memories was left as is (memory write refused)",
+                    source_ids.len()
+                );
+                // The plan is printed and served; nothing of a canonical
+                // that was refused is shown in it.
+                cluster_record.draft_title = REFUSED_DRAFT.into();
+                cluster_record.draft_content = REFUSED_DRAFT.into();
+            }
+            Err(e) => return Err(e),
         }
 
         planned.push(cluster_record);
@@ -287,6 +322,20 @@ pub fn run_reflection(
         pool_size,
         clusters: planned,
     })
+}
+
+/// The canonical of a cluster, prepared, and whether preparing it changed
+/// its text. What it is synthesized from was admitted memory by memory (or
+/// stored before there was a policy), and put together it is a new text:
+/// it is prepared before the plan shows it, before it is embedded and
+/// before it is stored. What names its members is judged, not rewritten.
+fn canonical(draft: MemoryEntry, source_ids: &[String]) -> Result<(MemoryEntry, bool)> {
+    const WHAT: &str = "memory write";
+    crate::redaction::state::admit_identities(WHAT, source_ids.iter().map(String::as_str))?;
+    let prepared = crate::redaction::prepare_entry(draft, crate::redaction::STRUCTURAL_KEYS)
+        .map_err(|code| crate::redaction::state::refused(WHAT, code))?;
+    let changed = prepared.summary().changed();
+    Ok((prepared.into_entry(), changed))
 }
 
 struct ActiveEntry {
@@ -512,6 +561,219 @@ mod tests {
             "dry-run id must be synthetic, got '{}'",
             plan.run_id
         );
+    }
+
+    fn token() -> String {
+        ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat()
+    }
+
+    /// A store with two pairs of near duplicates: a clean pair, and a pair
+    /// whose second member a build before the redaction policy stored,
+    /// under `id` and with `text`. Returns the clean pair and the other.
+    fn two_pairs(
+        id: &str,
+        text: &str,
+    ) -> (
+        crate::test_support::InTempDir<Arc<crate::storage::Storage>>,
+        [String; 2],
+        [String; 2],
+    ) {
+        let storage = crate::test_support::InTempDir::new("mnemonic-reflect-", |dir| {
+            Arc::new(crate::storage::Storage::open(&dir.join("memory.db")).unwrap())
+        });
+        let save = |text: &str, vector: Vec<f32>| {
+            let entry = MemoryEntry::new(text, text, MemoryType::Note, EventSource::Manual);
+            storage.save_with_embedding(&entry, Some(&vector)).unwrap();
+            entry.id
+        };
+        let clean = [
+            save("use SQLite for the index", vec![1.0, 0.0, 0.0, 0.0]),
+            save("SQLite it is for the index", vec![1.0, 0.0, 0.0, 0.0]),
+        ];
+        let legacy_clean = save("deploy needs the key", vec![0.0, 1.0, 0.0, 0.0]);
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO memories (id, timestamp, title, content, memory_type, tags, source, importance, metadata, embedding)
+                 VALUES (?1, ?2, ?3, ?3, 'note', '[]', '\"Manual\"', 0.5, 'null', ?4)",
+                rusqlite::params![
+                    id,
+                    Utc::now().to_rfc3339(),
+                    text,
+                    crate::embedding::embedding_to_bytes(&[0.0, 1.0, 0.0, 0.0]),
+                ],
+            )
+            .unwrap();
+        (storage, clean, [legacy_clean, id.to_string()])
+    }
+
+    fn options(mode: Mode) -> ReflectionOptions {
+        ReflectionOptions {
+            mode,
+            threshold: 0.9,
+            ..ReflectionOptions::default()
+        }
+    }
+
+    fn column<T: rusqlite::types::FromSql>(
+        storage: &crate::storage::Storage,
+        sql: &str,
+        id: &str,
+    ) -> T {
+        let conn = storage.conn.lock().unwrap();
+        conn.query_row(sql, [id], |r| r.get(0)).unwrap()
+    }
+
+    /// A canonical names its members, and a member stored before the
+    /// redaction policy can be filed under an id the policy refuses. That
+    /// cluster is left as it is and the run goes on: the clean cluster is
+    /// applied and the run is finalized.
+    #[test]
+    fn redaction_memory_reflection_skips_a_refused_cluster_and_applies_the_rest() {
+        let token = token();
+        let (storage, clean, legacy) = two_pairs(&token, "the deploy key is kept in the vault");
+        let plan = run_reflection_with(&storage, &Config::default(), &options(Mode::Apply), || {
+            Some(Box::new(crate::test_support::ConstEmbedder))
+        })
+        .unwrap();
+        let applied: Vec<&PlannedCluster> = plan.clusters.iter().filter(|c| c.applied).collect();
+        assert!(applied.len() == 1 && applied[0].source_ids.len() == 2);
+        assert!(applied[0].source_ids.iter().all(|id| clean.contains(id)));
+        let skipped = plan.clusters.iter().find(|c| !c.applied).unwrap();
+        assert!(skipped.source_ids.contains(&legacy[0]));
+        // Nothing of the canonical that was refused is shown, and the id
+        // the policy refuses is not said.
+        assert!(skipped.draft_title == REFUSED_DRAFT && skipped.draft_content == REFUSED_DRAFT);
+        assert!(
+            !format!("{plan:?}").contains(&token),
+            "the plan says the refused id"
+        );
+        assert!(!serde_json::to_string(&plan).unwrap().contains(&token));
+        // The refused cluster's members are untouched and still active.
+        for id in &legacy {
+            let active: i64 = column(
+                &storage,
+                "SELECT count(*) FROM memories WHERE id = ?1 AND superseded_by IS NULL",
+                id,
+            );
+            assert!(active == 1);
+        }
+        let finalized: i64 = column(
+            &storage,
+            "SELECT count(*) FROM reflection_runs WHERE id = ?1 AND applied_count IS NOT NULL",
+            &plan.run_id,
+        );
+        assert!(finalized == 1, "the run was finalized");
+    }
+
+    /// A canonical copies its members' text, and put together it is a new
+    /// text: it is prepared before the plan shows it, before it is
+    /// embedded and before it is stored. A member stored before the
+    /// policy no longer costs its cluster the consolidation.
+    #[test]
+    fn redaction_generated_reflection_prepares_the_canonical_for_all_who_are_given_it() {
+        let token = token();
+        let id = uuid::Uuid::new_v4().to_string();
+        let (storage, _, _) = two_pairs(&id, &format!("the deploy key is {token}"));
+        let embedder = crate::test_support::RecordingEmbedder::new();
+        let given = embedder.clone();
+        let plan = run_reflection_with(
+            &storage,
+            &Config::default(),
+            &options(Mode::Apply),
+            move || Some(Box::new(given)),
+        )
+        .unwrap();
+        assert!(plan.clusters.len() == 2 && plan.clusters.iter().all(|c| c.applied));
+        assert!(!format!("{plan:?}").contains(&token));
+        let changed = plan
+            .clusters
+            .iter()
+            .find(|c| {
+                c.draft_content
+                    .contains(crate::redaction::CREDENTIAL_MARKER)
+            })
+            .unwrap();
+
+        let texts = embedder.texts();
+        assert!(texts.len() == 2 && texts.iter().all(|text| !text.contains(&token)));
+
+        let canonical = changed.canonical_id.as_deref().unwrap();
+        let stored = storage.get_by_id(canonical).unwrap().unwrap();
+        assert!(!serde_json::to_string(&stored).unwrap().contains(&token));
+        assert!(stored.content == changed.draft_content && stored.title == changed.draft_title);
+        assert!(stored.metadata[crate::redaction::SUMMARY_KEY]["changed"] == true);
+        // Its members are superseded by it, the one from before the
+        // policy included.
+        let by: String = column(
+            &storage,
+            "SELECT superseded_by FROM memories WHERE id = ?1",
+            &id,
+        );
+        assert!(by == canonical);
+    }
+
+    /// A dry run shows the same prepared drafts and writes nothing.
+    #[test]
+    fn redaction_generated_reflection_dry_run_shows_prepared_drafts() {
+        let token = token();
+        let id = uuid::Uuid::new_v4().to_string();
+        let (storage, _, _) = two_pairs(&id, &format!("the deploy key is {token}"));
+        let plan =
+            run_reflection_with(&storage, &Config::default(), &options(Mode::DryRun), || {
+                panic!("a dry run embeds nothing")
+            })
+            .unwrap();
+        assert!(plan.clusters.len() == 2 && plan.clusters.iter().all(|c| !c.applied));
+        assert!(!format!("{plan:?}").contains(&token));
+        assert!(plan.clusters.iter().any(|c| {
+            c.draft_content
+                .contains(crate::redaction::CREDENTIAL_MARKER)
+        }));
+        let canonicals: i64 = {
+            let conn = storage.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT count(*) FROM memories WHERE canonical_memory_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(canonicals == 0);
+    }
+
+    /// Without a vector of its own, a canonical whose text preparation
+    /// changed gets none: the mean of its members' vectors is of the text
+    /// that was there before. One whose text is as it was keeps the mean.
+    #[test]
+    fn redaction_generated_reflection_gives_a_changed_text_its_own_vector_or_none() {
+        let token = token();
+        type Make = fn() -> Option<Box<dyn Embedder>>;
+        let embedders: [Make; 2] = [
+            || None,
+            || Some(Box::new(crate::test_support::RecordingEmbedder::failing())),
+        ];
+        for make in embedders {
+            let id = uuid::Uuid::new_v4().to_string();
+            let (storage, _, _) = two_pairs(&id, &format!("the deploy key is {token}"));
+            let plan =
+                run_reflection_with(&storage, &Config::default(), &options(Mode::Apply), make)
+                    .unwrap();
+            assert!(plan.clusters.len() == 2 && plan.clusters.iter().all(|c| c.applied));
+            for cluster in &plan.clusters {
+                let changed = cluster
+                    .draft_content
+                    .contains(crate::redaction::CREDENTIAL_MARKER);
+                let vector: Option<Vec<u8>> = column(
+                    &storage,
+                    "SELECT embedding FROM memories WHERE id = ?1",
+                    cluster.canonical_id.as_deref().unwrap(),
+                );
+                assert!(vector.is_none() == changed);
+            }
+        }
     }
 
     /// A memory in an update chain is one value in a history: reflection

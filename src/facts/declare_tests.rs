@@ -308,7 +308,7 @@ fn a_plain_change_that_lands_after_planning_is_updated_anyway() {
     assert!(prepared.planned.is_none(), "nothing to update yet");
     let six = plain(&s, "Widget price is now $6");
     assert_eq!(head(&s, &first).as_deref(), Some(six.as_str()));
-    let again = commit(&s, prepared, 0.92, &write("$5"), None).unwrap();
+    let again = commit(&s, prepared, 0.92, &write("$5"), false).unwrap();
     assert_eq!(again.outcome.outcome, "reconfirm");
     let again = again.memory.expect("written to update the plain $6").id;
     assert_eq!(head(&s, &six).as_deref(), Some(again.as_str()));
@@ -475,7 +475,7 @@ fn a_project_merged_while_planning_names_the_memory_too() {
     let prepared = prepare(&s, &ConstEmbedder, 0.92, &old_shop, None).unwrap();
     assert_eq!(prepared.entry.metadata["project_key"], "old-shop");
     s.merge_entities("new-shop", "old-shop").unwrap();
-    let declared = commit(&s, prepared, 0.92, &old_shop, None).unwrap();
+    let declared = commit(&s, prepared, 0.92, &old_shop, false).unwrap();
     assert_eq!(declared.outcome.fact.project, "new-shop");
     assert_eq!(declared.memory.unwrap().metadata["project_key"], "new-shop");
 }

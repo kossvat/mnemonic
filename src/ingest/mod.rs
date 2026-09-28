@@ -1,5 +1,7 @@
 //! Local, bounded transcript ingress. Replay returns the bounded capture
 //! event, and a terminal receipt drops the payload that produced it.
+#[cfg(test)]
+mod redaction_tests;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -11,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::embedding::{Embedding, embedding_to_bytes};
 use crate::event::{Event, MemoryEntry};
+use crate::redaction::{self, STRUCTURAL_KEYS};
 use crate::storage::Storage;
 
 pub(crate) use schema::install;
@@ -55,6 +58,9 @@ pub enum SkipReason {
     Filtered,
     Duplicate,
     LowImportance,
+    /// The queued payload could not be admitted again (an identity in it
+    /// holds a credential); its text is dropped without a memory.
+    Rejected,
 }
 impl SkipReason {
     fn as_str(&self) -> &'static str {
@@ -62,8 +68,27 @@ impl SkipReason {
             Self::Filtered => "filtered",
             Self::Duplicate => "duplicate",
             Self::LowImportance => "low_importance",
+            Self::Rejected => "rejected",
         }
     }
+}
+
+/// The guard at the durable queue: every text field a record persists is
+/// checked as it is, never rewritten. A watcher that skipped preparation
+/// gets an error and writes nothing.
+fn admit_record(record: &IngestRecord) -> Result<()> {
+    let clean = redaction::check_identity(&record.source_key).is_ok()
+        && record
+            .source_at
+            .as_deref()
+            .is_none_or(|at| redaction::check_identity(at).is_ok())
+        && redaction::check_event(&record.payload.event, STRUCTURAL_KEYS).is_ok();
+    ensure!(
+        clean,
+        "ingress record refused ({})",
+        redaction::RedactionError::SensitiveContent.code()
+    );
+    Ok(())
 }
 
 pub enum ProcessingDecision<'a> {
@@ -269,6 +294,14 @@ impl Storage {
                 "ingress cursor cannot move backwards within a generation"
             );
         }
+        ensure!(
+            redaction::check_identity(&next.stream).is_ok(),
+            "ingress cursor stream refused ({})",
+            redaction::RedactionError::SensitiveContent.code()
+        );
+        for record in records {
+            admit_record(record)?;
+        }
         let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure!(
@@ -329,6 +362,9 @@ impl Storage {
     /// capture keeps its own position. A key already present is left alone,
     /// so this can run again safely. Returns how many were new.
     pub fn append_history(&self, records: &[IngestRecord]) -> Result<usize> {
+        for record in records {
+            admit_record(record)?;
+        }
         let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut added = 0;
@@ -346,11 +382,51 @@ impl Storage {
 
     /// Even if maintenance has not run yet, expired events and deletion
     /// suppressions cannot enter processing.
+    ///
+    /// Every payload is prepared again on its way out, so a row queued
+    /// before this policy existed is redacted too; the summary admission
+    /// wrote is kept. A payload whose identities cannot be admitted gets a
+    /// terminal `rejected` receipt, which drops its text, and is not
+    /// returned.
     pub fn pending_ingest(&self, now: DateTime<Utc>, limit: usize) -> Result<Vec<PendingEvent>> {
+        let mut pending = Vec::new();
+        let mut after = 0;
+        while pending.len() < limit {
+            let wanted = limit - pending.len();
+            let (page, rejected, last) = self.pending_ingest_raw(now, wanted, after)?;
+            let Some(last) = last else {
+                break; // nothing left to examine
+            };
+            let full = page.len() + rejected.len() == wanted;
+            for seq in rejected {
+                self.finish_ingest(seq, ProcessingDecision::Skip(SkipReason::Rejected), now)?;
+            }
+            pending.extend(page);
+            // A page that came back short is the end of the queue; one that
+            // lost rows to rejection is refilled from where it stopped, so a
+            // caller reading full pages as "more to come" is not slowed down
+            // and no row is handed out twice.
+            if !full {
+                break;
+            }
+            after = last;
+        }
+        Ok(pending)
+    }
+
+    /// One page of pending rows after `after`, split into events prepared
+    /// again and rows that cannot be admitted; and the last seq examined.
+    fn pending_ingest_raw(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+        after: i64,
+    ) -> Result<(Vec<PendingEvent>, Vec<i64>, Option<i64>)> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT e.seq, e.payload FROM ingest_events e
              WHERE e.payload IS NOT NULL AND e.schema_version = ?1 AND e.observed_at >= ?2
+               AND e.seq > ?5
                AND NOT EXISTS (SELECT 1 FROM consumer_receipts r WHERE r.event_id = e.seq
                                AND (r.consumer = ?3 OR r.outcome = 'forgotten'))
              ORDER BY e.seq LIMIT ?4",
@@ -360,19 +436,27 @@ impl Storage {
                 SCHEMA_VERSION,
                 timestamp(floor(now)),
                 CONSUMER,
-                limit as i64
+                limit as i64,
+                after
             ],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
         )?;
-        rows.map(|row| {
+        let mut pending = Vec::new();
+        let mut rejected = Vec::new();
+        let mut last = None;
+        for row in rows {
             let (seq, payload) = row?;
+            last = Some(seq);
             let payload: IngestPayload = serde_json::from_str(&payload)?;
-            Ok(PendingEvent {
-                seq,
-                event: payload.event,
-            })
-        })
-        .collect()
+            match redaction::replay_event(payload.event, STRUCTURAL_KEYS) {
+                Ok(prepared) => pending.push(PendingEvent {
+                    seq,
+                    event: prepared.into_event(),
+                }),
+                Err(_) => rejected.push(seq),
+            }
+        }
+        Ok((pending, rejected, last))
     }
 
     /// The terminal outcome and memory (including optional extraction enqueue)
@@ -394,6 +478,15 @@ impl Storage {
         now: DateTime<Utc>,
         fault: Fault,
     ) -> Result<Option<MemoryEntry>> {
+        // The memory row is written below by a direct INSERT: guard it here
+        // like every other memory write, before anything is touched.
+        if let ProcessingDecision::Save { entry, .. } = &decision {
+            ensure!(
+                redaction::check_entry(entry, STRUCTURAL_KEYS).is_ok(),
+                "ingest completion refused ({})",
+                redaction::RedactionError::SensitiveContent.code()
+            );
+        }
         let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let terminal: bool = tx.query_row(
@@ -437,6 +530,13 @@ impl Storage {
                     // id, and a constant prefix would collapse every
                     // transcript-derived citation into the same few strings.
                     entry.id = payload.event.id.clone();
+                    // The id comes from the queue, not from the checked
+                    // entry: judge it before it is written anywhere.
+                    ensure!(
+                        redaction::check_identity(&entry.id).is_ok(),
+                        "ingest completion refused ({})",
+                        redaction::RedactionError::SensitiveContent.code()
+                    );
                     entry.timestamp = payload.event.timestamp;
                     // Plain INSERT: never replace a row or silently erase its links.
                     tx.execute(

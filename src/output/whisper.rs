@@ -377,13 +377,27 @@ impl Whisper {
         topic: &str,
         limit: usize,
     ) -> Result<String> {
-        let now = Utc::now();
         let embedder = create_embedder()?;
+        self.topic_context(storage, &*embedder, topic, limit)
+    }
+
+    /// The context for `topic` with the embedder given. A topic is new
+    /// text: it is prepared once, and what is searched by and what the
+    /// heading shows are the prepared one.
+    pub(crate) fn topic_context(
+        &self,
+        storage: &Storage,
+        embedder: &dyn crate::embedding::Embedder,
+        topic: &str,
+        limit: usize,
+    ) -> Result<String> {
+        let now = Utc::now();
+        let topic = &crate::redaction::redact_text(topic).value;
         let opts = crate::retrieval::HybridOptions {
             limit,
             ..Default::default()
         };
-        let hits = crate::retrieval::hybrid_search(storage, &*embedder, topic, &opts)?;
+        let hits = crate::retrieval::hybrid_search(storage, embedder, topic, &opts)?;
         render_topic(storage, topic, &hits, now)
     }
 
@@ -894,5 +908,29 @@ mod tests {
         let content = whisper.generate(&storage).unwrap();
         assert!(!content.contains("## Projects (state digests)"));
         assert!(content.contains("solo note"));
+    }
+
+    /// A topic is new text: what is searched by, and what the heading of
+    /// the context shows, is the prepared one.
+    #[test]
+    fn redaction_generated_context_topic_is_prepared_for_the_search_and_the_heading() {
+        let token: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let db = crate::test_support::temp_path("mnemonic-whisper-redaction-", "memory.db");
+        let storage = Storage::open(&db).unwrap();
+        let whisper = Whisper::new(db.parent().unwrap().join("CONTEXT.md"));
+        let embedder = crate::test_support::RecordingEmbedder::new();
+        let context = whisper
+            .topic_context(&storage, &embedder, &format!("deploys with {token}"), 5)
+            .unwrap();
+        assert!(!context.contains(&token));
+        assert!(context.contains(crate::redaction::CREDENTIAL_MARKER));
+        assert!(context.contains("No relevant memories found."));
+        let texts = embedder.texts();
+        assert!(texts.len() == 1 && !texts[0].contains(&token));
+        // A clean topic is shown as it is.
+        let context = whisper
+            .topic_context(&storage, &embedder, "deploys", 5)
+            .unwrap();
+        assert!(context.contains("\"deploys\""));
     }
 }

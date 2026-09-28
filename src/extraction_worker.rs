@@ -25,6 +25,7 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use crate::graph::extractor::EntityExtractor;
+use crate::redaction::failure::Failure;
 use crate::storage::Storage;
 
 /// First-attempt failures tolerated before a row is dead-lettered into
@@ -54,7 +55,11 @@ pub fn spawn_worker(
         loop {
             ticker.tick().await;
             if let Err(e) = drain_once(&storage, &extractor, batch_size).await {
-                warn!("Extraction worker tick error: {e}");
+                warn!(
+                    "Extraction worker tick error ({}): {}",
+                    Failure::Storage,
+                    store_words(&e)
+                );
             }
         }
     })
@@ -89,7 +94,7 @@ pub async fn drain_once(
                 continue;
             }
             Err(e) => {
-                warn!("Extraction worker get_by_id failed for {id}: {e}");
+                warn!("{}", failure_notice("get_by_id", &id, &e));
                 continue;
             }
         };
@@ -119,20 +124,33 @@ pub async fn drain_once(
                 let _ = storage.dequeue_extraction(&id);
                 processed += 1;
             }
+            Ok(Err(e)) if crate::redaction::state::is_refused(&e) => {
+                // The guard refused a name in this graph. Trying again
+                // gives the same graph: the row leaves the queue, and the
+                // memory keeps whatever graph it had.
+                warn!("{}", refused_notice(&id, &e));
+                let _ = storage.dequeue_extraction(&id);
+            }
             Ok(Err(e)) => {
                 // Graph write failed (DB lock, constraint, transient I/O).
                 // Bump attempts and leave the row so the NEXT tick retries;
                 // after MAX_FIRST_ATTEMPTS it's dead-lettered to
                 // `pending_extractions` so it can't block the queue head.
-                warn!("Extraction worker replace_graph failed for {id}: {e} — will retry");
-                note_failure(storage, &id, &e.to_string());
+                warn!("{} — will retry", failure_notice("replace_graph", &id, &e));
+                note_failure(storage, &id, Failure::Storage);
             }
-            Err(e) => {
+            Err(_) => {
                 // Extractor panicked inside spawn_blocking. Same policy as
                 // a write failure — a row that panics the extractor every
-                // tick is the definition of poisoned.
-                warn!("Extraction worker spawn_blocking joined with error: {e}");
-                note_failure(storage, &id, &format!("extractor panic: {e}"));
+                // tick is the definition of poisoned. What a panic says is
+                // the extractor's, and with it the model's: the log says
+                // that it happened.
+                warn!(
+                    "Extraction worker: extractor stopped for {} ({})",
+                    crate::redaction::state::shown(&id),
+                    Failure::Worker
+                );
+                note_failure(storage, &id, Failure::Worker);
             }
         }
     }
@@ -140,16 +158,50 @@ pub async fn drain_once(
     Ok(processed)
 }
 
+/// What the worker logs for a graph the guard refused. The memory's id is
+/// shown unless it is what the guard refused: a memory stored before the
+/// redaction policy can have an id that is the credential.
+fn refused_notice(id: &str, error: &anyhow::Error) -> String {
+    format!(
+        "Extraction worker: graph of {} left as is ({error})",
+        crate::redaction::state::shown(id)
+    )
+}
+
+/// What the worker logs when the store failed it, reading a memory or
+/// taking its graph. The memory's id is shown unless the policy refuses
+/// it. The store's own words help to tell a locked database from a broken
+/// one; they are prepared like any text, and cut, before they are logged.
+fn failure_notice(step: &'static str, id: &str, error: &anyhow::Error) -> String {
+    format!(
+        "Extraction worker {step} failed for {} ({}): {}",
+        crate::redaction::state::shown(id),
+        Failure::Storage,
+        store_words(error)
+    )
+}
+
+/// The store's own words of a failure, as they are logged: prepared, and
+/// cut.
+fn store_words(error: &anyhow::Error) -> String {
+    const SHOWN: usize = 200;
+    crate::redaction::state::prepare_capped(&error.to_string(), SHOWN).value
+}
+
 /// Record a failed attempt; never propagates — failure bookkeeping must
-/// not abort the rest of the batch.
-fn note_failure(storage: &Arc<Storage>, id: &str, error: &str) {
-    match storage.fail_extraction(id, error, MAX_FIRST_ATTEMPTS) {
+/// not abort the rest of the batch. The record holds the code.
+fn note_failure(storage: &Arc<Storage>, id: &str, failure: Failure) {
+    let id_shown = crate::redaction::state::shown(id);
+    match storage.fail_extraction(id, failure.code(), MAX_FIRST_ATTEMPTS) {
         Ok(true) => warn!(
-            "Extraction worker: {id} dead-lettered to pending_extractions \
+            "Extraction worker: {id_shown} dead-lettered to pending_extractions \
              after {MAX_FIRST_ATTEMPTS} failed attempts (`mnemonic reextract --pending`)"
         ),
         Ok(false) => {}
-        Err(e) => warn!("Extraction worker: fail_extraction({id}) errored: {e}"),
+        Err(_) => warn!(
+            "Extraction worker: fail_extraction({id_shown}) errored ({})",
+            Failure::Storage
+        ),
     }
 }
 
@@ -359,6 +411,82 @@ mod tests {
         );
     }
 
+    /// An extractor whose graph names something the redaction policy
+    /// refuses. The value is assembled at run time.
+    struct DirtyExtractor(String);
+    impl EntityExtractor for DirtyExtractor {
+        fn extract(&self, _entry: &MemoryEntry) -> ExtractionResult {
+            ExtractionResult {
+                entities: vec![
+                    crate::graph::Entity {
+                        name: "demoapp".into(),
+                        entity_type: crate::graph::EntityType::Project,
+                    },
+                    crate::graph::Entity {
+                        name: self.0.clone(),
+                        entity_type: crate::graph::EntityType::Concept,
+                    },
+                ],
+                edges: vec![],
+            }
+        }
+    }
+
+    /// A refused graph gives the same refusal on every try: the row leaves
+    /// the queue at once, is not dead-lettered, and nothing of the graph
+    /// is written.
+    #[tokio::test]
+    async fn redaction_state_worker_drops_a_refused_graph_without_retrying() {
+        let db = tmp_db();
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let name = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let extractor: Arc<dyn EntityExtractor> = Arc::new(DirtyExtractor(name));
+        let entry = make_entry("a plain note", "plain body");
+        storage.save(&entry).unwrap();
+        storage.enqueue_extraction(&entry.id).unwrap();
+
+        assert_eq!(drain_once(&storage, &extractor, 10).await.unwrap(), 0);
+        assert_eq!(storage.extraction_queue_count().unwrap(), 0);
+        assert!(storage.pending_row(&entry.id).unwrap().is_none());
+        assert_eq!(storage.graph_stats().unwrap(), (0, 0));
+    }
+
+    /// A memory stored before the policy under an id it refuses: its graph
+    /// is refused for the id alone, the row leaves the queue, and what the
+    /// worker logs does not name it.
+    #[tokio::test]
+    async fn redaction_state_worker_does_not_name_a_refused_memory_id() {
+        let db = tmp_db();
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let id = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO memories (id, timestamp, title, content, memory_type, tags, source,
+                     importance, metadata)
+                 VALUES (?1, ?2, 'a plain note', 'body', 'note', '[]', '\"Manual\"', 0.5,
+                         'null')",
+                rusqlite::params![id, Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO extraction_queue (memory_id) VALUES (?1)",
+                [&id],
+            )
+            .unwrap();
+        }
+        let extractor: Arc<dyn EntityExtractor> = Arc::new(RuleExtractor::new());
+        assert!(drain_once(&storage, &extractor, 10).await.unwrap() == 0);
+        assert!(storage.extraction_queue_count().unwrap() == 0);
+        assert!(storage.pending_row(&id).unwrap().is_none());
+
+        let error = storage.replace_graph(&id, &[], &[]).unwrap_err();
+        let notice = refused_notice(&id, &error);
+        assert!(notice.contains("left as is") && notice.contains("SENSITIVE_CONTENT"));
+        assert!(!notice.contains(&id), "the notice names the refused id");
+        assert!(refused_notice("m-1", &error).contains("graph of m-1 left"));
+    }
+
     /// Extractor that panics on entries whose title contains "poison" and
     /// returns an empty (successful) extraction for everything else —
     /// simulates a poisoned row without touching real failure plumbing.
@@ -436,4 +564,63 @@ mod tests {
     // doesn't see it used by the inferred type above.
     #[allow(dead_code)]
     fn _unused(_: ExtractionResult) {}
+
+    /// An extractor that stops with what a model could have said.
+    struct LoudExtractor(String);
+    impl EntityExtractor for LoudExtractor {
+        fn extract(&self, _entry: &MemoryEntry) -> ExtractionResult {
+            panic!("extractor stopped at {}", self.0);
+        }
+    }
+
+    /// What a panic says is not kept: the dead letter holds the code.
+    #[tokio::test]
+    async fn redaction_generated_worker_panic_leaves_a_code_and_no_text() {
+        let token: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let db = tmp_db();
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let extractor: Arc<dyn EntityExtractor> = Arc::new(LoudExtractor(token.clone()));
+        let entry = make_entry("rollout", "the sample service goes out on friday");
+        storage.save(&entry).unwrap();
+        storage.enqueue_extraction(&entry.id).unwrap();
+        for _ in 0..MAX_FIRST_ATTEMPTS {
+            drain_once(&storage, &extractor, 5).await.unwrap();
+        }
+        let row = storage.pending_row(&entry.id).unwrap().unwrap();
+        assert!(row.1.as_deref() == Some("WORKER_FAILED"));
+    }
+
+    /// The store's own words are logged prepared, and the memory's id is
+    /// shown unless the policy refuses it.
+    #[test]
+    fn redaction_generated_worker_notice_of_a_store_failure_is_prepared() {
+        let token: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let error = anyhow::anyhow!("constraint failed near {token} and more");
+        let notice = failure_notice("replace_graph", &token, &error);
+        assert!(notice.contains("STORAGE_FAILED") && notice.contains("constraint failed"));
+        assert!(!notice.contains(&token), "the notice holds the token");
+        let notice = failure_notice("get_by_id", "m-1", &anyhow::anyhow!("database is locked"));
+        assert!(notice.contains("get_by_id failed for m-1"));
+        assert!(notice.contains("database is locked"));
+        // What is shown of the store's words is cut.
+        let long = anyhow::anyhow!("{}", "lock ".repeat(200));
+        assert!(failure_notice("get_by_id", "m-1", &long).chars().count() < 400);
+    }
+
+    /// Every line the worker logs of a failure is made by one of the
+    /// notices above: none puts an id or an error into a line as it is.
+    /// (A lookup that fails cannot be made to happen in a test, so the
+    /// line it logs is held to this by its source.)
+    #[test]
+    fn redaction_generated_worker_logs_no_id_and_no_error_as_it_is() {
+        let source = include_str!("extraction_worker.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        for raw in ["{id}", "{e}", "{e:", "{error}", "{error:"] {
+            let lines: Vec<&str> = code
+                .lines()
+                .filter(|line| line.contains(raw) && !line.contains("({error})"))
+                .collect();
+            assert!(lines.is_empty(), "a line holds {raw}");
+        }
+    }
 }

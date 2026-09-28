@@ -7,12 +7,43 @@ use tracing::{debug, info, warn};
 
 use crate::config::WatcherConfig;
 use crate::event::{Event, EventKind as MnemonicEventKind, EventSource};
+use crate::redaction;
 
 pub struct FileWatcher {
     config: WatcherConfig,
 }
 
 impl FileWatcher {
+    /// The event for one file change, or `None` when the path itself holds
+    /// a credential: a path is an identity, so it is refused, not masked,
+    /// and never formatted or logged.
+    fn file_event(kind: MnemonicEventKind, path: &Path) -> Option<Event> {
+        if redaction::check_identity(&path.to_string_lossy()).is_err() {
+            warn!(
+                "file watcher: a path was refused ({})",
+                redaction::RedactionError::SensitiveContent.code()
+            );
+            return None;
+        }
+        let content = format!(
+            "{}: {}",
+            match &kind {
+                MnemonicEventKind::FileCreated => "File created",
+                MnemonicEventKind::FileModified => "File modified",
+                MnemonicEventKind::FileDeleted => "File deleted",
+                MnemonicEventKind::DependencyAdded => "Dependency changed",
+                _ => "File event",
+            },
+            path.display()
+        );
+        Some(
+            Event::new(EventSource::FileWatcher, kind, &content).with_metadata(serde_json::json!({
+                "path": path.to_string_lossy(),
+                "extension": path.extension().map(|e| e.to_string_lossy().to_string()),
+            })),
+        )
+    }
+
     pub fn new(config: WatcherConfig) -> Self {
         Self { config }
     }
@@ -120,28 +151,10 @@ impl super::Watcher for FileWatcher {
                                 continue;
                             }
 
-                            if let Some(kind) = Self::classify_event(&notify_event.kind, path) {
-                                let content = format!(
-                                    "{}: {}",
-                                    match &kind {
-                                        MnemonicEventKind::FileCreated => "File created",
-                                        MnemonicEventKind::FileModified => "File modified",
-                                        MnemonicEventKind::FileDeleted => "File deleted",
-                                        MnemonicEventKind::DependencyAdded => "Dependency changed",
-                                        _ => "File event",
-                                    },
-                                    path.display()
-                                );
-
-                                let event = Event::new(EventSource::FileWatcher, kind, &content)
-                                    .with_metadata(serde_json::json!({
-                                        "path": path.to_string_lossy(),
-                                        "extension": path.extension()
-                                            .map(|e| e.to_string_lossy().to_string()),
-                                    }));
-
-                                debug!("File event: {content}");
-
+                            if let Some(kind) = Self::classify_event(&notify_event.kind, path)
+                                && let Some(event) = Self::file_event(kind, path)
+                            {
+                                debug!("File event: {}", event.content);
                                 if tx.blocking_send(event).is_err() {
                                     return;
                                 }
@@ -159,5 +172,27 @@ impl super::Watcher for FileWatcher {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A path holding a credential is refused: no event, so nothing formats
+    /// or logs it. An ordinary path gives the usual event.
+    #[test]
+    fn redaction_ingress_file_event_refuses_a_credential_path() {
+        let token: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let dirty = std::path::PathBuf::from(format!("/work/exports/{token}.json"));
+        assert!(FileWatcher::file_event(MnemonicEventKind::FileCreated, &dirty).is_none());
+        let clean = std::path::PathBuf::from("/work/exports/report-2026.json");
+        let event = FileWatcher::file_event(MnemonicEventKind::FileModified, &clean).unwrap();
+        assert_eq!(
+            event.content,
+            "File modified: /work/exports/report-2026.json"
+        );
+        assert_eq!(event.metadata["extension"], "json");
+        assert!(crate::redaction::check_event(&event, crate::redaction::STRUCTURAL_KEYS).is_ok());
     }
 }

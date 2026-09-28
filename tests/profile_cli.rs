@@ -37,9 +37,25 @@ fn fake_home(root: &Path) -> PathBuf {
     home
 }
 
+/// A child process that sees only the fake home. Commands that embed (`save`)
+/// would otherwise download the ~1 GB model into an empty cache on every run:
+/// the model endpoint points at a closed local port, so loading fails at once
+/// and the binary falls back to the hash embedder, which is all these tests need.
+fn child(program: impl AsRef<std::ffi::OsStr>, user_home: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env("HOME", user_home)
+        .env_remove("MNEMONIC_HOME")
+        .env("FASTEMBED_CACHE_DIR", user_home.join(".fastembed_cache"))
+        .env("HF_ENDPOINT", "http://127.0.0.1:9")
+        .env_remove("HF_HOME");
+    for proxy in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
+        cmd.env_remove(proxy).env_remove(proxy.to_lowercase());
+    }
+    cmd
+}
+
 fn mnemonic(user_home: &Path, env_home: Option<&str>, args: &[&str]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mnemonic"));
-    cmd.env("HOME", user_home).env_remove("MNEMONIC_HOME");
+    let mut cmd = child(env!("CARGO_BIN_EXE_mnemonic"), user_home);
     if let Some(value) = env_home {
         cmd.env("MNEMONIC_HOME", value);
     }
@@ -76,6 +92,41 @@ fn init_under_the_variable_writes_only_inside_the_profile() {
     );
     assert_eq!(owner_config(&user_home), before);
     assert!(!user_home.join(".mnemonic").exists());
+}
+
+/// Loading a profile checks its config against the owner's home as the
+/// process sees it: the unit tests inject a home, this pins the real lookup.
+#[test]
+fn a_profile_config_naming_the_owners_transcripts_is_refused() {
+    let root = Temp::new("owner-dirs");
+    let user_home = fake_home(&root.0);
+    let global = user_home.join(".claude/projects");
+    std::fs::create_dir_all(&global).unwrap();
+    let profile = root.0.join("client");
+    let home = profile.to_str().unwrap();
+    let init = mnemonic(&user_home, None, &["--home", home, "init"]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // Hand-edited later: capture every project from the owner's folder.
+    std::fs::write(
+        profile.join("config.toml"),
+        format!(
+            "[watchers]\nconversation_enabled = true\nconversation_sessions_dir = \"{}\"\n",
+            global.display()
+        ),
+    )
+    .unwrap();
+    let out = mnemonic(&user_home, None, &["--home", home, "status"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is part of the global"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -171,9 +222,7 @@ fn context_refuses_to_write_through_a_symlink_out_of_the_profile() {
     std::fs::create_dir_all(&dest_dir).unwrap();
     std::os::unix::fs::symlink(&outside, dest_dir.join("CONTEXT.md")).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_mnemonic"))
-        .env("HOME", &user_home)
-        .env_remove("MNEMONIC_HOME")
+    let out = child(env!("CARGO_BIN_EXE_mnemonic"), &user_home)
         .current_dir(&work)
         .args(["--home", home_arg, "context"])
         .output()
@@ -301,9 +350,7 @@ fn a_relative_project_root_keeps_its_absolute_spelling() {
     std::os::unix::fs::symlink(&work, &desk).unwrap();
 
     // The way a human types it: `./demoapp` from the folder holding the link.
-    let out = Command::new(env!("CARGO_BIN_EXE_mnemonic"))
-        .env("HOME", &user_home)
-        .env_remove("MNEMONIC_HOME")
+    let out = child(env!("CARGO_BIN_EXE_mnemonic"), &user_home)
         .env("PWD", &desk)
         .current_dir(&desk)
         .args(["--home", profile.to_str().unwrap()])
@@ -460,22 +507,21 @@ fn the_printed_setup_survives_a_path_with_spaces_and_quotes() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // The shell line runs as printed (asking for `doctor`, not a daemon).
+    // The shell line runs as printed (asking for `init --force`, not a
+    // daemon: `doctor` would also query the owner's launchd services).
     let start = stdout
         .lines()
         .find(|line| line.trim_end().ends_with("start -d"))
         .unwrap();
-    let doctor = start.trim().replace("start -d", "doctor");
-    let ran = Command::new("sh")
+    let reinit = start.trim().replace("start -d", "init --force");
+    let ran = child("sh", &user_home)
         .arg("-c")
-        .arg(&doctor)
-        .env("HOME", &user_home)
-        .env_remove("MNEMONIC_HOME")
+        .arg(&reinit)
         .output()
         .unwrap();
     assert!(
-        String::from_utf8_lossy(&ran.stdout).contains("Isolated profile"),
-        "{doctor}\n{}",
+        String::from_utf8_lossy(&ran.stdout).contains(&format!("Isolated profile ready: {home}")),
+        "{reinit}\n{}",
         String::from_utf8_lossy(&ran.stderr)
     );
 
@@ -527,4 +573,57 @@ fn a_symlinked_selector_and_its_target_are_one_profile() {
         &["--home", real.to_str().unwrap(), "doctor"],
     );
     assert!(!out.status.success());
+}
+
+#[test]
+fn doctor_in_a_profile_never_probes_the_owner_launch_agent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = Temp::new("doctor");
+    let user_home = fake_home(&root.0);
+    let profile = root.0.join("client");
+    // Stand-ins that log every call, found on PATH ahead of the real tools.
+    let bin = root.0.join("bin");
+    let calls = root.0.join("calls.log");
+    std::fs::create_dir_all(&bin).unwrap();
+    for tool in ["launchctl", "which"] {
+        let script = bin.join(tool);
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho {tool} >> '{}'\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_mnemonic"))
+        .env("HOME", &user_home)
+        .env("PATH", path)
+        .env_remove("MNEMONIC_HOME")
+        .args(["--home", profile.to_str().unwrap(), "doctor"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !calls.exists(),
+        "doctor ran {:?}\n{stdout}",
+        std::fs::read_to_string(&calls).unwrap_or_default()
+    );
+    assert!(!stdout.contains("launchctl"), "{stdout}");
+    if cfg!(target_os = "macos") {
+        assert!(
+            stdout.contains("launchd: not used for isolated profiles"),
+            "{stdout}"
+        );
+    }
 }

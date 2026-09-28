@@ -5,6 +5,13 @@
 //! are cached by sha-ish hash of (title|content|extractor_id) so repeated
 //! identical memories don't re-burn LLM calls.
 //!
+//! A model's answer is fresh input, whatever the prompt held: it is parsed,
+//! every name in it is judged as the model wrote it, and only the structure
+//! that passed is written out again for the cache. The cache is read in the
+//! namespace of the redaction policy in force, so what was cached before
+//! it, unjudged, is not read. A failure leaves a fixed code, never the
+//! error's text.
+//!
 //! Pure rule-based extraction still runs alongside via `CompositeExtractor`.
 //! This module never panics — extraction failure must degrade gracefully.
 
@@ -19,6 +26,7 @@ use crate::config::LlmConfig;
 use crate::event::MemoryEntry;
 use crate::graph::extractor::{EntityExtractor, ExtractionResult};
 use crate::graph::{Edge, Entity, EntityType};
+use crate::redaction::failure::Failure;
 use crate::storage::Storage;
 
 /// Strict JSON schema the LLM must return. Anything else is dropped.
@@ -121,13 +129,58 @@ impl LlmExtractor {
     ) -> Self {
         // Identify cache entries by backend + model so swapping models
         // doesn't poison results from the previous one.
-        let extractor_id = format!("ollama:{}", cfg.model);
+        let extractor_id = cache_namespace(&cfg.model);
         Self {
             backend,
             storage,
             extractor_id,
             min_chars: cfg.min_chars,
         }
+    }
+}
+
+/// The cache namespace of a model under the redaction policy in force.
+/// What a build before the policy cached under the model's name alone was
+/// never judged: it stays where it is and is not read.
+fn cache_namespace(model: &str) -> String {
+    format!(
+        "ollama:{model}:redaction-v{}",
+        crate::redaction::POLICY_VERSION
+    )
+}
+
+/// The structure a model answered with, if the policy admits every name
+/// in it as the model wrote it: before a name is canonicalized (which
+/// takes the dots out of a token and the case out of a prefix), before
+/// the structure is cached and before it becomes a graph.
+fn accept(parsed: LlmResponse) -> Result<LlmResponse, Failure> {
+    let names = parsed
+        .entities
+        .iter()
+        .flat_map(|e| [e.name.as_str(), e.entity_type.as_str()])
+        .chain(
+            parsed
+                .relations
+                .iter()
+                .flat_map(|r| [r.source.as_str(), r.target.as_str(), r.relation.as_str()]),
+        );
+    match crate::redaction::state::check_identities(names) {
+        Ok(()) => Ok(parsed),
+        Err(_) => Err(Failure::Rejected),
+    }
+}
+
+impl LlmExtractor {
+    /// A failed attempt: the memory keeps its rule-based graph and waits
+    /// for a retry (a backend that was down, a model that may do better
+    /// next time). What failed is said by its code alone, in the log and
+    /// in the retry record.
+    fn failed(&self, entry: &MemoryEntry, failure: Failure) -> ExtractionResult {
+        warn!("LLM extractor: {failure}");
+        let _ = self
+            .storage
+            .enqueue_pending_extraction(&entry.id, failure.code());
+        ExtractionResult::default()
     }
 }
 
@@ -140,50 +193,38 @@ impl EntityExtractor for LlmExtractor {
 
         let hash = content_hash(&combined);
 
-        // Cache lookup. Treat parse failure as cache miss.
+        // Cache lookup. An entry that does not parse, or that holds a name
+        // the policy refuses, is a miss.
         if let Ok(Some(cached)) = self.storage.llm_cache_get(&hash, &self.extractor_id)
             && let Ok(parsed) = serde_json::from_str::<LlmResponse>(&cached)
+            && let Ok(accepted) = accept(parsed)
         {
             debug!("LLM extractor cache hit ({})", &hash[..8]);
-            return to_result(&parsed, &entry.id);
+            return to_result(&accepted, &entry.id);
         }
 
         // Cache miss — call the model.
         let prompt = build_prompt(&entry.title, &entry.content);
-        let raw = match self.backend.generate(&prompt) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("LLM extractor backend error: {e}");
-                // Queue for retry. Backend hiccups (Ollama not running, model
-                // download in progress, network flake) shouldn't permanently
-                // strand a memory in rule-only land.
-                let _ = self
-                    .storage
-                    .enqueue_pending_extraction(&entry.id, &format!("backend: {e}"));
-                return ExtractionResult::default();
-            }
+        let Ok(raw) = self.backend.generate(&prompt) else {
+            return self.failed(entry, Failure::Backend);
+        };
+        let Ok(parsed) = serde_json::from_str::<LlmResponse>(&raw) else {
+            return self.failed(entry, Failure::InvalidJson);
+        };
+        let accepted = match accept(parsed) {
+            Ok(accepted) => accepted,
+            Err(failure) => return self.failed(entry, failure),
         };
 
-        let parsed: LlmResponse = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("LLM extractor JSON parse failed: {e}");
-                // Same logic — a model that returned malformed JSON might
-                // do better next time (different seed, or after a swap).
-                let _ = self
-                    .storage
-                    .enqueue_pending_extraction(&entry.id, &format!("parse: {e}"));
-                return ExtractionResult::default();
-            }
-        };
-
-        // Store raw model output, not parsed — re-parsing is cheap and keeps
-        // forward compat if we extend the response schema later.
-        let _ = self.storage.llm_cache_put(&hash, &self.extractor_id, &raw);
+        // The accepted structure written out again, never the answer as it
+        // came: a field the schema does not know is not in it.
+        if let Ok(json) = serde_json::to_string(&accepted) {
+            let _ = self.storage.llm_cache_put(&hash, &self.extractor_id, &json);
+        }
         // Success — make sure the retry queue doesn't keep this around.
         let _ = self.storage.drop_pending_extraction(&entry.id);
 
-        to_result(&parsed, &entry.id)
+        to_result(&accepted, &entry.id)
     }
 }
 
@@ -353,6 +394,10 @@ fn to_result(parsed: &LlmResponse, memory_id: &str) -> ExtractionResult {
 }
 
 #[cfg(test)]
+#[path = "extractor_llm_redaction_tests.rs"]
+mod redaction_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::{EventSource, MemoryType};
@@ -475,11 +520,7 @@ mod tests {
             "JSON parse failure should enqueue for retry"
         );
         let row = storage.pending_row(&e.id).unwrap().unwrap();
-        assert!(
-            row.1.as_deref().unwrap_or("").starts_with("parse:"),
-            "last_error should record parse failure, got {:?}",
-            row.1
-        );
+        assert_eq!(row.1.as_deref(), Some("GENERATED_JSON_INVALID"));
     }
 
     /// Backend errors (Ollama unreachable, timeout, etc.) also enqueue.
@@ -497,11 +538,7 @@ mod tests {
         let _ = ex.extract(&e);
         assert_eq!(storage.pending_extractions_count().unwrap(), 1);
         let row = storage.pending_row(&e.id).unwrap().unwrap();
-        assert!(
-            row.1.as_deref().unwrap_or("").starts_with("backend:"),
-            "last_error should record backend failure, got {:?}",
-            row.1
-        );
+        assert_eq!(row.1.as_deref(), Some("BACKEND_FAILED"));
     }
 
     /// Successful extraction must drop any prior pending row — otherwise the

@@ -37,11 +37,13 @@
 //! exposes `summary_for_session` to check whether a summary already
 //! exists; batch runs skip already-summarized sessions.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::HashMap;
 
 use crate::event::{EventSource, MemoryEntry, MemoryType};
 use crate::graph::extractor_llm::LlmBackend;
+use crate::redaction::failure::Failure;
+use crate::redaction::state::shown;
 use crate::storage::{Session, Storage};
 
 /// Output of `summarize_session_heuristic`: a `MemoryEntry` ready to
@@ -79,7 +81,7 @@ fn summarize_session_heuristic_inner(
 ) -> Result<MemoryEntry> {
     let session = storage
         .session_by_id(session_id)?
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", shown(session_id)))?;
 
     // Codex P1: refuse open sessions unless explicit opt-in.
     // Summary text would include "Window: ... → ongoing" — fine as
@@ -89,17 +91,21 @@ fn summarize_session_heuristic_inner(
     // the CLI.
     if !allow_open && session.is_open() {
         anyhow::bail!(
-            "session {session_id} is still open (no ended_at). \
+            "session {} is still open (no ended_at). \
              Refusing to summarize an active session — its memories \
              are still accumulating. Wait for the idle-timeout to \
              close it, or call --allow-open if you really want a \
-             snapshot."
+             snapshot.",
+            shown(session_id)
         );
     }
 
     let memories = storage.memories_for_session(session_id)?;
     if memories.is_empty() {
-        anyhow::bail!("session {session_id} has no memories — nothing to summarize");
+        anyhow::bail!(
+            "session {} has no memories — nothing to summarize",
+            shown(session_id)
+        );
     }
 
     let body = render_heuristic_body(&session, &memories, storage);
@@ -121,7 +127,17 @@ fn summarize_session_heuristic_inner(
         // this for freshness-based regeneration.
         "open_at_summary_time": session.is_open(),
     });
-    Ok(entry)
+    prepared(entry)
+}
+
+/// A summary as it is shown, embedded and stored: prepared. Its text is
+/// new, whether a model wrote it or it was put together from titles that
+/// were each admitted alone, and whoever takes the entry from here (a
+/// preview, an embedder, the store) takes the prepared one.
+fn prepared(entry: MemoryEntry) -> Result<MemoryEntry> {
+    crate::redaction::prepare_entry(entry, crate::redaction::STRUCTURAL_KEYS)
+        .map(crate::redaction::PreparedEntry::into_entry)
+        .map_err(|code| crate::redaction::state::refused("memory write", code))
 }
 
 /// LLM-driven summarizer (the v2 of dream consolidation). Same input
@@ -171,27 +187,38 @@ fn summarize_session_llm_inner(
     // around what's a valid input.
     let session = storage
         .session_by_id(session_id)?
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", shown(session_id)))?;
     if !allow_open && session.is_open() {
         anyhow::bail!(
-            "session {session_id} is still open (no ended_at). \
+            "session {} is still open (no ended_at). \
              Refusing to summarize an active session — its memories \
              are still accumulating. Wait for the idle-timeout to \
              close it, or call --allow-open if you really want a \
-             snapshot."
+             snapshot.",
+            shown(session_id)
         );
     }
     let memories = storage.memories_for_session(session_id)?;
     if memories.is_empty() {
-        anyhow::bail!("session {session_id} has no memories — nothing to summarize");
+        anyhow::bail!(
+            "session {} has no memories — nothing to summarize",
+            shown(session_id)
+        );
     }
 
     let prompt = build_llm_prompt(&session, &memories);
-    let body_raw = backend
-        .generate(&prompt)
-        .context("LLM backend failed to generate session summary")?;
-    let body = extract_llm_summary_text(&body_raw)
-        .with_context(|| format!("LLM returned no usable summary text: {body_raw}"))?;
+    // What failed is said by its code: the backend's own words, and the
+    // answer that could not be used, are the model's.
+    let body_raw = backend.generate(&prompt).map_err(|_| {
+        Failure::Backend
+            .error()
+            .context("LLM backend failed to generate session summary")
+    })?;
+    let body = extract_llm_summary_text(&body_raw).map_err(|_| {
+        Failure::InvalidJson
+            .error()
+            .context("LLM returned no usable summary text")
+    })?;
     let title = render_heuristic_title(&session, storage);
 
     let mut entry = MemoryEntry::new(title, body, MemoryType::SessionSummary, EventSource::Manual);
@@ -207,7 +234,7 @@ fn summarize_session_llm_inner(
         "summarizer": "llm-v1",
         "open_at_summary_time": session.is_open(),
     });
-    Ok(entry)
+    prepared(entry)
 }
 
 /// Build the LLM prompt. Mirrors the conclusions_generator pattern:
@@ -294,6 +321,25 @@ fn extract_llm_summary_text(raw: &str) -> Result<String> {
 /// don't have an index for this column today; cost is O(N) over
 /// session_summary rows, which stays cheap until summary counts
 /// grow into the tens of thousands. Add an index then.
+/// Store `summary` in place of `prior`, a summary of the same session that
+/// is being regenerated. The new one is judged first: a summary the store
+/// would refuse (a title copied from a memory kept before the redaction
+/// policy, or fresh model output) must not cost the session the one it has.
+pub fn replace_summary(
+    storage: &Storage,
+    prior: Option<&str>,
+    summary: &MemoryEntry,
+    embedding: Option<&crate::embedding::Embedding>,
+) -> Result<()> {
+    crate::redaction::check_entry(summary, crate::redaction::STRUCTURAL_KEYS).map_err(|code| {
+        anyhow::Error::new(code).context(format!("memory write refused ({})", code.code()))
+    })?;
+    if let Some(prior) = prior {
+        storage.forget_by_id(prior)?;
+    }
+    storage.save_with_embedding(summary, embedding)
+}
+
 pub fn summary_for_session(storage: &Storage, session_id: &str) -> Result<Option<MemoryEntry>> {
     storage.session_summary_lookup(session_id)
 }
@@ -418,6 +464,10 @@ fn session_duration(session: &Session) -> Option<String> {
 }
 
 #[cfg(test)]
+#[path = "dream_redaction_tests.rs"]
+pub(crate) mod redaction_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::{EventSource, MemoryEntry, MemoryType};
@@ -443,6 +493,42 @@ mod tests {
             importance: 0.5,
             metadata: serde_json::Value::Null,
         }
+    }
+
+    /// Regenerating replaces the prior summary only once the new one is
+    /// admitted: a refused one leaves the session with what it has.
+    #[test]
+    fn redaction_memory_dream_keeps_the_prior_summary_when_the_new_one_is_refused() {
+        let storage = tmp_storage();
+        let peer_id = storage.upsert_peer("claude", None, "agent").unwrap();
+        let session_id = storage
+            .open_session(&peer_id, Some("test"), "jsonl")
+            .unwrap();
+        let entry = make_entry("First decision", MemoryType::Decision);
+        storage.save(&entry).unwrap();
+        storage
+            .set_memory_session(&entry.id, Some(&session_id))
+            .unwrap();
+        storage.end_session(&session_id).unwrap();
+        let prior = summarize_session_heuristic(&storage, &session_id).unwrap();
+        storage.save(&prior).unwrap();
+
+        let token: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let mut refused = prior.clone();
+        refused.id = uuid::Uuid::new_v4().to_string();
+        refused.content = format!("{}\n{token}", prior.content);
+        let err = replace_summary(&storage, Some(&prior.id), &refused, None).unwrap_err();
+        assert!(err.to_string().contains("SENSITIVE_CONTENT"));
+        let kept = summary_for_session(&storage, &session_id).unwrap().unwrap();
+        assert_eq!(kept.id, prior.id, "the prior summary is gone");
+
+        let mut fresh = prior.clone();
+        fresh.id = uuid::Uuid::new_v4().to_string();
+        fresh.content = format!("{}\nregenerated", prior.content);
+        replace_summary(&storage, Some(&prior.id), &fresh, None).unwrap();
+        let now = summary_for_session(&storage, &session_id).unwrap().unwrap();
+        assert_eq!(now.id, fresh.id);
+        assert!(storage.get_by_id(&prior.id).unwrap().is_none());
     }
 
     /// Happy path: a CLOSED session with mixed memory types produces

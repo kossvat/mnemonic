@@ -47,6 +47,13 @@ fn slug(text: &str) -> String {
 /// Uncapped: the graph cuts names at 60 characters, and two long product
 /// names that differ only after that are two subjects (review point).
 pub fn subject_key(conn: &Connection, subject: &str) -> Result<String> {
+    Ok(subject_resolution(conn, subject)?.0)
+}
+
+/// [`subject_key`], with the alias target the key was made from, if any:
+/// the key of a target is its canonical form, which no longer shows what
+/// the target's own spelling held.
+pub fn subject_resolution(conn: &Connection, subject: &str) -> Result<(String, Option<String>)> {
     let raw = subject.trim();
     ensure!(!raw.is_empty(), "a fact needs a subject");
     let canonical = crate::graph::canonical::canonicalize_name_uncapped(raw);
@@ -57,16 +64,16 @@ pub fn subject_key(conn: &Connection, subject: &str) -> Result<String> {
         if let Some(target) = crate::storage::Storage::canonical_for_alias_conn(conn, &candidate)? {
             let key = crate::graph::canonical::canonicalize_name_uncapped(&target);
             if !key.is_empty() {
-                return Ok(key);
+                return Ok((key, Some(target)));
             }
         }
     }
     if !canonical.is_empty() {
-        return Ok(canonical);
+        return Ok((canonical, None));
     }
     let folded = fold(raw);
     ensure!(!folded.is_empty(), "a fact needs a subject");
-    Ok(folded)
+    Ok((folded, None))
 }
 
 /// The predicate key: a slug, with the common business predicates folded

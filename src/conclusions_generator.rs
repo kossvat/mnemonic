@@ -37,6 +37,7 @@ use serde::Deserialize;
 
 use crate::event::MemoryEntry;
 use crate::graph::extractor_llm::LlmBackend;
+use crate::redaction::failure::Failure;
 use crate::storage::Storage;
 
 /// Output of `LlmConclusionGenerator::generate_for_subject` — a
@@ -75,8 +76,29 @@ fn default_confidence() -> f32 {
 /// through if the prompt is changed to require attribution.
 #[derive(Debug, Clone)]
 pub struct GenerationOutput {
+    /// The claims as they are shown and stored: prepared.
     pub conclusions: Vec<GeneratedConclusion>,
     pub source_memory_ids: Vec<String>,
+    /// How many claims were left out because the model gave them a kind
+    /// the redaction policy refuses. A number, never the claims.
+    pub withheld: usize,
+}
+
+/// What a model answered is new text: a statement is prepared, as the
+/// store prepares it, before it is shown; a kind names the claim, and a
+/// claim under a kind the policy refuses is left out.
+fn prepare(generated: Vec<GeneratedConclusion>) -> (Vec<GeneratedConclusion>, usize) {
+    let total = generated.len();
+    let kept: Vec<GeneratedConclusion> = generated
+        .into_iter()
+        .filter(|c| crate::redaction::state::check_identities([c.kind.as_str()]).is_ok())
+        .map(|mut c| {
+            c.statement = crate::redaction::redact_text(&c.statement).value;
+            c
+        })
+        .collect();
+    let withheld = total - kept.len();
+    (kept, withheld)
 }
 
 /// Trait abstracting the generation step so tests can mock without
@@ -115,22 +137,31 @@ impl ConclusionGenerator for LlmConclusionGenerator {
         let memories = storage.memories_for_entity_name(subject, limit)?;
         if memories.is_empty() {
             anyhow::bail!(
-                "no memories mention `{subject}` — nothing to generate from. \
-                 (Subject lookup is case-insensitive against the entities table.)"
+                "no memories mention `{}` — nothing to generate from. \
+                 (Subject lookup is case-insensitive against the entities table.)",
+                crate::redaction::state::shown(subject)
             );
         }
 
         let prompt = build_prompt(subject, &memories);
-        let raw = self
-            .backend
-            .generate(&prompt)
-            .context("LLM backend failed to respond")?;
-        let conclusions = parse_llm_response(&raw)
-            .with_context(|| format!("could not parse LLM JSON response: {raw}"))?;
+        // What failed is said by its code: the backend's own words, and
+        // the answer that could not be parsed, are the model's.
+        let raw = self.backend.generate(&prompt).map_err(|_| {
+            Failure::Backend
+                .error()
+                .context("LLM backend failed to respond")
+        })?;
+        let generated = parse_llm_response(&raw).map_err(|_| {
+            Failure::InvalidJson
+                .error()
+                .context("could not parse LLM JSON response")
+        })?;
+        let (conclusions, withheld) = prepare(generated);
 
         Ok(GenerationOutput {
             conclusions,
             source_memory_ids: memories.into_iter().map(|m| m.id).collect(),
+            withheld,
         })
     }
 }
@@ -215,6 +246,10 @@ fn parse_llm_response(raw: &str) -> Result<Vec<GeneratedConclusion>> {
         .map(|_| Vec::new())
         .context("response is neither {\"conclusions\": [...]} nor [...]")
 }
+
+#[cfg(test)]
+#[path = "conclusions_generator_redaction_tests.rs"]
+mod redaction_tests;
 
 #[cfg(test)]
 mod tests {

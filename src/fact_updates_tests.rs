@@ -24,6 +24,10 @@ impl Harness {
         config.output.memory_files_enabled = false;
         config.output.obsidian_enabled = false;
         config.output.memory_api_enabled = false;
+        // `context` writes CONTEXT.md here even with the sink off; the
+        // default is the owner's real agent folder.
+        config.output.memory_files_path = dir.path().join("memory-files");
+        config.output.obsidian_path = dir.path().join("obsidian");
         let storage = Storage::open(&config.storage.db_path).unwrap();
         Self {
             _dir: dir,

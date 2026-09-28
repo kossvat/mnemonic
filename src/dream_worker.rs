@@ -33,6 +33,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::DreamConfig;
 use crate::dream;
+use crate::embedding::Embedder;
 use crate::graph::extractor_llm::OllamaBackend;
 use crate::storage::Storage;
 
@@ -96,6 +97,23 @@ pub fn drain_once(
     dream_cfg: &DreamConfig,
     llm_cfg: &crate::config::LlmConfig,
 ) -> anyhow::Result<usize> {
+    drain_once_with(
+        storage,
+        dream_cfg,
+        llm_cfg,
+        crate::embedding::create_embedder,
+    )
+}
+
+/// `drain_once` with the embedder supplied by the caller. It is built only
+/// when a session actually needs summarizing, so tests can pass a fake and
+/// never load the real model.
+fn drain_once_with(
+    storage: &Arc<Storage>,
+    dream_cfg: &DreamConfig,
+    llm_cfg: &crate::config::LlmConfig,
+    make_embedder: impl FnOnce() -> anyhow::Result<Box<dyn Embedder>>,
+) -> anyhow::Result<usize> {
     let sessions = storage.closed_sessions_since(dream_cfg.since_hours, dream_cfg.batch_limit)?;
     if sessions.is_empty() {
         return Ok(0);
@@ -141,7 +159,7 @@ pub fn drain_once(
         None
     };
 
-    let embedder = crate::embedding::create_embedder()?;
+    let embedder = make_embedder()?;
     let mut saved = 0usize;
     for s in &pending {
         let result = match &backend {
@@ -230,12 +248,20 @@ mod tests {
         }
     }
 
+    /// One tick with a fake embedder: these tests are about which sessions
+    /// get summarized, and must never load the real model.
+    fn drain(storage: &Arc<Storage>) -> anyhow::Result<usize> {
+        drain_once_with(storage, &dream_cfg(false), &llm_cfg_disabled(), || {
+            Ok(Box::new(crate::test_support::ConstEmbedder))
+        })
+    }
+
     /// Empty DB: drain returns 0, no errors. Worker can run
     /// safely on a fresh install before any sessions exist.
     #[test]
     fn drain_once_returns_zero_on_empty_db() {
         let storage = tmp_storage();
-        let n = drain_once(&storage, &dream_cfg(false), &llm_cfg_disabled()).unwrap();
+        let n = drain(&storage).unwrap();
         assert_eq!(n, 0);
     }
 
@@ -270,7 +296,7 @@ mod tests {
         let summary = dream::summarize_session_heuristic(&storage, &closed_summarized).unwrap();
         storage.save(&summary).unwrap();
 
-        let n = drain_once(&storage, &dream_cfg(false), &llm_cfg_disabled()).unwrap();
+        let n = drain(&storage).unwrap();
         assert_eq!(
             n, 0,
             "open + already-summarized sessions must both be skipped"
@@ -292,12 +318,12 @@ mod tests {
             .unwrap();
         storage.end_session(&session_id).unwrap();
 
-        let n = drain_once(&storage, &dream_cfg(false), &llm_cfg_disabled()).unwrap();
+        let n = drain(&storage).unwrap();
         assert_eq!(n, 1, "exactly one summary should land");
 
         // Second tick — link is now there, lookup returns it,
         // session is skipped.
-        let n2 = drain_once(&storage, &dream_cfg(false), &llm_cfg_disabled()).unwrap();
+        let n2 = drain(&storage).unwrap();
         assert_eq!(n2, 0, "second tick must be idempotent");
 
         // Verify the summary exists in the lookup path.
@@ -322,9 +348,43 @@ mod tests {
             .unwrap();
         storage.end_session(&empty).unwrap();
 
-        let n = drain_once(&storage, &dream_cfg(false), &llm_cfg_disabled()).unwrap();
+        let n = drain(&storage).unwrap();
         assert_eq!(n, 0, "empty session generates no summary");
         // Worker didn't error — that's the assertion: no panic, no
         // anyhow propagation, just a clean 0.
+    }
+
+    /// The worker embeds and stores the summary it was given, which is the
+    /// prepared one.
+    #[test]
+    fn redaction_generated_dream_worker_embeds_and_stores_the_prepared_summary() {
+        let token: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let storage = tmp_storage();
+        let session = crate::dream::redaction_tests::session(
+            &storage,
+            Some(&format!("Deploy key is {token}")),
+        );
+        let embedder = crate::test_support::RecordingEmbedder::new();
+        let given = embedder.clone();
+        let saved = drain_once_with(
+            &storage,
+            &dream_cfg(false),
+            &llm_cfg_disabled(),
+            move || Ok(Box::new(given)),
+        )
+        .unwrap();
+        assert!(saved == 1);
+        let texts = embedder.texts();
+        assert!(texts.len() == 1 && !texts[0].contains(&token));
+        assert!(texts[0].contains(crate::redaction::CREDENTIAL_MARKER));
+        let summary = dream::summary_for_session(&storage, &session)
+            .unwrap()
+            .unwrap();
+        assert!(!serde_json::to_string(&summary).unwrap().contains(&token));
+        assert!(
+            summary
+                .content
+                .contains(crate::redaction::CREDENTIAL_MARKER)
+        );
     }
 }

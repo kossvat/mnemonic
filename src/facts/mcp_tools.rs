@@ -101,7 +101,7 @@ pub fn fact_set(
     };
     let declared = declare(storage, embedder, threshold, &write, text(params, "note"))?;
     let outcome = &declared.outcome;
-    Ok(json!({
+    let mut reply = json!({
         "outcome": outcome.outcome,
         "replayed": outcome.replayed,
         "fact": outcome.fact,
@@ -115,7 +115,16 @@ pub fn fact_set(
             .zip(declared.memory.as_ref())
             .map(|(link, memory)| vec![crate::updates::plan::link_json(&memory.id, link)])
             .unwrap_or_default(),
-    }))
+    });
+    // What preparing the note redacted, as classes and counts.
+    if let Some(summary) = declared
+        .memory
+        .as_ref()
+        .and_then(|m| m.metadata.get(crate::redaction::SUMMARY_KEY))
+    {
+        reply["redaction"] = summary.clone();
+    }
+    Ok(reply)
 }
 
 /// How many earlier values the short trail shows.

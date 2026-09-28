@@ -29,6 +29,7 @@ use super::ingress::{CONVERSATION_NAMESPACE, ParsedTurn, RecordScope, message_ke
 use super::scope::{ClaudeScope, CodexScope, ProjectScope};
 use crate::config::Config;
 use crate::ingest::{IngestPayload, IngestRecord};
+use crate::redaction;
 use crate::storage::Storage;
 
 /// Metadata flag the daemon reads: a history turn does not open a session.
@@ -62,6 +63,11 @@ pub struct HistoryReport {
     /// The same turn copied into another transcript by /compact or a
     /// resume, counted once.
     pub repeated: usize,
+    /// Transcripts whose path could not be admitted (it would be stored
+    /// with every turn of theirs), left out.
+    pub refused: usize,
+    /// Turns whose stored message key could not be admitted, left out.
+    pub refused_turns: usize,
     /// Whether the new turns were queued.
     pub applied: bool,
 }
@@ -117,6 +123,13 @@ impl TranscriptDirs {
     }
 }
 
+/// A transcript left out because its path (copied into every turn) or its
+/// stream key (part of every Codex message key) cannot be admitted.
+fn refused_path(path: &Path, stream: &str) -> bool {
+    redaction::check_identity(&path.to_string_lossy()).is_err()
+        || redaction::check_identity(stream).is_err()
+}
+
 /// One transcript's complete records, in order. A trailing record still
 /// being written is left for live capture.
 fn complete_records(path: &Path, mut visit: impl FnMut(&str)) -> Result<()> {
@@ -159,6 +172,12 @@ impl Collector<'_> {
         // A copy first, so every distinct turn lands in exactly one count.
         if !self.seen.insert(source_key.clone()) {
             self.report.repeated += 1;
+            return;
+        }
+        // Stored serialized: JSON escaping can join what a control character
+        // split in the raw id.
+        if redaction::check_identity(&source_key).is_err() {
+            self.report.refused_turns += 1;
             return;
         }
         let dated = turn
@@ -247,6 +266,10 @@ pub fn ingest_history(
         let mut claude = ClaudeScope::new(scope.clone());
         for path in ConversationWatcher::new(dir).find_jsonl_files() {
             let stream = stream_of(CONVERSATION_NAMESPACE, &path);
+            if refused_path(&path, &stream) {
+                collector.report.refused += 1;
+                continue;
+            }
             claude.reset();
             complete_records(&path, |line| {
                 let admitted = !scope.is_restricted() || claude.admit(line);
@@ -264,6 +287,10 @@ pub fn ingest_history(
         let mut codex = CodexScope::new(scope.clone());
         for path in watcher.find_rollout_files() {
             let stream = stream_of("codex", &path);
+            if refused_path(&path, &stream) {
+                collector.report.refused += 1;
+                continue;
+            }
             codex.reset();
             complete_records(&path, |line| {
                 let admitted = !scope.is_restricted() || codex.admit(line);

@@ -5,6 +5,7 @@
 //! it is not a sandbox against a process that can read the hub's filesystem.
 
 pub mod access;
+mod admit;
 pub mod curation;
 mod filesystem;
 mod mcp;

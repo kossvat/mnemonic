@@ -136,7 +136,8 @@ pub fn prepare(home: &Path) -> Result<PathBuf> {
     prepare_for(home, dirs::home_dir().as_deref())
 }
 
-fn prepare_for(home: &Path, user_home: Option<&Path>) -> Result<PathBuf> {
+/// `prepare` checked against `user_home`, the owner's home directory.
+pub(crate) fn prepare_for(home: &Path, user_home: Option<&Path>) -> Result<PathBuf> {
     std::fs::create_dir_all(home)
         .with_context(|| format!("cannot create {HOME_ENV} {}", home.display()))?;
     let resolved = home

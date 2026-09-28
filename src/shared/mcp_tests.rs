@@ -483,3 +483,38 @@ fn serve_refuses_a_policy_for_another_project_on_a_pinned_database() {
     assert!(output.is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A sensitive observation is refused with the fixed code and nothing of
+/// what was sent; it leaves no row and takes no place in the session.
+#[test]
+fn redaction_shared_mcp_refuses_a_sensitive_observation_without_a_receipt() {
+    let secret = ["sk-", "proj-", &"a1b2c3d4e5f6".repeat(4)].concat();
+    let fixture = Fixture::new();
+    let mut server = fixture.server(true);
+    let observe = |server: &mut SharedMcp<'_>, request: &str, content: &str| {
+        let call = json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
+            "name":"shared_observe","arguments":{"request_id":request,"title":"Note",
+            "content":content,"source":"chat:1"}}});
+        server.respond(call.to_string().as_bytes()).unwrap()
+    };
+    for request in ["r1", "r2", "r3"] {
+        let reply = observe(
+            &mut server,
+            request,
+            &format!("deploy with {secret} on friday"),
+        );
+        let text = reply.to_string();
+        assert!(reply["result"]["isError"] == true);
+        assert!(text.contains("SENSITIVE_CONTENT") && !text.contains(&secret));
+    }
+    assert!(fixture.store.inbox("alpha", 10).unwrap().is_empty());
+    // The session's two places are still free, and another rejection
+    // still says nothing of its reason.
+    for request in ["r1", "r2"] {
+        let reply = observe(&mut server, request, "The deploy window moved");
+        assert!(reply["result"]["isError"] == false);
+    }
+    let reply = observe(&mut server, "r3", "One more");
+    assert!(reply["result"]["isError"] == true);
+    assert!(!reply.to_string().contains("SENSITIVE_CONTENT"));
+}

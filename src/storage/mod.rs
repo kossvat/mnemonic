@@ -98,10 +98,17 @@ impl Storage {
             // Old facts written by any binary since the last open, and links
             // left dangling while a trigger was missing. A busy store is
             // retried at the next open rather than failing this one.
-            if crate::facts::legacy::needs_catch_up(&conn)?
-                && let Err(e) = crate::facts::legacy::catch_up(&mut conn)
-            {
-                warn!("Facts catch-up will retry at the next open: {e}");
+            if crate::facts::legacy::needs_catch_up(&conn)? {
+                match crate::facts::legacy::catch_up(&mut conn) {
+                    // Every open meets these rows again: said quietly, and
+                    // counted by `fact audit`.
+                    Ok(caught_up) if caught_up.held_back > 0 => debug!(
+                        "Facts catch-up: {} old rows held back (SENSITIVE_CONTENT)",
+                        caught_up.held_back
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!("Facts catch-up will retry at the next open: {e}"),
+                }
             }
             versioning::bump(&conn, may_upgrade)?;
         }
@@ -1472,6 +1479,7 @@ impl Storage {
         entry: &MemoryEntry,
         embedding: Option<&Embedding>,
     ) -> Result<()> {
+        admit_memory(entry)?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let blob = embedding.map(|e| embedding_to_bytes(e));
 
@@ -1639,6 +1647,7 @@ impl Storage {
         link: Option<&crate::updates::plan::LinkPlan>,
         actor: &'static str,
     ) -> Result<Option<crate::updates::store::Link>> {
+        admit_memory(entry)?;
         let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
@@ -2892,6 +2901,9 @@ impl Storage {
         confidence: Option<f32>,
         reason: Option<&str>,
     ) -> Result<()> {
+        crate::redaction::state::admit_identities("conflict", [old_id, new_id, project, status])?;
+        // The reason is narrative (a judge's words about two memories).
+        let reason = reason.map(|r| crate::redaction::redact_text(r).value);
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         conn.execute(
             "INSERT INTO decision_conflicts
@@ -3002,43 +3014,74 @@ impl Storage {
         Ok(entries)
     }
 
-    /// Import memories from JSON array (skips duplicates by id)
+    /// Import memories from a JSON array as `export` writes it (skips
+    /// duplicates by id). Every record is decoded and prepared before any is
+    /// written: a record that cannot be admitted (an id, project or other
+    /// identity holding a credential, or serialized tags or metadata that do
+    /// not parse) refuses the whole import with a fixed code and its index,
+    /// so a file is either admitted prepared or not at all. The admitted rows
+    /// are written in bounded transactions; a run a storage failure cuts
+    /// short is completed by importing the file again.
     pub fn import_entries(&self, entries: &[serde_json::Value]) -> Result<(usize, usize)> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        /// Rows per import transaction.
+        const IMPORT_CHUNK: usize = 500;
+
+        let prepared = entries
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| {
+                decode_import(raw)
+                    .and_then(|entry| {
+                        crate::redaction::prepare_entry(entry, crate::redaction::STRUCTURAL_KEYS)
+                            .map_err(|code| anyhow::anyhow!("{}", code.code()))
+                    })
+                    // The write's own guard, run here so the whole file is
+                    // judged before any row is written.
+                    .and_then(|prepared| admit_memory(prepared.entry()).map(|()| prepared))
+                    .map_err(|e| anyhow::anyhow!("import refused at record {index}: {e:#}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        // Refusal is all-or-nothing (judged above); the writes go in
+        // bounded transactions so a large file does not hold the write
+        // lock for its whole duration. A run cut short is completed by
+        // importing again: existing ids are skipped.
         let mut imported = 0;
         let mut skipped = 0;
-
-        for entry in entries {
-            let id = entry["id"].as_str().unwrap_or_default();
-            let exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(false);
-
-            if exists {
-                skipped += 1;
-                continue;
+        for chunk in prepared.chunks(IMPORT_CHUNK) {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for prepared in chunk {
+                let entry = prepared.entry();
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
+                        params![entry.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+                if exists {
+                    skipped += 1;
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO memories (id, timestamp, title, content, memory_type, tags, source, importance, metadata)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        entry.id,
+                        entry.timestamp.to_rfc3339(),
+                        entry.title,
+                        entry.content,
+                        entry.memory_type.to_string(),
+                        serde_json::to_string(&entry.tags)?,
+                        serde_json::to_string(&entry.source)?,
+                        entry.importance,
+                        entry.metadata.to_string(),
+                    ],
+                )?;
+                imported += 1;
             }
-
-            conn.execute(
-                "INSERT INTO memories (id, timestamp, title, content, memory_type, tags, source, importance, metadata)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    id,
-                    entry["timestamp"].as_str().unwrap_or_default(),
-                    entry["title"].as_str().unwrap_or_default(),
-                    entry["content"].as_str().unwrap_or_default(),
-                    entry["memory_type"].as_str().unwrap_or("note"),
-                    entry["tags"].as_str().unwrap_or("[]"),
-                    entry["source"].as_str().unwrap_or("\"manual\""),
-                    entry["importance"].as_f64().unwrap_or(0.5),
-                    entry["metadata"].as_str().unwrap_or("{}"),
-                ],
-            )?;
-            imported += 1;
+            tx.commit()?;
         }
 
         Ok((imported, skipped))
@@ -3047,12 +3090,16 @@ impl Storage {
     /// Begin a reflection run, persist its metadata, return the run id.
     /// `mode` is "dry-run" or "apply"; threshold is the cosine cutoff used
     /// for clustering. `synthesizer` is "rule" or the LLM model id.
+    ///
+    /// Both names are written as they are given, so the store judges them
+    /// itself: a synthesizer that is a model says its own name.
     pub fn begin_reflection_run(
         &self,
         mode: &str,
         threshold: f32,
         synthesizer: &str,
     ) -> Result<String> {
+        crate::redaction::state::admit_identities("reflection run", [mode, synthesizer])?;
         let id = uuid::Uuid::new_v4().to_string();
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         conn.execute(
@@ -3093,6 +3140,12 @@ impl Storage {
         canonical_embedding: Option<&Embedding>,
         cluster: &[(String, f32)],
     ) -> Result<Option<String>> {
+        admit_memory(canonical_entry)?;
+        // What the canonical is said to come from is written with it.
+        crate::redaction::state::admit_identities(
+            "memory write",
+            std::iter::once(run_id).chain(cluster.iter().map(|(id, _)| id.as_str())),
+        )?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let tx = conn.unchecked_transaction()?;
         let blob = canonical_embedding.map(|e| embedding_to_bytes(e));
@@ -3335,6 +3388,7 @@ impl Storage {
         tags_csv: &str,
     ) -> Result<usize> {
         const MIN_PROJECT_MEMS: i64 = 3;
+        crate::redaction::state::admit_identities("graph write", [memory_id])?;
         if is_meta_memory(memory_type, tags_csv) {
             return Ok(0);
         }
@@ -3414,8 +3468,18 @@ impl Storage {
             .collect()
         };
         let scanned = rows.len();
+        let mut refused = 0;
         for (id, title, mtype, tags) in rows {
-            self.reconcile_memory_projects(&id, &title, &mtype, &tags)?;
+            match self.reconcile_memory_projects(&id, &title, &mtype, &tags) {
+                Ok(()) => {}
+                // An id stored before the redaction policy: that memory
+                // keeps its links, the repair goes on.
+                Err(e) if is_refused_write(&e) => refused += 1,
+                Err(e) => return Err(e),
+            }
+        }
+        if refused > 0 {
+            info!("Project repair: {refused} memories left as they are (SENSITIVE_CONTENT)");
         }
         Ok(scanned)
     }
@@ -3427,6 +3491,7 @@ impl Storage {
     /// can't attribute time or pollute the graph. Returns (links removed, edges
     /// removed).
     pub fn strip_memory_project_associations(&self, memory_id: &str) -> Result<(usize, usize)> {
+        crate::redaction::state::admit_identities("graph write", [memory_id])?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let projects: Vec<(String, String)> = {
             let mut stmt =
@@ -3463,6 +3528,14 @@ impl Storage {
     /// false (caller falls back to normal backlink) if the scope isn't a known
     /// project entity.
     pub fn set_memory_single_project(&self, memory_id: &str, canonical_name: &str) -> Result<bool> {
+        crate::redaction::state::admit_identities("graph write", [memory_id])?;
+        // The scope is read from a stored title and only looked up: one
+        // the policy refuses is no known project, and the caller falls
+        // back as for any other unknown scope. An error here would come
+        // after the memory's graph was already replaced.
+        if crate::redaction::state::check_identities([canonical_name]).is_err() {
+            return Ok(false);
+        }
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let keep_id: Option<String> = conn
             .query_row(
@@ -3567,6 +3640,7 @@ impl Storage {
 
     /// Upsert an entity — create if new, bump mention_count if exists
     pub fn upsert_entity(&self, entity: &Entity) -> Result<String> {
+        admit_graph(None, std::slice::from_ref(entity), &[])?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -3598,6 +3672,7 @@ impl Storage {
 
     /// Save an edge between two entities
     pub fn save_edge(&self, edge: &Edge) -> Result<()> {
+        admit_graph(None, &[], std::slice::from_ref(edge))?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
@@ -3621,6 +3696,7 @@ impl Storage {
 
     /// Link a memory to an entity
     pub fn link_memory_entity(&self, memory_id: &str, entity_id: &str) -> Result<()> {
+        crate::redaction::state::admit_identities("graph write", [memory_id, entity_id])?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         conn.execute(
             "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id) VALUES (?1, ?2)",
@@ -3631,6 +3707,8 @@ impl Storage {
 
     /// Save extraction results: entities, edges, and links to memory
     pub fn save_graph(&self, memory_id: &str, entities: &[Entity], edges: &[Edge]) -> Result<()> {
+        // The whole graph first: a refused name leaves nothing of it behind.
+        admit_graph(Some(memory_id), entities, edges)?;
         for entity in entities {
             let entity_id = self.upsert_entity(entity)?;
             self.link_memory_entity(memory_id, &entity_id)?;
@@ -3666,6 +3744,9 @@ impl Storage {
         entities: &[Entity],
         edges: &[Edge],
     ) -> Result<()> {
+        // Before the old footprint is dropped: a refused graph leaves the
+        // memory's graph as it was.
+        admit_graph(Some(memory_id), entities, edges)?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let tx = conn.unchecked_transaction()?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -4051,6 +4132,8 @@ impl Storage {
     /// The canonical entity must already exist (caller's responsibility);
     /// for "promote alias to canonical" use `rename_entity` instead.
     pub fn merge_entities(&self, canonical_name: &str, alias_name: &str) -> Result<MergeReport> {
+        // Both names, before any row, follow-up, memory or fact moves.
+        crate::graph::canonical::admit_renamed("graph write", [canonical_name, alias_name])?;
         if canonical_name == alias_name {
             return Ok(MergeReport::default());
         }
@@ -4160,6 +4243,8 @@ impl Storage {
     /// when the canonical name doesn't yet exist.
     /// Returns true if a row was renamed.
     pub fn rename_entity(&self, old_name: &str, new_name: &str) -> Result<bool> {
+        // Both names, before any row, follow-up, memory or fact moves.
+        crate::graph::canonical::admit_renamed("graph write", [old_name, new_name])?;
         if old_name == new_name {
             return Ok(false);
         }
@@ -4291,6 +4376,8 @@ impl Storage {
         extractor_id: &str,
         result_json: &str,
     ) -> Result<()> {
+        // What is stored is what was judged, written out again.
+        let result_json = admit_cache(content_hash, extractor_id, result_json)?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         conn.execute(
             "INSERT OR REPLACE INTO llm_extraction_cache
@@ -4309,7 +4396,12 @@ impl Storage {
     ///
     /// First enqueue → `next_attempt_at = now + 60s`, so a flapping Ollama
     /// gets a chance to come back before the first retry.
+    ///
+    /// The queue has no tie to the memories it names, so it judges the id
+    /// it is handed.
     pub fn enqueue_pending_extraction(&self, memory_id: &str, error: &str) -> Result<()> {
+        crate::redaction::state::admit_identities("extraction retry", [memory_id])?;
+        let error = retry_code(error);
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         conn.execute(
             "INSERT INTO pending_extractions (memory_id, attempts, last_error, next_attempt_at)
@@ -4338,6 +4430,7 @@ impl Storage {
     /// at ~32h of cumulative backoff a memory that's still not extractable
     /// almost certainly won't recover from another retry.
     pub fn mark_pending_attempted(&self, memory_id: &str, error: &str) -> Result<bool> {
+        let error = retry_code(error);
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let attempts: i64 = conn
             .query_row(
@@ -4461,6 +4554,15 @@ impl Storage {
         confidence: f32,
         source_memory_ids: &[String],
     ) -> Result<String> {
+        // What names the conclusion, as it was given; the statement is
+        // narrative, and only its prepared text is stored.
+        crate::redaction::state::admit_identities(
+            "conclusion",
+            [subject, kind]
+                .into_iter()
+                .chain(source_memory_ids.iter().map(String::as_str)),
+        )?;
+        let statement = &crate::redaction::redact_text(statement).value;
         let subject_lc = subject.trim().to_lowercase();
         if subject_lc.is_empty() {
             anyhow::bail!(
@@ -4589,6 +4691,7 @@ impl Storage {
     /// regardless of caller (CLI, tests, future LLM generator).
     #[allow(dead_code)]
     pub fn supersede_conclusion(&self, old_id: &str, new_id: &str) -> Result<()> {
+        crate::redaction::state::admit_identities("conclusion", [old_id, new_id])?;
         if old_id == new_id {
             anyhow::bail!(
                 "supersede_conclusion: cannot supersede a conclusion with itself ({old_id})"
@@ -4680,6 +4783,7 @@ impl Storage {
     /// table — wrong table for conclusions). This is the dedicated
     /// helper the CLI now exposes.
     pub fn delete_conclusion(&self, id: &str) -> Result<bool> {
+        crate::redaction::state::admit_identities("conclusion", [id])?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let removed = conn.execute("DELETE FROM conclusions WHERE id = ?1", params![id])?;
         Ok(removed > 0)
@@ -4707,6 +4811,11 @@ impl Storage {
         display_name: Option<&str>,
         kind: &str,
     ) -> Result<String> {
+        // A display name names the peer too: refused, not rewritten.
+        crate::redaction::state::admit_identities(
+            "peer",
+            [name, kind].into_iter().chain(display_name),
+        )?;
         let lc = name.trim().to_lowercase();
         if lc.is_empty() {
             anyhow::bail!("upsert_peer: name must be non-empty");
@@ -4855,6 +4964,9 @@ impl Storage {
     /// follow-up conversation-watcher auto-tagging commit. Tests cover it.
     #[allow(dead_code)]
     pub fn open_session(&self, peer_id: &str, label: Option<&str>, source: &str) -> Result<String> {
+        crate::redaction::state::admit_identities("session", [peer_id, source])?;
+        // A label describes the session: prepared.
+        let label = label.map(|l| crate::redaction::redact_text(l).value);
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let id = uuid::Uuid::new_v4().to_string();
         // last_activity_at is set to NOW at open so subsequent idle
@@ -4898,6 +5010,8 @@ impl Storage {
     /// need a way to backdate.
     #[allow(dead_code)]
     pub fn end_session_at(&self, session_id: &str, ended_at: &str) -> Result<()> {
+        // The time is stored as text: only text the policy admits.
+        crate::redaction::state::admit_identities("session", [session_id, ended_at])?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         conn.execute(
             "UPDATE sessions SET ended_at = ?1
@@ -4979,6 +5093,9 @@ impl Storage {
         idle_secs: u64,
     ) -> Result<String> {
         use rusqlite::OptionalExtension;
+        crate::redaction::state::admit_identities("session", [peer_id, external_key, source])?;
+        // A label describes the session: prepared.
+        let label = label.map(|l| crate::redaction::redact_text(l).value);
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let tx = conn.unchecked_transaction()?;
 
@@ -5360,6 +5477,11 @@ impl Storage {
     /// `allow(dead_code)`: wired in the follow-up watcher commit.
     #[allow(dead_code)]
     pub fn set_memory_session(&self, memory_id: &str, session_id: Option<&str>) -> Result<()> {
+        // The messages below name the ids: only ones the policy admits.
+        crate::redaction::state::admit_identities(
+            "session",
+            [memory_id].into_iter().chain(session_id),
+        )?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         if let Some(sid) = session_id {
             let exists: i64 = conn.query_row(
@@ -5569,6 +5691,7 @@ impl Storage {
     /// "mentioned", "addressee", etc.
     #[allow(dead_code)]
     pub fn link_memory_peer(&self, memory_id: &str, peer_id: &str, role: &str) -> Result<()> {
+        crate::redaction::state::admit_identities("peer", [memory_id, peer_id, role])?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         conn.execute(
             "INSERT OR IGNORE INTO memory_peers (memory_id, peer_id, role)
@@ -5618,6 +5741,7 @@ impl Storage {
     /// number of links that were re-pointed (some collide on the new
     /// PK and are silently merged via `INSERT OR IGNORE`).
     pub fn merge_peers(&self, src_name: &str, dst_name: &str) -> Result<usize> {
+        crate::redaction::state::admit_identities("peer", [src_name, dst_name])?;
         let src_name = src_name.trim().to_lowercase();
         let dst_name = dst_name.trim().to_lowercase();
         if src_name == dst_name {
@@ -5682,7 +5806,11 @@ impl Storage {
     /// Enqueue a freshly-saved memory for background entity extraction.
     /// Idempotent — `INSERT OR IGNORE` so repeated enqueues for the same id
     /// (e.g. a memory that got reflected or merged) don't pile up.
+    ///
+    /// The queue has no tie to the memories it names, so it judges the id
+    /// it is handed.
     pub fn enqueue_extraction(&self, memory_id: &str) -> Result<()> {
+        crate::redaction::state::admit_identities("extraction queue", [memory_id])?;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         conn.execute(
             "INSERT OR IGNORE INTO extraction_queue (memory_id) VALUES (?1)",
@@ -5732,6 +5860,7 @@ impl Storage {
     /// instead of looping in `extraction_queue` forever. Returns `true`
     /// when the row was dead-lettered.
     pub fn fail_extraction(&self, memory_id: &str, error: &str, max_attempts: i64) -> Result<bool> {
+        let error = retry_code(error);
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let attempts: i64 = conn
             .query_row(
@@ -5742,21 +5871,30 @@ impl Storage {
             .unwrap_or(0)
             + 1;
         if attempts >= max_attempts {
+            // An id the policy refuses is not copied into the retry queue
+            // (a memory stored before the policy can be queued under a
+            // credential). Its row leaves this queue all the same, so it
+            // cannot camp at the head.
+            let admitted =
+                crate::redaction::state::admit_identities("extraction retry", [memory_id]);
             let tx = conn.unchecked_transaction()?;
             tx.execute(
                 "DELETE FROM extraction_queue WHERE memory_id = ?1",
                 params![memory_id],
             )?;
-            // Same upsert as enqueue_pending_extraction — inlined because
-            // that helper takes the conn lock this fn already holds.
-            tx.execute(
-                "INSERT INTO pending_extractions (memory_id, attempts, last_error, next_attempt_at)
-                     VALUES (?1, 0, ?2, datetime('now', '+60 seconds'))
-                 ON CONFLICT(memory_id) DO UPDATE SET
-                     last_error = excluded.last_error",
-                params![memory_id, error],
-            )?;
+            if admitted.is_ok() {
+                // Same upsert as enqueue_pending_extraction — inlined because
+                // that helper takes the conn lock this fn already holds.
+                tx.execute(
+                    "INSERT INTO pending_extractions (memory_id, attempts, last_error, next_attempt_at)
+                         VALUES (?1, 0, ?2, datetime('now', '+60 seconds'))
+                     ON CONFLICT(memory_id) DO UPDATE SET
+                         last_error = excluded.last_error",
+                    params![memory_id, error],
+                )?;
+            }
             tx.commit()?;
+            admitted?;
             return Ok(true);
         }
         conn.execute(
@@ -5980,7 +6118,10 @@ pub struct GraphResult {
 }
 
 impl GraphResult {
+    /// The answer for a name that names nothing. The name is said back
+    /// unless the redaction policy refuses it.
     fn not_found(name: &str) -> Self {
+        let name = crate::redaction::state::shown(name);
         Self {
             entity_name: name.to_string(),
             entity_type: String::new(),
@@ -6336,6 +6477,146 @@ pub trait OutputSink: Send + Sync {
     fn name(&self) -> &str;
 }
 
+/// The guard at every memory write: the entry is stored exactly as it is,
+/// or not at all. A caller that skipped preparation gets an error with a
+/// fixed code, and its vector is not stored either.
+fn admit_memory(entry: &MemoryEntry) -> Result<()> {
+    crate::redaction::check_entry(entry, crate::redaction::STRUCTURAL_KEYS).map_err(|code| {
+        // Typed, so a caller can tell a refused record from a failed store.
+        anyhow::Error::new(code).context(format!("memory write refused ({})", code.code()))
+    })
+}
+
+/// The guard at every graph write: a name, a relation or an id that holds
+/// a credential refuses the whole graph, before anything is normalized or
+/// written. An entity's name is what it is found by; rewriting one would
+/// merge it with another.
+fn admit_graph(memory_id: Option<&str>, entities: &[Entity], edges: &[Edge]) -> Result<()> {
+    crate::redaction::state::admit_identities(
+        "graph write",
+        memory_id
+            .into_iter()
+            .chain(entities.iter().map(|e| e.name.as_str()))
+            .chain(edges.iter().flat_map(|e| {
+                [
+                    e.source.as_str(),
+                    e.target.as_str(),
+                    e.relation.as_str(),
+                    e.memory_id.as_str(),
+                ]
+            })),
+    )
+}
+
+/// The guard at every write of the extraction cache: what is cached is
+/// read back as a result, so it is a structure the policy admits, under a
+/// name the policy admits, or nothing. A model's answer as it came is
+/// neither: it is parsed, judged and written out again by the extractor.
+///
+/// Returns the text to store: the judged structure written out again, not
+/// the text that was given. The two differ where a text says more than
+/// its structure holds, and the text is read strictly for the same reason
+/// (of two members of one name a parser keeps the last).
+fn admit_cache(content_hash: &str, extractor_id: &str, result_json: &str) -> Result<String> {
+    use crate::redaction::failure::Failure;
+    use crate::redaction::{Limits, RedactionError, parse_strict, redact_json};
+    const WHAT: &str = "extraction cache write";
+    crate::redaction::state::admit_identities(WHAT, [content_hash, extractor_id])?;
+    let value = parse_strict(result_json).ok_or_else(|| Failure::InvalidJson.error())?;
+    match redact_json(&value, &[], Limits::default()) {
+        Ok(prepared) if !prepared.changed => Ok(value.to_string()),
+        Ok(_) => Err(crate::redaction::state::refused(
+            WHAT,
+            RedactionError::SensitiveContent,
+        )),
+        Err(code) => Err(crate::redaction::state::refused(WHAT, code)),
+    }
+}
+
+/// What a retry record says of a failure: one of the fixed codes. A
+/// caller's text that is none of them is stored as the generic one.
+fn retry_code(error: &str) -> &'static str {
+    crate::redaction::failure::Failure::of(error).code()
+}
+
+/// Whether an error from a memory write is the guard refusing the record
+/// (as opposed to the store failing).
+pub fn is_refused_write(error: &anyhow::Error) -> bool {
+    crate::redaction::state::is_refused(error)
+}
+
+/// A time as the store's readers accept it: RFC 3339, or the naive forms
+/// older hand-written imports used, taken as UTC.
+fn parse_stored_time(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(time) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(time.with_timezone(&chrono::Utc));
+    }
+    ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"]
+        .iter()
+        .find_map(|format| chrono::NaiveDateTime::parse_from_str(text, format).ok())
+        .map(|naive| naive.and_utc())
+}
+
+/// One record of an export file as a [`MemoryEntry`], with its serialized
+/// tags and metadata decoded so they can be judged field by field.
+fn decode_import(raw: &serde_json::Value) -> Result<MemoryEntry> {
+    let text = |key: &str| raw.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+    let timestamp = parse_stored_time(text("timestamp"))
+        .ok_or_else(|| anyhow::anyhow!("timestamp is not a date and time"))?;
+    let memory_type = match text("memory_type") {
+        "decision" => crate::event::MemoryType::Decision,
+        "feedback" => crate::event::MemoryType::Feedback,
+        "session_summary" => crate::event::MemoryType::SessionSummary,
+        "security" => crate::event::MemoryType::Security,
+        _ => crate::event::MemoryType::Note,
+    };
+    let tags: Vec<String> = match raw.get("tags").and_then(|v| v.as_str()) {
+        Some(tags) => {
+            serde_json::from_str(tags).map_err(|_| anyhow::anyhow!("tags do not parse"))?
+        }
+        None => Vec::new(),
+    };
+    // A tag of a fixed set, not text: anything else is an import by hand.
+    let source: crate::event::EventSource = raw
+        .get("source")
+        .and_then(|v| v.as_str())
+        .and_then(|source| serde_json::from_str(source).ok())
+        .unwrap_or(crate::event::EventSource::Manual);
+    let metadata: serde_json::Value = match raw.get("metadata").and_then(|v| v.as_str()) {
+        Some(metadata) => serde_json::from_str(metadata)
+            .map_err(|_| anyhow::anyhow!("metadata does not parse"))?,
+        None => serde_json::Value::Null,
+    };
+    let id = text("id");
+    anyhow::ensure!(!id.is_empty(), "record has no id");
+    Ok(MemoryEntry {
+        id: id.to_string(),
+        timestamp,
+        title: text("title").to_string(),
+        content: text("content").to_string(),
+        memory_type,
+        tags,
+        source,
+        importance: raw
+            .get("importance")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.5) as f32,
+        metadata,
+    })
+}
+
+#[cfg(test)]
+#[path = "redaction_tests.rs"]
+mod redaction_tests;
+
+#[cfg(test)]
+#[path = "redaction_state_tests.rs"]
+mod redaction_state_tests;
+
+#[cfg(test)]
+#[path = "redaction_generated_tests.rs"]
+mod redaction_generated_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6515,7 +6796,7 @@ mod tests {
         storage.save(&entry).unwrap();
 
         storage
-            .enqueue_pending_extraction(&entry.id, "backend: connection refused")
+            .enqueue_pending_extraction(&entry.id, "BACKEND_FAILED")
             .unwrap();
         let row1 = storage.pending_row(&entry.id).unwrap().unwrap();
         assert_eq!(row1.0, 0, "first enqueue → attempts=0");
@@ -6525,11 +6806,11 @@ mod tests {
         // backoff schedule should be controlled by the *retry* path, not by
         // how many times we slammed enqueue.
         storage
-            .enqueue_pending_extraction(&entry.id, "backend: timeout")
+            .enqueue_pending_extraction(&entry.id, "GENERATED_JSON_INVALID")
             .unwrap();
         let row2 = storage.pending_row(&entry.id).unwrap().unwrap();
         assert_eq!(row2.0, 0, "re-enqueue must not bump attempts");
-        assert_eq!(row2.1.as_deref(), Some("backend: timeout"));
+        assert_eq!(row2.1.as_deref(), Some("GENERATED_JSON_INVALID"));
     }
 
     #[test]

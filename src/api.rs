@@ -171,7 +171,7 @@ async fn handle_request(
                     });
                     json_response(200, &body)
                 }
-                Err(e) => json_response(500, &serde_json::json!({ "error": e.to_string() })),
+                Err(_) => json_response(500, &serde_json::json!({ "error": STORE_FAILED })),
             }
         }
         ("GET", "/recent") => match storage.recent(20) {
@@ -186,7 +186,7 @@ async fn handle_request(
                 });
                 json_response(200, &body)
             }
-            Err(e) => json_response(500, &serde_json::json!({ "error": e.to_string() })),
+            Err(_) => json_response(500, &serde_json::json!({ "error": STORE_FAILED })),
         },
         _ => json_response(404, &serde_json::json!({ "error": "not found" })),
     };
@@ -224,6 +224,12 @@ async fn handle_embed(
         Ok(v) => v,
         Err(msg) => return json_response(400, &serde_json::json!({ "error": msg })),
     };
+    // A text given to be embedded is new text, whoever sends it: the
+    // model is given the prepared one.
+    let texts: Vec<String> = texts
+        .iter()
+        .map(|text| crate::redaction::redact_text(text).value)
+        .collect();
 
     // Serialize model access; ONNX embedding is blocking CPU work, so it
     // runs on the blocking pool, not the async workers.
@@ -259,16 +265,25 @@ async fn handle_embed(
                 }),
             )
         }
-        Ok(Err(e)) => json_response(500, &serde_json::json!({ "error": e.to_string() })),
-        Err(e) => json_response(500, &serde_json::json!({ "error": format!("join: {e}") })),
+        // An embedder's own words can quote what it was given.
+        Ok(Err(_)) => json_response(500, &serde_json::json!({ "error": EMBEDDING_FAILED })),
+        Err(_) => json_response(500, &serde_json::json!({ "error": EMBEDDING_FAILED })),
     }
 }
 
+/// What the endpoint says when the embedder failed.
+const EMBEDDING_FAILED: &str = "EMBEDDING_FAILED";
+/// What an endpoint says when the store failed it: the store's own words
+/// stay in the process.
+const STORE_FAILED: &str = "STORAGE_FAILED";
+
 /// Validate the /embed request body. Pure so it unit-tests without hyper.
-/// Returns (texts, is_query).
+/// Returns (texts, is_query). What it says of a bad request is fixed: a
+/// parser quotes the body it stopped in, and a field holds what the
+/// caller put there.
 fn parse_embed_request(body: &[u8]) -> Result<(Vec<String>, bool), String> {
     let value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| format!("bad JSON: {e}"))?;
+        serde_json::from_slice(body).map_err(|_| "bad JSON".to_string())?;
     let kind = value
         .get("kind")
         .and_then(|v| v.as_str())
@@ -276,7 +291,7 @@ fn parse_embed_request(body: &[u8]) -> Result<(Vec<String>, bool), String> {
     let is_query = match kind {
         "query" => true,
         "passage" => false,
-        other => return Err(format!("bad 'kind': {other}")),
+        _ => return Err("bad 'kind' (\"query\" or \"passage\")".to_string()),
     };
     let texts: Vec<String> = value
         .get("texts")
@@ -315,6 +330,10 @@ fn json_response(status: u16, body: &serde_json::Value) -> Response<Full<Bytes>>
         .body(Full::new(Bytes::from(payload)))
         .unwrap()
 }
+
+#[cfg(test)]
+#[path = "api_redaction_tests.rs"]
+mod redaction_tests;
 
 #[cfg(test)]
 mod tests {

@@ -595,6 +595,8 @@ async fn handle_memory_sources(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // The id is said back in the reply.
+    crate::redaction::state::admit_identities("memory lookup", [id.as_str()])?;
     let pairs = state.storage.sources_for_canonical(&id)?;
     let mut out = Vec::with_capacity(pairs.len());
     for (sid, cosine) in &pairs {
@@ -873,6 +875,8 @@ struct DedupeReport {
     dry_run: bool,
     merged: usize,
     renamed: usize,
+    /// Entities left as they are: a name the redaction policy refuses.
+    refused: usize,
     edges_redirected: usize,
     memory_links_redirected: usize,
 }
@@ -920,45 +924,25 @@ async fn handle_dedupe(
             dry_run: true,
             merged: 0,
             renamed: 0,
+            refused: 0,
             edges_redirected: 0,
             memory_links_redirected: 0,
         }));
     }
 
-    let mut merged = 0usize;
-    let mut renamed = 0usize;
-    let mut edges_redirected = 0usize;
-    let mut memory_links_redirected = 0usize;
-
-    for group in &plan {
-        let canonical_exists = group.variants.iter().any(|v| v == &group.canonical);
-        let needs_rename = !canonical_exists;
-        if needs_rename
-            && let Some(to_rename) = group.variants.first()
-            && state.storage.rename_entity(to_rename, &group.canonical)?
-        {
-            renamed += 1;
-        }
-        for variant in &group.variants {
-            if variant == &group.canonical {
-                continue;
-            }
-            let report = state.storage.merge_entities(&group.canonical, variant)?;
-            if report.alias_dropped {
-                merged += 1;
-                edges_redirected += report.edges_redirected;
-                memory_links_redirected += report.memory_links_redirected;
-            }
-        }
-    }
-
+    let totals = crate::graph::dedupe::apply(
+        &state.storage,
+        plan.iter()
+            .map(|g| (g.canonical.as_str(), g.variants.as_slice())),
+    )?;
     Ok(Json(DedupeReport {
         groups: plan,
         dry_run: false,
-        merged,
-        renamed,
-        edges_redirected,
-        memory_links_redirected,
+        merged: totals.merged,
+        renamed: totals.renamed,
+        refused: totals.refused,
+        edges_redirected: totals.edges_redirected,
+        memory_links_redirected: totals.memory_links_redirected,
     }))
 }
 
@@ -1310,6 +1294,9 @@ async fn handle_entity_merge(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::graph::canonical::canonicalize_name;
 
+    // As they were given: canonicalization can drop the syntax that made
+    // a name a credential.
+    crate::redaction::state::admit_identities("graph write", [name.as_str(), &body.into])?;
     let alias = canonicalize_name(&name);
     let canonical = canonicalize_name(&body.into);
     if alias.is_empty() || canonical.is_empty() {
@@ -1352,6 +1339,8 @@ async fn handle_forget(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // The reply below names the id: only one the policy admits.
+    crate::redaction::state::admit_identities("forget", [id.as_str()])?;
     let removed = state.storage.forget_by_id(&id)?;
     if !removed {
         return Err(AppError(
@@ -1381,14 +1370,24 @@ fn memory_to_json(entry: &crate::event::MemoryEntry) -> serde_json::Value {
 struct AppError(StatusCode, String);
 
 impl IntoResponse for AppError {
+    /// What an error says is prepared here, where every error reply is
+    /// made, however the error was: it can say back what the request gave.
     fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
+        let said = crate::redaction::state::said_of(&self.1);
+        (self.0, Json(serde_json::json!({"error": said}))).into_response()
     }
 }
 
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
-        AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        // A refused input is the caller's to fix; its message is a fixed
+        // code, never the input.
+        let status = if crate::redaction::state::is_refused(&e) {
+            StatusCode::UNPROCESSABLE_ENTITY
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        AppError(status, e.to_string())
     }
 }
 
@@ -1559,6 +1558,121 @@ mod tests {
         assert!(storage.graph_query("example-org-co").unwrap().found);
     }
 
+    fn merge_request(name: &str, into: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/entities/{name}/merge"))
+            .header(header::HOST, "localhost")
+            .header(TOKEN_HEADER, "test-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "into": into }).to_string()))
+            .unwrap()
+    }
+
+    /// Canonicalization turns `password=<v>` into `password-<v>`, which
+    /// reads as a name: both names are judged as they were given.
+    #[tokio::test]
+    async fn redaction_state_http_merge_judges_names_before_canonicalization() {
+        let value: String = "a1b2c3d4e5f6".chars().cycle().take(32).collect();
+        let db = tmp_db();
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        for name in [format!("password-{value}"), "example-org".to_string()] {
+            storage
+                .upsert_entity(&Entity {
+                    name,
+                    entity_type: EntityType::Project,
+                })
+                .unwrap();
+        }
+        let mut app = router(test_state(storage.clone()));
+        let raw = format!("password={value}");
+        for request in [
+            merge_request(&raw, "example-org"),
+            merge_request("example-org", &raw),
+        ] {
+            let response = app.call(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("SENSITIVE_CONTENT"));
+            assert!(!text.contains(&value), "the reply echoes the name");
+        }
+        assert!(
+            storage
+                .graph_query(&format!("password-{value}"))
+                .unwrap()
+                .found
+        );
+        assert!(storage.graph_query("example-org").unwrap().found);
+        assert!(
+            storage
+                .canonical_for_alias(&format!("password-{value}"))
+                .unwrap()
+                .is_none()
+        );
+        // The same merge, named as the entity is stored, goes through.
+        let response = app
+            .call(merge_request(&format!("password-{value}"), "example-org"))
+            .await
+            .unwrap();
+        assert_eq!(response_json(response).await["action"], "merged");
+    }
+
+    /// The reply to a forget names the id: not one the policy refuses.
+    #[tokio::test]
+    async fn redaction_state_http_forget_does_not_echo_a_refused_id() {
+        let id = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let db = tmp_db();
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let mut app = router(test_state(storage));
+        let request = axum::http::Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/api/memories/{id}"))
+            .header(header::HOST, "localhost")
+            .header(TOKEN_HEADER, "test-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("SENSITIVE_CONTENT") && !text.contains(&id));
+    }
+
+    /// An entity stored before the policy under a name it refuses stays as
+    /// it is; the rest of the plan is applied.
+    #[tokio::test]
+    async fn redaction_state_http_dedupe_leaves_a_refused_entity_and_goes_on() {
+        let value: String = "a1b2c3d4e5f6".chars().cycle().take(32).collect();
+        let db = tmp_db();
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        seed_duplicate_entities(&storage);
+        let legacy = format!("password={value}");
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO entities (id, name, entity_type, mention_count, first_seen, last_seen)
+                 VALUES ('legacy', ?1, 'concept', 1, datetime('now'), datetime('now'))",
+                [&legacy],
+            )
+            .unwrap();
+        let mut app = router(test_state(storage.clone()));
+        let report = response_json(
+            app.call(dedupe_request(Some(r#"{"apply":true}"#)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(report["merged"], 1);
+        assert_eq!(report["refused"], 1);
+        assert_eq!(report["renamed"], 0);
+        let names = storage.list_entity_names().unwrap();
+        assert!(names.contains(&legacy));
+        assert!(!names.contains(&format!("password-{value}")));
+    }
+
     #[tokio::test]
     async fn dedupe_apply_true_mutates_duplicate_entities() {
         let db = tmp_db();
@@ -1577,5 +1691,76 @@ mod tests {
         assert_eq!(report["merged"], 1);
         assert!(storage.graph_query("example-org").unwrap().found);
         assert!(!storage.graph_query("example-org-co").unwrap().found);
+    }
+
+    /// What an error says is prepared before it is a reply: it can say
+    /// back what the request gave.
+    #[tokio::test]
+    async fn redaction_outputs_http_error_replies_are_prepared() {
+        let token: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let replies = [
+            AppError::from(anyhow::anyhow!("no entity named {token}")),
+            AppError::from(serde_json::from_str::<u8>(&format!("\"{token}\"")).unwrap_err()),
+            // An error that was made where it happened.
+            AppError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("bad day {token:?}"),
+            ),
+        ];
+        for reply in replies {
+            let response = reply.into_response();
+            assert!(response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(!body.contains(&token), "the reply says the request back");
+            assert!(body.contains(crate::redaction::CREDENTIAL_MARKER));
+        }
+        // An error that holds nothing of the kind reads as it is.
+        let response = AppError::from(anyhow::anyhow!("no entity named demoapp")).into_response();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("no entity named demoapp"));
+    }
+
+    /// A name or an id of the path that finds nothing is not said back
+    /// when the policy refuses it.
+    #[tokio::test]
+    async fn redaction_outputs_http_lookups_do_not_say_back_a_refused_name() {
+        let token: String = ["sk-", "proj-", &"a1B2c3D4e5F6".repeat(4)].concat();
+        let db = tmp_db();
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let mut app = router(test_state(storage));
+        let get = |path: String| {
+            axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header(header::HOST, "localhost")
+                .header(TOKEN_HEADER, "test-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let lookups = [
+            (format!("/api/memories/{token}"), StatusCode::NOT_FOUND),
+            (
+                format!("/api/memories/{token}/sources"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (format!("/api/entities/{token}"), StatusCode::OK),
+        ];
+        for (n, (path, status)) in lookups.into_iter().enumerate() {
+            let response = app.call(get(path)).await.unwrap();
+            assert!(
+                response.status() == status,
+                "lookup {n} answered {}",
+                response.status()
+            );
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(!body.contains(&token), "the reply says the request back");
+            assert!(!body.is_empty());
+        }
+        // What the policy admits is said as it was given.
+        let response = app.call(get("/api/memories/m-1".into())).await.unwrap();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("memory m-1 not found"));
     }
 }

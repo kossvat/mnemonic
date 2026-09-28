@@ -289,8 +289,17 @@ pub fn create_outcome(
     new: NewFollowup<'_>,
     now: DateTime<Utc>,
 ) -> Result<CreateOutcome> {
+    // What names the follow-up, as it was given: resolving a project can
+    // drop the syntax that made it a credential.
+    crate::redaction::state::admit_identities(
+        "follow-up",
+        [new.project, new.actor, new.request_id]
+            .into_iter()
+            .chain(new.source_memory_id),
+    )?;
     let project = new.project.trim();
-    let title = normalize_title(new.title);
+    // The title is narrative: prepared, and prepared again after its cut.
+    let title = crate::redaction::state::prepare_normalized(new.title, normalize_title).value;
     if project.is_empty() {
         bail!("follow-up needs a project");
     }
@@ -307,6 +316,12 @@ pub fn create_outcome(
         .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
     let tx = write_tx(&conn)?;
     let project = canonical_project(&tx, project)?;
+    // What the name resolves to is what is stored and returned: an alias
+    // or a project stored before the policy can lead to a name it refuses.
+    crate::redaction::state::admit_identities(
+        "follow-up",
+        [project.as_str(), project_key(&project).as_str()],
+    )?;
     if let Some(existing) = by_request(&tx, new.request_id)? {
         return Ok(CreateOutcome::Existing(existing));
     }
@@ -398,6 +413,15 @@ fn normalize_title(raw: &str) -> String {
 /// The revision guard is part of the UPDATE itself, so two processes sharing
 /// the database (several MCP servers + the daemon) can't both win a race.
 pub fn transition(storage: &Storage, t: Transition<'_>, now: DateTime<Utc>) -> Result<Followup> {
+    // Before the replay lookup too: a refused request has no earlier
+    // success to return.
+    crate::redaction::state::admit_identities(
+        "follow-up",
+        [t.id, t.actor, t.request_id]
+            .into_iter()
+            .chain(t.project)
+            .chain(t.evidence_memory_id),
+    )?;
     if t.request_id.trim().is_empty() {
         bail!("follow-up transition needs a request id");
     }
@@ -406,23 +430,27 @@ pub fn transition(storage: &Storage, t: Transition<'_>, now: DateTime<Utc>) -> R
         .lock()
         .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
     let tx = write_tx(&conn)?;
+    let guard_project = match t.project {
+        Some(p) => Some(canonical_project(&tx, p)?),
+        None => None,
+    };
+    // What the guard resolves to is compared and named in a message.
+    crate::redaction::state::admit_identities("follow-up", guard_project.as_deref())?;
     if let Some(existing) = by_request(&tx, t.request_id)? {
         return Ok(existing);
     }
     let Some(current) = by_id(&tx, t.id)? else {
         bail!("no follow-up with id {}", t.id);
     };
-    let guard_project = match t.project {
-        Some(p) => Some(canonical_project(&tx, p)?),
-        None => None,
-    };
     if let Some(project) = guard_project.as_deref()
         && project_key(project) != project_key(&current.project)
     {
+        // The stored name is shown unless it is one the policy refuses
+        // (a project stored before it).
         bail!(
             "follow-up {} belongs to project {:?}, not {:?}",
             short_id(&current.id),
-            current.project,
+            crate::redaction::state::shown(&current.project),
             project
         );
     }
@@ -637,6 +665,8 @@ pub fn list(
 /// only — the same contract as `session show`). Ambiguity is an error, never
 /// a silent first match: closing the wrong obligation is the failure to avoid.
 pub fn resolve_id(storage: &Storage, id_or_prefix: &str) -> Result<String> {
+    // The messages below name the id: only one the policy admits.
+    crate::redaction::state::admit_identities("follow-up", [id_or_prefix])?;
     let p = id_or_prefix.trim();
     if p.len() < 8 || !p.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
         bail!("follow-up id must be at least 8 hex characters, got {p:?}");
@@ -739,6 +769,7 @@ pub fn sweep(storage: &Storage, now: DateTime<Utc>) -> Result<usize> {
     let cutoff = (now - chrono::Duration::days(PROPOSAL_MAX_AGE_DAYS)).to_rfc3339();
     let mut cursor: (String, String) = ("9999".into(), String::new());
     let mut created = 0;
+    let mut refused = 0;
     // A commit subject describes work that is DONE. "Page the follow-up
     // listing" carries a marker yet is the opposite of an open intention, so
     // commit notes never propose. `source` is stored as its JSON form.
@@ -804,14 +835,22 @@ pub fn sweep(storage: &Storage, now: DateTime<Utc>) -> Result<usize> {
                     request_id: &format!("sweep:{memory_id}"),
                 },
                 now,
-            )?;
-            if matches!(outcome, CreateOutcome::Created(_)) {
-                created += 1;
+            );
+            match outcome {
+                Ok(CreateOutcome::Created(_)) => created += 1,
+                Ok(_) => {}
+                // A project or id stored before the policy: that note
+                // proposes nothing, the sweep goes on.
+                Err(e) if crate::redaction::state::is_refused(&e) => refused += 1,
+                Err(e) => return Err(e),
             }
         }
         if (page_len as i64) < SWEEP_BATCH {
             break;
         }
+    }
+    if refused > 0 {
+        tracing::debug!("Follow-up sweep: {refused} notes proposed nothing (SENSITIVE_CONTENT)");
     }
     Ok(created)
 }
@@ -1940,3 +1979,7 @@ mod tests {
         assert!(resolve_id(&s, "00000000").is_err(), "unknown");
     }
 }
+
+#[cfg(test)]
+#[path = "followups_redaction_tests.rs"]
+mod redaction_tests;

@@ -34,21 +34,10 @@ pub struct Declared {
 
 /// The memory a statement is recorded as.
 fn source_memory(write: &FactWrite<'_>, note: Option<&str>) -> MemoryEntry {
-    let mut about = format!("{} {}", write.subject.trim(), write.predicate.trim());
-    if let Some(qualifier) = write.qualifier.map(str::trim).filter(|q| !q.is_empty()) {
-        about.push_str(&format!(" ({qualifier})"));
-    }
-    let (title, mut content) = match write.value {
-        Some(value) => (format!("{about}: {value}"), format!("{about} is {value}")),
-        None => (
-            format!("{about}: retracted"),
-            format!("{about} no longer has a value"),
-        ),
-    };
     // The project stays out of the text: the scanner reads an extra word
     // as a different context, and the statement would then no longer
     // replace a plain memory of the old value.
-    content.push('.');
+    let (title, mut content) = super::admit::statement(write);
     if let Some(note) = note.map(str::trim).filter(|n| !n.is_empty()) {
         content.push_str("\n\n");
         content.push_str(note);
@@ -184,8 +173,19 @@ pub fn declare(
     write: &FactWrite<'_>,
     note: Option<&str>,
 ) -> Result<Declared> {
+    // What the fact states and what names it, as given and as the store
+    // would file it, before anything else sees the statement. The write
+    // judges both again under its lock.
+    super::admit::admit(write)?;
+    {
+        let conn = storage
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        super::admit::admit_resolved(&conn, write)?;
+    }
     let prepared = prepare(storage, embedder, threshold, write, note)?;
-    commit(storage, prepared, threshold, write, note)
+    commit(storage, prepared, threshold, write, note.is_some())
 }
 
 fn prepare(
@@ -208,6 +208,12 @@ fn prepare(
         plan::set_project(storage, &mut entry, project)?;
         entry.tags.push(project.to_owned());
     }
+    // The record of the statement is a memory like any other: prepared
+    // before it is embedded. The statement stood the stricter check above,
+    // so what this changes is the note.
+    let entry = crate::redaction::prepare_entry(entry, crate::redaction::STRUCTURAL_KEYS)
+        .map_err(|code| crate::redaction::state::refused("fact", code))?
+        .into_entry();
     // Planned outside the lock: which plain memory of the old value this
     // statement replaces. Settled again inside the transaction.
     // A hard failure (wrong model, bad request) fails the call as it does
@@ -244,7 +250,7 @@ fn commit(
     prepared: Prepared,
     threshold: f32,
     write: &FactWrite<'_>,
-    note: Option<&str>,
+    noted: bool,
 ) -> Result<Declared> {
     let Prepared {
         mut entry,
@@ -286,8 +292,7 @@ fn commit(
     };
     // A plain memory of another value saved since is the newest word: the
     // statement is then written, to update it (review point).
-    let quiet =
-        preview.replayed || (preview.outcome == "reconfirm" && note.is_none() && planned.is_none());
+    let quiet = preview.replayed || (preview.outcome == "reconfirm" && !noted && planned.is_none());
     if quiet {
         let outcome = store::apply_in(&tx, write, now)?;
         reaffirm_matched(&tx, &outcome, &entry)?;
@@ -298,6 +303,10 @@ fn commit(
             link: None,
         });
     }
+    // The same guard as every other memory write: a statement whose record
+    // cannot be stored as it is fails whole, fact and memory alike.
+    crate::redaction::check_entry(&entry, crate::redaction::STRUCTURAL_KEYS)
+        .map_err(|code| anyhow::anyhow!("memory write refused ({})", code.code()))?;
     tx.execute(
         "INSERT INTO memories (id, timestamp, title, content, memory_type, tags, source, importance, metadata, embedding)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",

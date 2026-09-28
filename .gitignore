@@ -21,7 +21,8 @@ Thumbs.db
 # Environment
 .env
 .env.*
-.fastembed_cache/
+# A directory, or the symlink left where the model cache used to live.
+.fastembed_cache
 
 # Local eval seed — users put their own real-DB queries here, not committed.
 tests/eval/queries.local.jsonl

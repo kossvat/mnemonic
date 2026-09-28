@@ -127,6 +127,102 @@ fn ingress_save_never_enqueues_a_second_extraction_behind_the_worker() {
     );
 }
 
+/// A clean correction whose first line, cut to a title, reads as a
+/// credential (`password=f(` loses its `(`) used to be refused at
+/// completion on every replay and stayed pending forever. The classifier's
+/// result is prepared again before it is embedded or written.
+#[test]
+fn ingress_a_title_cut_into_a_credential_shape_still_completes() {
+    let tmp = crate::test_support::temp_dir("mnemonic-ingress-title-");
+    let storage = Arc::new(Storage::open(&tmp.path().join("memory.db")).unwrap());
+    let daemon = Daemon::new(Config::default());
+    let classifier = RuleClassifier::new(daemon.config.classifier.clone());
+    let sinks: Vec<Box<dyn OutputSink>> = Vec::new();
+    let value: String = "a1B2c3D4e5F6".chars().cycle().take(32).collect();
+    let text = format!(
+        "не так, please reset the current password={value}_from_entropy() before the deploy"
+    );
+    let event = crate::redaction::prepare_event(
+        Event::new(
+            EventSource::ConversationWatcher,
+            EventKind::UserCorrection,
+            &text,
+        ),
+        crate::redaction::STRUCTURAL_KEYS,
+    )
+    .unwrap()
+    .into_event();
+    assert!(
+        event.content.contains(&value),
+        "a call is code: admission keeps it"
+    );
+    let cut = classifier.classify(&event).unwrap().title;
+    assert!(
+        cut.contains(&value) && !cut.contains('('),
+        "the title cut must produce the credential shape for this test to mean anything"
+    );
+    storage
+        .append_ingest(
+            None,
+            &IngestCursor {
+                stream: "demoapp".into(),
+                generation: 0,
+                offset: 10,
+                file_id: "file".into(),
+                prefix_len: 0,
+                prefix_hash: String::new(),
+                anchor_hash: String::new(),
+            },
+            &[IngestRecord {
+                source_key: "demoapp/title".into(),
+                source_at: None,
+                observed_at: chrono::Utc::now(),
+                payload: IngestPayload { event },
+            }],
+        )
+        .unwrap();
+    let events: Vec<_> = storage
+        .pending_ingest(chrono::Utc::now(), 8)
+        .unwrap()
+        .into_iter()
+        .map(|pending| (Some(pending.seq), pending.event))
+        .collect();
+    daemon.process_batch(
+        &events,
+        &classifier,
+        &storage,
+        &sinks,
+        &HashEmbedder,
+        0.99,
+        &ImportanceScorer::default(),
+        0.0,
+        &RuleExtractor::new(),
+        false,
+        None,
+        None,
+    );
+    assert_eq!(storage.count().unwrap(), 1, "the turn completed");
+    assert!(
+        storage
+            .pending_ingest(chrono::Utc::now(), 8)
+            .unwrap()
+            .is_empty()
+    );
+    let (title, content): (String, String) = storage
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT title, content FROM memories", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert!(!title.contains(&value) && title.contains("[REDACTED:credential]"));
+    assert!(
+        content.contains(&value),
+        "the content is still the code it was"
+    );
+}
+
 #[test]
 fn ingress_daemon_replay_records_every_outcome_and_exports_only_derived_content() {
     let tmp = crate::test_support::temp_dir("mnemonic-ingress-daemon-");

@@ -108,6 +108,10 @@ impl SharedStore {
         validate_identifier(key, "key")?;
         validate_payload(title, content, source)?;
         validate_actor(actor)?;
+        // Before the retry below is answered: a refused request has no
+        // earlier success to return.
+        super::admit::identities([project_id, key].into_iter().chain(actor))?;
+        super::admit::text(Some(key), title, content, source)?;
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_pin(&tx, project_id)?;
@@ -121,6 +125,8 @@ impl SharedStore {
             && existing.source == source
             && existing.published_by.as_deref() == actor
         {
+            // The answer is the row as it is stored, whatever stored it.
+            super::admit::record(existing)?;
             return Ok(existing.clone());
         }
         check_expected(key, existing.as_ref(), expected)?;
@@ -271,6 +277,14 @@ impl SharedStore {
         }
         validate_identifier(request_id, "request_id")?;
         validate_payload(title, content, source)?;
+        // Before the retry below is answered, and before the writer is
+        // bound to a principal or counted against its quota.
+        super::admit::identities(
+            [project_id, writer_id, request_id]
+                .into_iter()
+                .chain(principal_id),
+        )?;
+        super::admit::text(None, title, content, source)?;
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_pin(&tx, project_id)?;
@@ -293,6 +307,8 @@ impl SharedStore {
                 existing.title == title && existing.content == content && existing.source == source,
                 "request_id already exists with different observation content"
             );
+            // The answer is the row as it is stored, whatever stored it.
+            super::admit::observation(&existing)?;
             return Ok(existing);
         }
         // A writer id belongs to one person for good, whatever a policy says.

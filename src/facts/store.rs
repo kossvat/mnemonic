@@ -91,6 +91,55 @@ pub fn scope_key(conn: &Connection, project: Option<&str>) -> Result<(String, St
     }
 }
 
+/// What a statement's names resolve to in the store: the keys its slot is
+/// found by and, when that slot exists, the spellings it is shown under.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Resolved {
+    pub scope_key: String,
+    pub scope: String,
+    pub subject_key: String,
+    /// The alias target the subject key was made from, if any.
+    pub subject_target: Option<String>,
+    pub predicate: String,
+    pub qualifier_key: String,
+    /// Scope, subject, predicate and qualifier as the existing slot spells
+    /// them (the first statement's spelling stays).
+    pub labels: Vec<String>,
+}
+
+impl Resolved {
+    /// Reads only.
+    pub fn of(conn: &Connection, write: &FactWrite<'_>) -> Result<Resolved> {
+        let (scope_key, scope) = scope_key(conn, write.project)?;
+        let (subject_key, subject_target) = keys::subject_resolution(conn, write.subject)?;
+        let predicate = keys::predicate_key(write.predicate)?;
+        let qualifier_key = keys::qualifier_key(write.qualifier.unwrap_or("").trim())?;
+        let labels = conn
+            .query_row(
+                "SELECT scope, subject, predicate_label, qualifier FROM fact_slots
+                  WHERE scope_key = ?1 AND subject_key = ?2 AND predicate = ?3
+                    AND qualifier_key = ?4",
+                params![scope_key, subject_key, predicate, qualifier_key],
+                |r| {
+                    (0..4)
+                        .map(|i| r.get::<_, String>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                },
+            )
+            .optional()?
+            .unwrap_or_default();
+        Ok(Resolved {
+            scope_key,
+            scope,
+            subject_key,
+            subject_target,
+            predicate,
+            qualifier_key,
+            labels,
+        })
+    }
+}
+
 fn now_text(now: DateTime<Utc>) -> String {
     now.to_rfc3339()
 }
@@ -258,6 +307,17 @@ pub(super) fn settle_spans(conn: &Connection, slot: &str, now: &str) -> Result<(
 
 /// Apply one statement in the caller's IMMEDIATE transaction.
 pub fn apply_in(conn: &Connection, write: &FactWrite<'_>, now: DateTime<Utc>) -> Result<Outcome> {
+    // Before the replay lookup too: a refused statement has no earlier
+    // success to return. As given, then as the store would file it.
+    super::admit::admit(write)?;
+    let Resolved {
+        scope_key,
+        scope,
+        subject_key,
+        predicate,
+        qualifier_key,
+        ..
+    } = super::admit::admit_resolved(conn, write)?;
     let now_ms = now.timestamp_millis();
     if let Some(request_id) = write.request_id {
         ensure!(
@@ -320,11 +380,7 @@ pub fn apply_in(conn: &Connection, write: &FactWrite<'_>, now: DateTime<Utc>) ->
     let trust = write.trust.unwrap_or(Trust::Declared);
     let now_s = now_text(now);
 
-    let (scope_key, scope) = scope_key(conn, write.project)?;
-    let subject_key = keys::subject_key(conn, write.subject)?;
-    let predicate = keys::predicate_key(write.predicate)?;
     let qualifier = write.qualifier.unwrap_or("").trim();
-    let qualifier_key = keys::qualifier_key(qualifier)?;
     let slot = slot_id(
         conn,
         (&scope_key, &scope),
@@ -342,9 +398,13 @@ pub fn apply_in(conn: &Connection, write: &FactWrite<'_>, now: DateTime<Utc>) ->
         && expected != revision
     {
         let current = slot_view(conn, &slot)?.current.and_then(|v| v.value);
+        // The stored value is shown unless it is one the policy refuses
+        // (a value stored before it).
         bail!(
             "revision mismatch: the fact is at revision {revision}, not {expected}; current value {}",
-            current.as_deref().unwrap_or("none")
+            current
+                .as_deref()
+                .map_or("none", crate::redaction::state::shown)
         );
     }
 
@@ -451,9 +511,7 @@ pub fn apply_in(conn: &Connection, write: &FactWrite<'_>, now: DateTime<Utc>) ->
                     valid_from_ms,
                     confidence,
                     write.source_memory_id,
-                    write
-                        .evidence
-                        .map(|e| e.chars().take(500).collect::<String>()),
+                    write.evidence.map(super::admit::evidence),
                     write.actor,
                     write.agent,
                     now_s
@@ -540,6 +598,7 @@ pub fn live_source(storage: &Storage, source: Option<&str>) -> Result<Option<Str
     let Some(source) = source.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
+    crate::redaction::state::admit_identities("fact", [source])?;
     let conn = storage
         .conn
         .lock()
@@ -568,6 +627,7 @@ pub struct Erased {
 /// match exactly one). The chain re-derives around the gap; the event
 /// records only that a value was erased, never which.
 pub fn forget_value(storage: &Storage, id_prefix: &str) -> Result<Erased> {
+    crate::redaction::state::admit_identities("fact", [id_prefix])?;
     let id_prefix = id_prefix.trim();
     ensure!(
         id_prefix.len() >= 4,

@@ -60,6 +60,21 @@ const ATTRIBUTE_SUFFIXES: &[&str] = &[
 
 /// Lowercase, hyphenate, trim filler. Returns empty string for unsalvageable
 /// inputs — caller must check.
+/// The names of a rename or a merge, judged as they are given and as the
+/// keys made from them, which are stored too (follow-ups, memories and
+/// facts are filed under the key of the new name). `what` names the kind
+/// of write in the refusal.
+pub fn admit_renamed(what: &'static str, names: [&str; 2]) -> anyhow::Result<()> {
+    let keys: Vec<String> = names
+        .iter()
+        .flat_map(|name| [canonicalize_name(name), canonicalize_name_uncapped(name)])
+        .collect();
+    crate::redaction::state::admit_identities(
+        what,
+        names.into_iter().chain(keys.iter().map(String::as_str)),
+    )
+}
+
 pub fn canonicalize_name(raw: &str) -> String {
     let mut slug = canonicalize_name_uncapped(raw);
     // Step 3: cap length. Long names hurt graph density and FK matching.

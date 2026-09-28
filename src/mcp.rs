@@ -126,14 +126,16 @@ impl McpServer {
 
         let request: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
-            Err(e) => {
+            // A parser says where it stopped and, of a value it did not
+            // expect, what the value was.
+            Err(_) => {
                 let err = JsonRpcResponse {
                     jsonrpc: "2.0".into(),
                     id: Value::Null,
                     result: None,
                     error: Some(JsonRpcError {
                         code: -32700,
-                        message: format!("Parse error: {e}"),
+                        message: "Parse error".into(),
                     }),
                 };
                 return serde_json::to_string(&err).ok();
@@ -150,8 +152,9 @@ impl McpServer {
         if request.id.is_none() {
             if let Err(e) = response {
                 tracing::debug!(
-                    "MCP notification {} handler error (no reply sent): {e}",
-                    request.method
+                    "MCP notification {} handler error (no reply sent): {}",
+                    crate::redaction::state::shown(&request.method),
+                    crate::redaction::state::said(&e)
                 );
             }
             return None;
@@ -169,9 +172,11 @@ impl McpServer {
                 jsonrpc: "2.0".into(),
                 id,
                 result: None,
+                // What an error says is prepared like any text: it can
+                // say back what the request gave.
                 error: Some(JsonRpcError {
                     code: -32603,
-                    message: e.to_string(),
+                    message: crate::redaction::state::said(&e),
                 }),
             },
         };
@@ -455,12 +460,19 @@ impl McpServer {
             _ => MemoryType::Note,
         };
 
-        let tag_list: Vec<String> = tags_str
+        // One string until it is split: a private region may span a comma,
+        // and a fragment of one is still private.
+        let tags_redacted = crate::redaction::redact_text(tags_str);
+        let tag_list: Vec<String> = tags_redacted
+            .value
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
 
+        let refused = |code: crate::redaction::RedactionError| {
+            anyhow::anyhow!("memory_save refused ({})", code.code())
+        };
         let mut entry = MemoryEntry::new(title, content, mt.clone(), EventSource::Socket);
         entry.tags = tag_list;
         if let Some(project) = params
@@ -469,8 +481,20 @@ impl McpServer {
             .map(str::trim)
             .filter(|p| !p.is_empty())
         {
+            // Judged raw, before it is resolved: canonicalizing a name can
+            // drop the very syntax that made it a credential, and then the
+            // resolved form under the structural keys passes.
+            crate::redaction::check_identity(project).map_err(refused)?;
             crate::updates::plan::set_project(storage, &mut entry, project)?;
         }
+        // Admission: nothing below sees the text as it arrived; the resolved
+        // project sits under structural keys and is judged again here.
+        let mut prepared =
+            crate::redaction::prepare_entry(entry, crate::redaction::STRUCTURAL_KEYS)
+                .map_err(refused)?;
+        prepared.absorb(&tags_redacted);
+        let summary = prepared.summary().clone();
+        let mut entry = prepared.into_entry();
         let mut updates = Vec::new();
 
         // Embedding + dedup + scoring. Only the EMBEDDING text is truncated:
@@ -478,9 +502,14 @@ impl McpServer {
         // semantic signal, and staying far under the daemon's /embed caps
         // means a large-but-valid memory can never be rejected with HTTP 400
         // (Codex review: the memory itself must always be savable in full).
-        let embed_text = format!("{} {}", title, content);
-        let embed_text = truncate_for_embedding(&embed_text, EMBED_TEXT_MAX_BYTES);
-        match embedder.embed(embed_text) {
+        // The cut text is prepared once more: a cut can make a credential
+        // of what was code.
+        let embed_text = crate::redaction::state::prepare_normalized(
+            &format!("{} {}", entry.title, entry.content),
+            |text| truncate_for_embedding(text, EMBED_TEXT_MAX_BYTES).to_string(),
+        )
+        .value;
+        match embedder.embed(&embed_text) {
             Ok(emb) => {
                 // `?`: a dimension-mismatch error (model swapped without a reembed) must
                 // abort the save, not fall through and write a mixed-dim vector.
@@ -494,12 +523,16 @@ impl McpServer {
                 )?;
                 let link = match plan {
                     crate::updates::plan::Plan::Duplicate { of, similarity } => {
-                        return Ok(json!({
+                        let mut reply = json!({
                             "status": "skipped",
                             "reason": "duplicate",
                             "similarity": similarity,
                             "duplicate_of": of
-                        }));
+                        });
+                        if summary.changed() {
+                            reply["redaction"] = summary.to_json();
+                        }
+                        return Ok(reply);
                     }
                     crate::updates::plan::Plan::Save { link, .. } => link,
                 };
@@ -566,6 +599,11 @@ impl McpServer {
         if let Some(project) = entry.metadata.get("project") {
             reply["project"] = project.clone();
         }
+        // What admission changed, so the caller knows the record differs
+        // from what it sent: classes and counts, never the text.
+        if summary.changed() {
+            reply["redaction"] = summary.to_json();
+        }
         Ok(reply)
     }
 
@@ -595,8 +633,13 @@ impl McpServer {
 
         // Same truncation as the save path: keeps oversized queries under
         // the daemon /embed caps (and e5 wouldn't attend past ~512 tokens).
-        let query = truncate_for_embedding(query, EMBED_TEXT_MAX_BYTES);
-        let emb = embedder.embed_query(query)?;
+        // A query is new text: prepared, cut, and prepared again (a cut
+        // can make a credential of what was code).
+        let query = crate::redaction::state::prepare_normalized(query, |text| {
+            truncate_for_embedding(text, EMBED_TEXT_MAX_BYTES).to_string()
+        })
+        .value;
+        let emb = embedder.embed_query(&query)?;
         let results = storage.find_similar(&emb, limit)?;
         let mut entries: Vec<Value> = results
             .iter()
@@ -658,7 +701,7 @@ impl McpServer {
         if !result.found {
             return Ok(json!({
                 "found": false,
-                "entity": entity,
+                "entity": crate::redaction::state::shown(entity),
                 "message": "Entity not found. Use list_all=true to see known entities."
             }));
         }
@@ -772,9 +815,10 @@ impl McpServer {
             Some("close") => Action::Close,
             Some("reopen") => Action::Reopen,
             Some("dismiss") => Action::Dismiss,
-            other => {
+            // The action is not echoed: it is input like any other.
+            _ => {
                 return Err(anyhow::anyhow!(
-                    "action must be confirm | close | reopen | dismiss, got {other:?}"
+                    "action must be confirm | close | reopen | dismiss"
                 ));
             }
         };
@@ -834,6 +878,9 @@ fn truncate_for_embedding(s: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 #[path = "fact_updates_tests.rs"]
 mod fact_updates_tests;
+#[cfg(test)]
+#[path = "mcp_redaction_tests.rs"]
+mod redaction_tests;
 
 #[cfg(test)]
 mod tests {

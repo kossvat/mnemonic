@@ -2,6 +2,7 @@
 //! qualifier) and change over time. The chain keeps every value with the
 //! time it held; the current one is derived, never stored.
 
+pub mod admit;
 pub mod declare;
 pub mod digest;
 pub mod keys;
@@ -13,3 +14,6 @@ pub mod rule;
 pub mod schema;
 pub mod store;
 pub mod view;
+
+#[cfg(test)]
+mod redaction_state_tests;

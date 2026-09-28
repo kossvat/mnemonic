@@ -43,10 +43,21 @@ fn observation_cap() -> usize {
 
 const MAX_SESSION_SECS: u64 = 7 * 24 * 60 * 60;
 
+const REJECTED: &str = "Operation rejected. Check input fields, limits and retry identity; \
+    no additional authority was granted.";
+const REFUSED: &str = "Operation rejected (SENSITIVE_CONTENT): the request holds a credential \
+    or a private block. Nothing was stored. Remove it and send the request again.";
+
 impl Policy {
     pub(super) fn load(path: &Path) -> Result<Self> {
         let file = filesystem::open_policy(path)?;
-        let policy: Self = toml::from_str(&read_bounded_text(file, 8192)?)?;
+        let text = read_bounded_text(file, 8192)?;
+        // Where, not what: the parser's own message quotes the line.
+        let policy: Self = toml::from_str(&text).map_err(|error| {
+            let at = error.span().map_or(0, |span| span.start.min(text.len()));
+            let line = text[..at].matches('\n').count() + 1;
+            anyhow::anyhow!("shared policy is not valid TOML for a policy (line {line})")
+        })?;
         policy.validate()?;
         Ok(policy)
     }
@@ -94,6 +105,10 @@ impl Policy {
             (1..=1000).contains(&self.max_observations_per_session),
             "observation session cap must be 1..1000"
         );
+        // What a policy names is written with every observation made
+        // under it, and into the policy file and the key line of a grant.
+        // (A principal is the head of the agent id it is judged in.)
+        super::admit::identities([self.project_id.as_str(), &self.agent_id])?;
         Ok(())
     }
 }
@@ -252,12 +267,20 @@ impl<'a> SharedMcp<'a> {
                     Ok(value) => {
                         json!({"content":[{"type":"text","text":value.to_string()}],"isError":false})
                     }
-                    Err(_) => {
+                    Err(error) => {
                         // Decode errors contain peer-supplied strings and field
                         // names, including secrets or terminal control bytes.
                         // Keep both protocol output and transport logs generic.
                         eprintln!("shared MCP operation rejected");
-                        json!({"content":[{"type":"text","text":"Operation rejected. Check input fields, limits and retry identity; no additional authority was granted."}],"isError":true})
+                        // A refusal by the redaction policy is said as such,
+                        // by its fixed code: the agent can remove what it
+                        // sent, and nothing of it is repeated.
+                        let text = if super::admit::is_refusal(&error) {
+                            REFUSED
+                        } else {
+                            REJECTED
+                        };
+                        json!({"content":[{"type":"text","text":text}],"isError":true})
                     }
                 }
             }

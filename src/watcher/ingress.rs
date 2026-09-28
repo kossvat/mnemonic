@@ -12,7 +12,15 @@ use tracing::warn;
 use super::tail;
 use crate::event::{Event, EventKind, EventSource};
 use crate::ingest::{IngestCursor, IngestPayload, IngestRecord};
+use crate::redaction::{self, RedactionError, STRUCTURAL_KEYS};
 use crate::storage::Storage;
+
+/// A transcript whose path could not be admitted: its name would be stored
+/// with every cursor and its path with every turn, so the file is left
+/// alone and never logged by name.
+fn refused(namespace: &str, what: &str, code: RedactionError) {
+    warn!("{namespace} ingress: {what} refused ({})", code.code());
+}
 
 pub(super) struct ParsedTurn {
     pub event: Event,
@@ -28,7 +36,11 @@ impl ParsedTurn {
     /// Note what `content` holds: a decision keeps only its excerpt, but a
     /// correction keeps the WHOLE message, because that is the memory. Not
     /// storing the turn separately bounds the copies, it does not make the
-    /// payload free of private text.
+    /// payload free of private text: that is what the redaction pass at the
+    /// top is for, before anything selects or cuts the text.
+    ///
+    /// A turn whose message or transcript id holds a credential is not
+    /// captured at all: the id would become its durable key.
     pub(super) fn new(
         line: &str,
         source: EventSource,
@@ -38,12 +50,16 @@ impl ParsedTurn {
         metadata: serde_json::Value,
     ) -> Option<Self> {
         use super::conversation::ConversationWatcher;
-        let (kind, content) = if role == "user" && ConversationWatcher::is_correction(&message) {
-            (EventKind::UserCorrection, message.clone())
-        } else if ConversationWatcher::is_decision(&message) {
+        // Private regions and credentials go first, so no excerpt boundary,
+        // pattern or length rule ever sees them.
+        let redacted = redaction::redact_text(&message);
+        let message = redacted.value.as_str();
+        let (kind, content) = if role == "user" && ConversationWatcher::is_correction(message) {
+            (EventKind::UserCorrection, message.to_string())
+        } else if ConversationWatcher::is_decision(message) {
             (
                 EventKind::Custom("conversation_decision".into()),
-                ConversationWatcher::decision_excerpt(&message),
+                ConversationWatcher::decision_excerpt(message),
             )
         } else {
             return None;
@@ -53,6 +69,21 @@ impl ParsedTurn {
         if let Ok(time) = chrono::DateTime::parse_from_rfc3339(&source_at) {
             event.timestamp = time.with_timezone(&Utc);
         }
+        let source_at = (!source_at.is_empty()).then_some(source_at);
+        let namespace = match source {
+            EventSource::CodexWatcher => "codex",
+            _ => CONVERSATION_NAMESPACE,
+        };
+        let event = match redaction::prepare_event(event, STRUCTURAL_KEYS) {
+            Ok(mut prepared) => {
+                prepared.absorb(&redacted);
+                prepared.into_event()
+            }
+            Err(code) => {
+                refused(namespace, "a turn's metadata", code);
+                return None;
+            }
+        };
         let message_id = match source {
             EventSource::ConversationWatcher => {
                 value.get("uuid").or_else(|| value.pointer("/message/id"))
@@ -69,9 +100,25 @@ impl ParsedTurn {
             .and_then(|v| v.as_str())
             .filter(|v| !v.is_empty())
             .map(str::to_owned);
+        let identities = [message_id.as_deref(), transcript_id.as_deref()];
+        if identities
+            .into_iter()
+            .flatten()
+            .any(|id| redaction::check_identity(id).is_err())
+        {
+            refused(
+                namespace,
+                "a turn's message identity",
+                RedactionError::SensitiveContent,
+            );
+            return None;
+        }
+        // The source time is kept verbatim, so a credential-shaped one is
+        // not kept at all: the turn is dated at observation instead.
+        let source_at = source_at.filter(|at| redaction::check_identity(at).is_ok());
         Some(Self {
             event,
-            source_at: (!source_at.is_empty()).then_some(source_at),
+            source_at,
             transcript_id,
             message_id,
         })
@@ -146,6 +193,8 @@ pub(super) struct IngressTail {
     /// Historic files whose adoption must be retried. `None` until the first
     /// bootstrap pass of this process has looked at every existing file.
     adoption_retries: Mutex<Option<HashSet<PathBuf>>>,
+    /// Transcripts refused for their path, so each is reported once.
+    refused_paths: Mutex<HashSet<PathBuf>>,
 }
 
 /// Outcome of adopting one pre-existing transcript.
@@ -162,7 +211,30 @@ impl IngressTail {
             storage,
             namespace,
             adoption_retries: Mutex::new(None),
+            refused_paths: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Whether this transcript is left alone: its path is copied into every
+    /// turn's metadata and its stream key (the JSON-encoded file name, which
+    /// escaping can join differently) into every cursor, so both must be
+    /// admissible. Reported once per path.
+    fn refused_path(&self, path: &Path) -> bool {
+        let clean = redaction::check_identity(&path.to_string_lossy()).is_ok()
+            && redaction::check_identity(&self.stream(path)).is_ok();
+        if clean {
+            return false;
+        }
+        if let Ok(mut seen) = self.refused_paths.lock()
+            && seen.insert(path.to_path_buf())
+        {
+            refused(
+                self.namespace,
+                "a transcript path",
+                RedactionError::SensitiveContent,
+            );
+        }
+        true
     }
 
     /// Every cursor of this watcher's namespace, read in one query. Stream
@@ -207,6 +279,9 @@ impl IngressTail {
         let mut captured = 0;
         for path in files {
             if adopting.contains(path) {
+                continue;
+            }
+            if self.refused_path(path) {
                 continue;
             }
             match self.poll(path, parse, &mut snapshot, scope.as_deref_mut()) {
@@ -329,6 +404,10 @@ impl IngressTail {
 
     fn adopt(&self, path: &Path, legacy: &HashMap<PathBuf, u64>) -> Result<Adoption> {
         let stream = self.stream(path);
+        // A refused path gets no cursor: the file is never polled either.
+        if self.refused_path(path) {
+            return Ok(Adoption::Settled);
+        }
         if self.storage.ingest_cursor(&stream)?.is_some() {
             return Ok(Adoption::Settled);
         }
@@ -407,9 +486,14 @@ impl IngressTail {
     ) -> Result<usize> {
         // Stat/read/fingerprint the same descriptor: a path may rotate at any
         // time. Its replacement is detected on the next poll.
+        let stream = self.stream(path);
+        ensure!(
+            redaction::check_identity(&stream).is_ok(),
+            "transcript name refused ({})",
+            RedactionError::SensitiveContent.code()
+        );
         let mut file = File::open(path)?;
         let meta = file.metadata()?;
-        let stream = self.stream(path);
         let previous = snapshot.get(&stream).cloned();
         let (generation, offset, known_prefix) = match previous.as_ref() {
             Some(previous) => match unchanged(&mut file, &meta, previous)? {
@@ -463,6 +547,17 @@ impl IngressTail {
                 serde_json::json!([self.namespace, "position", stream, generation, position])
                     .to_string()
             });
+            // The key is stored in its serialized form, and JSON escaping can
+            // join what a control character split in the raw id: refuse the
+            // turn, not the batch, so the cursor still moves past it.
+            if redaction::check_identity(&source_key).is_err() {
+                refused(
+                    self.namespace,
+                    "a turn's message key",
+                    RedactionError::SensitiveContent,
+                );
+                continue;
+            }
             records.push(IngestRecord {
                 source_key,
                 source_at: turn.source_at,
@@ -593,6 +688,9 @@ fn checkpoint(
     })
 }
 
+#[cfg(test)]
+#[path = "ingress_redaction_tests.rs"]
+mod redaction_tests;
 #[cfg(test)]
 #[path = "ingress_tests.rs"]
 mod tests;
