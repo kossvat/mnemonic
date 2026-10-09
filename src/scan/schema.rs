@@ -89,7 +89,7 @@ impl Store {
     /// were written for.
     pub fn versions(self) -> std::ops::RangeInclusive<i64> {
         match self {
-            Store::Private => 0..=2,
+            Store::Private => 0..=3,
             Store::Shared => 1..=2,
             Store::Activity => 0..=0,
         }
@@ -387,6 +387,34 @@ const PRIVATE: &[Table] = &[
             ("request_id", Name),
         ],
     },
+    // The log of what memory returned: numbers, words of fixed sets, and
+    // ids. No text of a memory and no query is in it.
+    Table {
+        name: "recall_events",
+        locator: RowId,
+        columns: &[
+            ("id", Plain),
+            ("at", Plain),
+            ("surface", Plain),
+            ("tool", Plain),
+            ("client", Name),
+            ("run", Name),
+            ("returned", Plain),
+            ("corrections", Plain),
+            ("chars", Plain),
+            ("hidden", Plain),
+        ],
+    },
+    Table {
+        name: "recall_items",
+        locator: RowId,
+        columns: &[
+            ("event_id", Plain),
+            ("rank", Plain),
+            ("memory_id", Name),
+            ("section", Plain),
+        ],
+    },
     Table {
         name: "followups",
         locator: RowId,
@@ -535,6 +563,133 @@ const PRIVATE: &[Table] = &[
             ("external_key", Name),
             ("last_activity_at", Plain),
         ],
+    },
+    // Stretches of work: paths of transcripts and times, no text.
+    Table {
+        name: "work_stretches",
+        locator: RowId,
+        columns: &[
+            ("id", Plain),
+            ("transcript", Name),
+            ("started_at", Plain),
+            ("last_at", Plain),
+        ],
+    },
+    Table {
+        name: "work_stretch_state",
+        locator: RowId,
+        columns: &[("name", Name), ("value", Plain)],
+    },
+    // The registry of projects: names of folders and ids, no location.
+    Table {
+        name: "projects",
+        locator: RowId,
+        columns: &[
+            ("id", Plain),
+            ("slug", Name),
+            ("name", Name),
+            ("parent_id", Plain),
+            ("entity_id", Name),
+            ("state", Plain),
+            ("slot", Plain),
+            ("merged_into", Plain),
+            ("prev_entity_type", Plain),
+            ("first_seen", Plain),
+            ("last_active_at", Plain),
+        ],
+    },
+    Table {
+        name: "project_aliases",
+        locator: RowId,
+        columns: &[("alias", Name), ("project_id", Plain), ("kind", Plain)],
+    },
+    Table {
+        name: "entity_archive",
+        locator: RowId,
+        columns: &[("entity_id", Name), ("at", Plain)],
+    },
+    Table {
+        name: "graph_slots",
+        locator: RowId,
+        columns: &[("node_key", Name), ("parent_key", Name), ("slot", Plain)],
+    },
+    // What the observation pass keeps: the stream names a transcript by
+    // its file, the rest is ids, enums, times and hashes.
+    Table {
+        name: "work_segments",
+        locator: RowId,
+        columns: &[
+            ("id", Plain),
+            ("stream", Name),
+            ("driver", Plain),
+            ("agent", Plain),
+            ("project_id", Plain),
+            ("started_at", Plain),
+            ("last_at", Plain),
+            ("last_touch_at", Plain),
+            ("source", Plain),
+        ],
+    },
+    Table {
+        name: "segment_activity",
+        locator: RowId,
+        columns: &[
+            ("segment_id", Plain),
+            ("minute", Plain),
+            ("records", Plain),
+            ("touches", Plain),
+        ],
+    },
+    Table {
+        name: "owner_prompts",
+        locator: RowId,
+        columns: &[("stream", Name), ("at", Plain)],
+    },
+    Table {
+        name: "observation_checkpoints",
+        locator: RowId,
+        columns: &[
+            ("stream", Name),
+            ("generation", Plain),
+            ("offset", Plain),
+            ("file_id", Plain),
+            ("prefix_len", Plain),
+            ("prefix_hash", Plain),
+            ("anchor_hash", Plain),
+            ("driver", Plain),
+            ("project_id", Plain),
+            ("candidate_id", Plain),
+            ("folder_id", Plain),
+            ("placed", Plain),
+            ("source", Plain),
+            ("last_kind", Plain),
+            ("last_at", Plain),
+        ],
+    },
+    // The owner's corrections of attribution: a stream, times and ids.
+    Table {
+        name: "attribution_overrides",
+        locator: RowId,
+        columns: &[
+            ("id", Plain),
+            ("stream", Name),
+            ("started_at", Plain),
+            ("ended_at", Plain),
+            ("project_id", Plain),
+            ("created_at", Plain),
+        ],
+    },
+    // Since when the rule of live projects is in force: a time.
+    Table {
+        name: "attribution_state",
+        locator: RowId,
+        columns: &[("key", Plain), ("value", Plain)],
+    },
+    // The days whose split of the owner's time is made again: numbers.
+    Table {
+        name: "attribution_dirty",
+        locator: RowId,
+        columns: &[("utc_day", Plain), ("mark", Plain)],
     },
     Table {
         name: "vector_index_changes",

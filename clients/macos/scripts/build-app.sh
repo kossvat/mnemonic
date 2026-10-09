@@ -33,6 +33,26 @@ if [[ ! -f "$BIN" ]]; then
   exit 1
 fi
 
+# A raw executable has no bundle manifest. Bind its route capability to
+# these exact built bytes so a later rebuild cannot reuse a stale receipt.
+ROUTE_DIGEST="$(/usr/bin/shasum -a 256 "$BIN" | /usr/bin/cut -d ' ' -f 1)"
+[[ "$ROUTE_DIGEST" =~ ^[0-9a-f]{64}$ ]] || exit 1
+ROUTE_RECEIPT="$(mktemp "${BIN}.route-capability.XXXXXX")"
+trap 'rm -f "$ROUTE_RECEIPT"' EXIT
+cat > "$ROUTE_RECEIPT" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>MnemonicRouteProtocolVersion</key>
+    <integer>1</integer>
+    <key>MnemonicExecutableSHA256</key>
+    <string>$ROUTE_DIGEST</string>
+</dict>
+</plist>
+PLIST
+mv -f "$ROUTE_RECEIPT" "${BIN}.route-capability.plist"
+trap - EXIT
+
 echo "==> Assembling $APP_NAME"
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS"
@@ -58,6 +78,19 @@ cat > "$APP_PATH/Contents/Info.plist" <<'PLIST'
     <string>6.0</string>
     <key>CFBundleName</key>
     <string>Mnemonic</string>
+    <key>MnemonicRouteProtocolVersion</key>
+    <integer>1</integer>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>mnemonic</string>
+            </array>
+        </dict>
+    </array>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -125,4 +158,6 @@ fi
 
 echo ""
 echo "Open with:  open '$APP_PATH'"
-[[ "$INSTALL" == "true" ]] && echo "Or from ~/Applications via Launchpad / Spotlight."
+if [[ "$INSTALL" == "true" ]]; then
+  echo "Or from ~/Applications via Launchpad / Spotlight."
+fi

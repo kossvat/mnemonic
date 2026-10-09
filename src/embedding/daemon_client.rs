@@ -500,7 +500,12 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         let listener = match UnixListener::bind(&sock) {
             Ok(l) => l,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // A runner that names the folder for sockets promised them:
+            // there the test fails. Elsewhere it has nothing to test with.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    && std::env::var_os(crate::test_support::SHORT_ROOT).is_none() =>
+            {
                 eprintln!("skipping socket-backed test: unix bind denied in this sandbox ({e})");
                 return None;
             }

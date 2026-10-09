@@ -29,6 +29,61 @@ pub struct Config {
     pub graph: GraphConfig,
     #[serde(default)]
     pub lint: LintConfig,
+    #[serde(default)]
+    pub recall: RecallConfig,
+    #[serde(default)]
+    pub projects: ProjectsConfig,
+}
+
+/// Where the owner's projects live: a workspace and a folder inside it
+/// whose child folders are the projects, each under the name of its
+/// folder. Without a workspace no project is discovered and the daemon
+/// behaves as before.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
+    /// The folder of projects inside the workspace; the workspace itself
+    /// when not named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<PathBuf>,
+    /// A second name of a project: `alias = "folder"`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub aliases: std::collections::BTreeMap<String, String>,
+    /// A name a project's folder had before: `former = "folder"`. Old
+    /// records that name the former folder resolve to the project.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub former: std::collections::BTreeMap<String, String>,
+    /// Optional provider, authority, checkout and gate choices by project key.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub plans: std::collections::BTreeMap<String, crate::plans::Config>,
+}
+
+impl ProjectsConfig {
+    /// The folder whose children are projects, when one is configured.
+    pub fn root(&self) -> Option<PathBuf> {
+        let workspace = self.workspace.as_ref()?;
+        Some(match &self.folder {
+            Some(folder) => workspace.join(folder),
+            None => workspace.clone(),
+        })
+    }
+}
+
+/// The log of what memory returned: one event per call answered by the
+/// MCP server and per context generated, with the ids of the memories in
+/// the order returned and no text. Read by `mnemonic recall`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecallConfig {
+    /// With false nothing is written.
+    #[serde(default = "default_true")]
+    pub log: bool,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self { log: true }
+    }
 }
 
 /// Contradiction lint — periodic pass that flags decisions semantically
@@ -426,6 +481,14 @@ pub struct DaemonConfig {
     pub pid_file: PathBuf,
     pub socket_path: PathBuf,
     pub log_file: PathBuf,
+    /// Seconds the embedding model may stay unused before it leaves
+    /// memory, to be loaded again on the next use; 0 keeps it loaded.
+    #[serde(default = "default_model_idle_release_secs")]
+    pub model_idle_release_secs: u64,
+}
+
+fn default_model_idle_release_secs() -> u64 {
+    crate::embedding::release::DEFAULT_IDLE_RELEASE.as_secs()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -567,6 +630,7 @@ impl Default for Config {
                 pid_file: data_dir.join("mnemonic.pid"),
                 socket_path: data_dir.join("mnemonic.sock"),
                 log_file: data_dir.join("daemon.log"),
+                model_idle_release_secs: default_model_idle_release_secs(),
             },
             watchers: WatcherConfig {
                 watch_paths: vec![
@@ -625,6 +689,8 @@ impl Default for Config {
             activity: ActivityConfig::default(),
             graph: GraphConfig::default(),
             lint: LintConfig::default(),
+            recall: RecallConfig::default(),
+            projects: ProjectsConfig::default(),
         }
     }
 }
@@ -784,6 +850,7 @@ impl Config {
                 pid_file: home.join("mnemonic.pid"),
                 socket_path: home.join("mnemonic.sock"),
                 log_file: home.join("daemon.log"),
+                model_idle_release_secs: default_model_idle_release_secs(),
             },
             watchers: WatcherConfig {
                 watch_paths: Vec::new(),
@@ -1050,13 +1117,10 @@ mod tests {
     mod isolated_profile {
         use super::*;
 
-        fn profile_root(tag: &str) -> PathBuf {
+        fn profile_root(tag: &str) -> crate::test_support::InTempDir<PathBuf> {
             // Not `temp_dir()`: on macOS it is ~50 bytes deep and a profile
             // socket under it would trip the Unix socket path limit.
-            let id = uuid::Uuid::new_v4().simple().to_string();
-            let dir = PathBuf::from("/tmp").join(format!("mn-{tag}-{}", &id[..8]));
-            std::fs::create_dir_all(&dir).unwrap();
-            dir.canonicalize().unwrap()
+            crate::test_support::short_dir(&format!("mn-{tag}-"))
         }
 
         /// A stand-in owner home holding the agents' global folders, so the
@@ -1099,7 +1163,6 @@ mod tests {
             assert!(!config.output.memory_api_enabled);
             assert!(config.output.memory_files_path.starts_with(&home));
             assert!(config.output.obsidian_path.starts_with(&home));
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
@@ -1119,7 +1182,6 @@ mod tests {
             for path in state_paths(&config) {
                 assert!(path.starts_with(&home), "{} escaped", path.display());
             }
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
@@ -1144,7 +1206,6 @@ mod tests {
                     "{section}.{key} outside the profile must be refused"
                 );
             }
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
@@ -1170,7 +1231,6 @@ mod tests {
             .unwrap();
             let config = Config::load_for(Some(&home)).unwrap();
             assert_eq!(config.watchers.conversation_sessions_dir, Some(sessions));
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
@@ -1211,7 +1271,6 @@ mod tests {
             std::fs::write(&config_path, "[output]\nmemory_files_enabled = true\n").unwrap();
             let config = Config::load_profile(&home, Some(&user_home)).unwrap();
             assert!(config.output.memory_files_path.starts_with(&home));
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
@@ -1237,7 +1296,6 @@ mod tests {
             std::os::unix::fs::symlink(owner.join("activity.db"), home.join("activity.db"))
                 .unwrap();
             assert!(Config::load_for(Some(&home)).is_err());
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
@@ -1287,7 +1345,6 @@ mod tests {
                     dir.display()
                 );
             }
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
@@ -1328,7 +1385,6 @@ mod tests {
                     bad.display()
                 );
             }
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
@@ -1341,7 +1397,6 @@ mod tests {
                 assert!(!state_paths(&b).contains(&path));
                 assert!(!default_paths.contains(&path));
             }
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
@@ -1353,7 +1408,6 @@ mod tests {
                 .unwrap();
             let config = Config::load_for(Some(&home)).unwrap();
             assert_eq!(config.storage.db_path, home.join("memory.db"));
-            std::fs::remove_dir_all(root).unwrap();
         }
     }
 }

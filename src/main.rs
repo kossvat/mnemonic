@@ -3,9 +3,11 @@ mod activity_worker;
 mod api;
 mod attribution;
 mod attribution_worker;
+mod backup;
 mod classifier;
 mod conclusions_generator;
 mod config;
+pub mod curated_graph;
 mod daemon;
 mod decay;
 mod digest;
@@ -22,9 +24,20 @@ mod http;
 mod ingest;
 mod journal;
 mod lint;
+mod live;
+mod live_run;
+mod live_signal;
 mod mcp;
 mod output;
+mod owner_time;
+mod owner_time_day;
+mod plans;
 mod profile;
+mod projects;
+mod quality;
+mod quality_data;
+mod recall_day;
+mod recall_log;
 mod redaction;
 mod reflection;
 mod reranker;
@@ -36,6 +49,7 @@ mod shared;
 mod storage;
 #[cfg(test)]
 mod test_support;
+mod timeline;
 mod updates;
 mod watcher;
 
@@ -56,6 +70,29 @@ use event::{EventSource, MemoryEntry, MemoryType};
 fn context_output(path: &str) -> Result<std::path::PathBuf> {
     redaction::state::admit_identities("context output", [path])?;
     Ok(std::path::PathBuf::from(path))
+}
+
+/// A day as the recall command takes it: YYYY-MM-DD, and nothing else.
+fn parse_day(text: &str) -> Result<chrono::NaiveDate, String> {
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .map_err(|_| format!("{text} is not a day of the form YYYY-MM-DD"))
+}
+
+/// One item of `recent --json`: the widget's card of the latest memory
+/// reads it, and skips a memory marked as noise.
+fn recent_item_json(entry: &event::MemoryEntry) -> serde_json::Value {
+    let mut item = serde_json::json!({
+        "id": entry.id,
+        "type": entry.memory_type.to_string(),
+        "title": entry.title,
+        "content": entry.content,
+        "timestamp": entry.timestamp.to_rfc3339(),
+        "importance": entry.importance,
+    });
+    if let Some(rule) = quality::judge(entry) {
+        item["noise"] = serde_json::Value::String(rule.as_str().to_string());
+    }
+    item
 }
 
 fn init_logging(log_file: Option<&std::path::Path>) {
@@ -119,6 +156,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Read aggregate plan counts from one explicit project, without a profile.
+    PlanCounts {
+        #[arg(long)]
+        root: std::path::PathBuf,
+    },
     /// Start the daemon in foreground
     Start {
         /// Run in background (daemonize). Refused when a launchd
@@ -211,9 +253,39 @@ enum Commands {
         /// Output path (default: project memory dir)
         #[arg(short, long)]
         output: Option<String>,
+        /// Print what the context leaves out as noise instead of the
+        /// context, and write no file
+        #[arg(long, conflicts_with = "topic")]
+        hidden: bool,
+        /// With --hidden: emit JSON
+        #[arg(long, requires = "hidden")]
+        json: bool,
+        /// Do not record this context in the recall log
+        #[arg(long)]
+        no_record: bool,
+    },
+    /// What memory returned on a day: contexts generated, calls answered,
+    /// memories and corrections returned, and the memories returned most.
+    /// The numbers of events are history; the distinct memories and the
+    /// top are of what still exists.
+    Recall {
+        /// The local calendar day, YYYY-MM-DD (default: today)
+        #[arg(long, value_parser = parse_day)]
+        day: Option<chrono::NaiveDate>,
+        /// Emit JSON, the same bytes GET /api/recall returns
+        #[arg(long)]
+        json: bool,
     },
     /// Export all memories to JSON (stdout)
     Export,
+    /// Copy the stores, as they are, into a folder: the way back before an
+    /// installation. The copies are whole while the daemon runs, and
+    /// nothing of the stores is changed or migrated.
+    Backup {
+        /// The folder to copy into; made when it is not there. A copy
+        /// that is there already is never written over.
+        dir: std::path::PathBuf,
+    },
     /// Import memories from JSON file
     Import {
         /// Path to JSON file (or - for stdin)
@@ -469,7 +541,11 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AttributeCommands {
-    /// Recompute the last N local days (default 14).
+    /// Recompute the last N local days (default 14). With a workspace
+    /// configured: read every transcript of history into segments first,
+    /// then make every day they changed, from the first segment on. It
+    /// can run while the daemon runs, and be run again after it was
+    /// interrupted.
     Backfill {
         #[arg(long, default_value = "14")]
         days: u32,
@@ -493,6 +569,26 @@ enum AttributeCommands {
         /// Local date YYYY-MM-DD; defaults to today.
         #[arg(long)]
         day: Option<String>,
+    },
+    /// Replay the transcripts through the rules that name the project a
+    /// session works on, and print what they give: hours by project, how
+    /// each was learned, and a sample of segments to check. Writes nothing.
+    Replay {
+        /// Required: only the dry run exists.
+        #[arg(long)]
+        dry_run: bool,
+        /// Count the time of the last N days.
+        #[arg(long, default_value = "7")]
+        days: u32,
+        /// Show N segments to label.
+        #[arg(long, default_value = "20")]
+        segments: usize,
+        /// The workspace, for a run before one is configured.
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<std::path::PathBuf>,
+        /// The folder of projects inside the workspace.
+        #[arg(long, value_name = "NAME", requires = "workspace")]
+        folder: Option<std::path::PathBuf>,
     },
 }
 
@@ -947,6 +1043,10 @@ async fn run() -> Result<()> {
     if let Commands::Shared(args) = &cli.command {
         return shared::run(args);
     }
+    if let Commands::PlanCounts { root } = &cli.command {
+        println!("{}", serde_json::to_string(&plans::counts::read(root)?)?);
+        return Ok(());
+    }
     profile::select(cli.home.clone())?;
     let config = Config::load()?;
 
@@ -962,12 +1062,15 @@ async fn run() -> Result<()> {
     // Daemon and foreground start: log to file. Everything else: log to stderr.
     match &cli.command {
         Commands::Start { .. } => init_logging(Some(&config.daemon.log_file)),
-        Commands::Mcp | Commands::Stats { .. } => {} // stdout is structured output, no tracing
+        Commands::Mcp | Commands::Stats { .. } | Commands::Recall { .. } => {} // stdout is structured output, no tracing
         _ => init_logging(None),
     }
 
     match cli.command {
         Commands::Shared(_) => unreachable!("shared command is handled before private config"),
+        Commands::PlanCounts { .. } => {
+            unreachable!("plan counts are handled before private config")
+        }
         Commands::Redact { .. } => unreachable!("the scanner is handled before private config"),
         Commands::Start { daemon: bg } => {
             // Liveness-aware start: distinguish genuine running from
@@ -1188,19 +1291,7 @@ async fn run() -> Result<()> {
 
             if json {
                 let total = st.stats().map(|s| s.total).unwrap_or(0);
-                let items: Vec<_> = results
-                    .iter()
-                    .map(|e| {
-                        serde_json::json!({
-                            "id": e.id,
-                            "type": e.memory_type.to_string(),
-                            "title": e.title,
-                            "content": e.content,
-                            "timestamp": e.timestamp.to_rfc3339(),
-                            "importance": e.importance,
-                        })
-                    })
-                    .collect();
+                let items: Vec<_> = results.iter().map(recent_item_json).collect();
                 println!("{}", serde_json::json!({ "total": total, "items": items }));
             } else if results.is_empty() {
                 println!("No memories yet.");
@@ -1442,8 +1533,19 @@ async fn run() -> Result<()> {
             topic,
             limit,
             output,
+            hidden,
+            json,
+            no_record,
         } => {
             let st = storage::Storage::open(&config.storage.db_path)?;
+            if hidden {
+                // Composed and not written: no context file, no access
+                // count, no record.
+                let whisper = output::whisper::Whisper::new(std::path::PathBuf::new());
+                let composed = whisper.compose(&st)?;
+                println!("{}", output::whisper::hidden_report(&composed, json));
+                return Ok(());
+            }
 
             // Default output: project memory dir / CONTEXT.md
             let explicit_output = output.is_some();
@@ -1467,13 +1569,33 @@ async fn run() -> Result<()> {
 
             let whisper = output::whisper::Whisper::new(output_path.clone());
 
-            let content = match topic {
-                Some(ref t) => whisper.generate_for_topic(&st, t, limit)?,
-                None => whisper.generate(&st)?,
+            let composed = match topic {
+                Some(ref t) => whisper.generate_for_topic_composed(&st, t, limit)?,
+                None => whisper.generate_composed(&st)?,
             };
 
-            println!("{content}");
+            println!("{}", composed.text);
             println!("\n---\nWritten to: {}", output_path.display());
+            // The record is written after the context went out: standard
+            // output is flushed first, and only a flush that succeeded is
+            // followed by the record.
+            use std::io::Write;
+            if !no_record && std::io::stdout().flush().is_ok() {
+                let writer = recall_log::Writer::new(&config.storage.db_path, config.recall.log);
+                let record =
+                    composed.record(recall_log::Surface::Context, recall_log::Tool::Context);
+                writer.record(&record, &mut std::io::stderr());
+            }
+        }
+        Commands::Recall { day, json } => {
+            let st = storage::Storage::open(&config.storage.db_path)?;
+            let day = day.unwrap_or_else(|| chrono::Local::now().date_naive());
+            let summary = recall_day::summary(&st, day, config.recall.log)?;
+            if json {
+                println!("{}", serde_json::to_string(&summary)?);
+            } else {
+                println!("{}", summary.text());
+            }
         }
         Commands::Export => {
             let st = storage::Storage::open(&config.storage.db_path)?;
@@ -2262,11 +2384,84 @@ async fn run() -> Result<()> {
         Commands::Activity { cmd } => {
             run_activity(&config, cmd)?;
         }
+        // A backup copies the stores as they are: it comes before they
+        // are opened to write, which would move them to this generation.
+        Commands::Backup { dir } => {
+            for copied in backup::backup(&config, &dir)? {
+                println!(
+                    "Copied {} ({} MB), checked.",
+                    copied.file.display(),
+                    copied.bytes >> 20
+                );
+            }
+        }
+        // The dry run opens the store through its read-only entry, and
+        // nothing else: it comes before the stores are opened to write.
+        Commands::Attribute {
+            cmd:
+                AttributeCommands::Replay {
+                    dry_run,
+                    days,
+                    segments,
+                    workspace,
+                    folder,
+                },
+        } => {
+            if !dry_run {
+                anyhow::bail!("only the dry run exists: mnemonic attribute replay --dry-run");
+            }
+            let mut config = config;
+            if workspace.is_some() {
+                config.projects.workspace = workspace;
+                config.projects.folder = folder;
+            }
+            let options = watcher::replay::Options {
+                days,
+                sample: segments,
+            };
+            print!(
+                "{}",
+                watcher::replay::dry_run(&config, &options, chrono::Utc::now())?
+            );
+        }
         Commands::Attribute { cmd } => {
             let mem = storage::Storage::open(&config.storage.db_path)?;
             let act = activity::ActivityStore::open(&config.activity_db_path())?;
             let acfg = attribution::AttribCfg::default();
             match cmd {
+                // With a workspace the rows are made by the rule of live
+                // projects, as the daemon makes them: the earlier rule
+                // would overwrite them.
+                AttributeCommands::Backfill { days } if config.projects.root().is_some() => {
+                    mem.require_current_generation()?;
+                    // The segments of history first: they mark every day
+                    // they change.
+                    let mem = std::sync::Arc::new(mem);
+                    let read = watcher::backfill::run(&config, mem.clone())?;
+                    println!(
+                        "History: {} project(s), {} transcript(s), {} with something new.",
+                        read.projects, read.transcripts, read.written
+                    );
+                    let marked = owner_time_day::recompute_due(
+                        &act,
+                        &mem,
+                        &owner_time_day::LocalCalendar,
+                        chrono::Utc::now(),
+                        &mut None,
+                        &acfg,
+                    )?;
+                    let n = attribution_worker::backfill_live(&act, &mem, days);
+                    println!(
+                        "Attribution: made {} changed day(s) and the last {n} day(s) by \
+                         live projects; days before the first segment keep their rows.",
+                        marked.len()
+                    );
+                }
+                AttributeCommands::Run if config.projects.root().is_some() => {
+                    mem.require_current_generation()?;
+                    let n = attribution_worker::backfill_live(&act, &mem, 1);
+                    println!("Attribution: recomputed {n} day(s) by live projects.");
+                }
                 AttributeCommands::Backfill { days } => {
                     let n = attribution_worker::backfill(&act, &mem, days, &acfg);
                     println!("Attribution: recomputed {n} day(s).");
@@ -2292,6 +2487,7 @@ async fn run() -> Result<()> {
                     };
                     carry_dry_run(&mem, &act, day, &acfg)?;
                 }
+                AttributeCommands::Replay { .. } => unreachable!("handled above"),
             }
         }
         Commands::Journal { day, json } => {
@@ -3796,38 +3992,42 @@ fn run_session_command(config: &Config, sub: SessionCommands) -> Result<()> {
             }
         }
         SessionCommands::Leaderboard { limit, json } => {
-            let rows = storage.longest_sessions(limit.clamp(1, 50))?;
+            let now = chrono::Utc::now();
             if json {
-                // Exact same payload shape as GET /api/leaderboard/sessions
-                // — the widget parses both interchangeably.
-                let payload: Vec<serde_json::Value> = rows
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "session_id": r.session_id,
-                            "started_at": r.started_at,
-                            "duration_seconds": r.duration_seconds,
-                            "duration_human": storage::human_duration(r.duration_seconds),
-                            "top_project": r.top_project,
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::json!({ "sessions": payload }));
+                // Exact same payload as GET /api/leaderboard/sessions — the
+                // widget parses both interchangeably.
+                println!(
+                    "{}",
+                    storage::leaderboard_payload(&storage, limit.clamp(1, 50), now)?
+                );
                 return Ok(());
             }
+            let rows = storage.longest_sessions(limit.clamp(1, 50), now)?;
             if rows.is_empty() {
-                println!("No completed sessions yet.");
+                println!("No sessions yet.");
                 return Ok(());
+            }
+            let going = storage.current_sessions(storage::CURRENT_SESSIONS, now)?;
+            if !going.is_empty() {
+                println!("Going on now:");
+                for r in &going {
+                    println!(
+                        "      {:>9}  {}  {}",
+                        storage::human_duration(r.duration_seconds),
+                        r.started_at,
+                        r.top_project.as_deref().unwrap_or("-")
+                    );
+                }
             }
             println!("Longest sessions:");
             for (i, r) in rows.iter().enumerate() {
                 println!(
-                    "  {:>2}. {:>9}  {}  {}  {}",
+                    "  {:>2}. {:>9}  {}  {}{}",
                     i + 1,
                     storage::human_duration(r.duration_seconds),
-                    &r.session_id[..8.min(r.session_id.len())],
                     r.started_at,
-                    r.top_project.as_deref().unwrap_or("-")
+                    r.top_project.as_deref().unwrap_or("-"),
+                    if r.live { "  (going on)" } else { "" }
                 );
             }
         }
@@ -4282,7 +4482,8 @@ fn reextract(
                     Box::new(backend),
                     storage.clone(),
                     &config.llm,
-                );
+                )
+                .with_project_registry(config.projects.workspace.is_some());
                 println!(
                     "Extractor: composite (rule + LLM via {} {})",
                     config.llm.endpoint, config.llm.model
@@ -4422,7 +4623,8 @@ fn reextract_pending(
             Box::new(backend),
             storage.clone(),
             &config.llm,
-        );
+        )
+        .with_project_registry(config.projects.workspace.is_some());
         Box::new(crate::graph::extractor_llm::CompositeExtractor::new(
             Box::new(RuleExtractor::new()),
             Box::new(llm),

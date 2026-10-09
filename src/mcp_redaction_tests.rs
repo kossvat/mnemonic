@@ -89,7 +89,8 @@ impl Harness {
                 None,
                 &self.sinks,
             )
-            .expect("a request gets a reply");
+            .expect("a request gets a reply")
+            .line;
         let reply: Value = serde_json::from_str(&out).unwrap();
         if let Some(error) = reply.get("error") {
             return Err(error.to_string());
@@ -471,7 +472,8 @@ fn redaction_outputs_mcp_save_every_copy_is_of_the_prepared_entry() {
             None,
             &h.sinks,
         )
-        .unwrap();
+        .unwrap()
+        .line;
     assert!(!reply.contains(&token) && !reply.contains("and a plan"));
     let reply: Value = serde_json::from_str(&reply).unwrap();
     let reply: Value =
@@ -569,7 +571,8 @@ fn redaction_outputs_mcp_replies_do_not_say_back_what_the_policy_refuses() {
                 None,
                 &h.sinks,
             )
-            .unwrap();
+            .unwrap()
+            .line;
         assert!(!reply.contains(&token), "the reply says the request back");
         let reply: Value = serde_json::from_str(&reply).unwrap();
         assert!(
@@ -590,7 +593,8 @@ fn redaction_outputs_mcp_replies_do_not_say_back_what_the_policy_refuses() {
             None,
             &h.sinks,
         )
-        .unwrap();
+        .unwrap()
+        .line;
     assert!(reply.contains("Unknown method: memory_nothing"));
 }
 

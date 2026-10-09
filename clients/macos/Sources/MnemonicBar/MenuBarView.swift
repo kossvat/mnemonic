@@ -1,11 +1,21 @@
 import SwiftUI
+import MnemonicShared
 
 /// Mnemonic menu-bar popover — v2 "Hybrid" design ported from Claude Design.
 /// Neutral macOS surface, warm amber accent on the chart + primary button only.
 /// Four jobs: worked-time hero, work-history (week/month · bars/curve · day
 /// timeline), primary actions, and the Latest Memory card.
+/// What the owner has begun to write in the widget. It outlives the page
+/// it is written on: the deck unmounts a page that is not shown.
+final class MemoryDraft: ObservableObject {
+    @Published var open = false
+    @Published var title = ""
+    @Published var type = "note"
+}
+
 struct MenuBarView: View {
     @ObservedObject var service: MnemonicService
+    @ObservedObject var draft: MemoryDraft
 
     /// When embedded as the Work page of the paged deck: the brand/search
     /// header moves up to the pager, the card is always expanded, and the
@@ -15,11 +25,10 @@ struct MenuBarView: View {
 
     @State private var range: ChartRange = .week
     @State private var chartType: ChartType = .bar
-    @State private var expanded: Bool = UserDefaults.standard.string(forKey: "mn-size") == "expanded"
+    @State private var expanded: Bool = ProfilePreferences.current.string(forKey: "mn-size") == "expanded"
     @State private var selected: Int = -1            // index into current series; -1 = last
     @State private var tappedDetail: WorkDay? = nil  // detail for a tapped non-today day
     @State private var memoryOpen = false
-    @State private var showAddMemory = false
     @State private var showShare = false
 
     private let contentWidth: CGFloat = 336
@@ -50,7 +59,8 @@ struct MenuBarView: View {
             hero
             historyCard
             actions
-            if showAddMemory { addMemoryForm }
+            if draft.open { addMemoryForm }
+            MemoryTodayView(state: d.recallToday)
             LatestMemoryView(mem: d.latest, total: d.memoriesTotal,
                              open: $memoryOpen, onOpenApp: { service.openDashboard() })
             if d.state == .broken { brokenBanner }
@@ -85,7 +95,7 @@ struct MenuBarView: View {
             Spacer(minLength: 0)
             iconBtn(expanded ? "chevron.up" : "chevron.down", help: expanded ? "Collapse" : "Expand") {
                 expanded.toggle()
-                UserDefaults.standard.set(expanded ? "expanded" : "compact", forKey: "mn-size")
+                ProfilePreferences.current.set(expanded ? "expanded" : "compact", forKey: "mn-size")
             }
             iconBtn("magnifyingglass", help: "Search memories") { service.openDashboard() }
             HeaderStatusView(state: d.state)
@@ -199,25 +209,23 @@ struct MenuBarView: View {
             }
             SecondaryButton(icon: justSaved ? "checkmark" : "plus",
                             label: justSaved ? "Saved" : "Add Memory") {
-                withAnimation(.easeOut(duration: 0.15)) { showAddMemory.toggle() }
+                withAnimation(.easeOut(duration: 0.15)) { draft.open.toggle() }
             }
             OverflowMenuView(state: d.state, service: service)
         }
         .padding(.bottom, 13)
     }
 
-    @State private var addTitle = ""
-    @State private var addType = "note"
     @State private var justSaved = false
     @FocusState private var addFieldFocused: Bool
 
     private func saveNewMemory() {
-        let t = addTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = draft.title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
-        service.addMemory(title: t, type: addType)
-        addTitle = ""
+        service.addMemory(title: t, type: draft.type)
+        draft.title = ""
         withAnimation(.easeOut(duration: 0.15)) {
-            showAddMemory = false
+            draft.open = false
             justSaved = true
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { service.refresh() }
@@ -229,7 +237,7 @@ struct MenuBarView: View {
 
     private var addMemoryForm: some View {
         VStack(alignment: .leading, spacing: 8) {
-            TextField("What to remember…", text: $addTitle)
+            TextField("What to remember…", text: $draft.title)
                 .textFieldStyle(.plain)
                 .font(.system(size: 13))
                 .foregroundStyle(WT.text)
@@ -243,12 +251,12 @@ struct MenuBarView: View {
                 ForEach([("note", "doc.text", WT.memNote),
                          ("decision", "lightbulb", WT.memDecision),
                          ("feedback", "bubble.left", WT.memFeedback)], id: \.0) { t, icon, c in
-                    Button { addType = t } label: {
+                    Button { draft.type = t } label: {
                         Image(systemName: icon).font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(addType == t ? c : WT.ter)
+                            .foregroundStyle(draft.type == t ? c : WT.ter)
                             .padding(6)
                             .background(RoundedRectangle(cornerRadius: 7)
-                                .fill(addType == t ? c.opacity(0.14) : .clear))
+                                .fill(draft.type == t ? c.opacity(0.14) : .clear))
                     }.buttonStyle(.plain)
                 }
                 Spacer()
@@ -258,7 +266,7 @@ struct MenuBarView: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 14).padding(.vertical, 7)
                 .background(RoundedRectangle(cornerRadius: 8).fill(WT.accent))
-                .opacity(addTitle.trimmingCharacters(in: .whitespaces).isEmpty ? 0.5 : 1)
+                .opacity(draft.title.trimmingCharacters(in: .whitespaces).isEmpty ? 0.5 : 1)
             }
         }
         .padding(12)

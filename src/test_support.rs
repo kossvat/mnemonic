@@ -26,13 +26,46 @@ pub fn temp_path(prefix: &str, file_name: &str) -> InTempDir<PathBuf> {
     InTempDir::new(prefix, |dir| dir.join(file_name))
 }
 
-/// Path for a unix socket in a fresh directory under `/tmp`, removed when the
-/// returned guard is dropped. macOS caps socket paths at 104 bytes, which a
-/// socket under the system temp dir (`/var/folders/...`) can exceed.
+/// Name of the variable a test runner sets to the directory short paths go
+/// under.
+pub const SHORT_ROOT: &str = "MNEMONIC_TEST_SOCKET_DIR";
+
+/// Where a test puts what needs a short path: macOS caps socket paths at 104
+/// bytes, which a socket under the system temp dir (`/var/folders/...`) can
+/// exceed. `/tmp`, unless a runner names a directory of its own. A runner
+/// that names one promised it: a directory that is not there fails the test
+/// instead of sending it back to `/tmp`.
+pub fn short_root() -> PathBuf {
+    let Some(named) = std::env::var_os(SHORT_ROOT) else {
+        return PathBuf::from("/tmp");
+    };
+    let root = PathBuf::from(named);
+    assert!(
+        root.is_absolute() && root.is_dir(),
+        "{SHORT_ROOT} names no directory"
+    );
+    root
+}
+
+/// A fresh directory under [`short_root`], named `<prefix><random>` and known
+/// by its canonical path (`/tmp` is a link on macOS, and a profile is compared
+/// by where it really is). Removed when the returned guard is dropped,
+/// including while a failing test unwinds.
+pub fn short_dir(prefix: &str) -> InTempDir<PathBuf> {
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(short_root())
+        .expect("create short temp dir");
+    let value = dir.path().canonicalize().expect("resolve short temp dir");
+    InTempDir { value, _dir: dir }
+}
+
+/// Path for a unix socket in a fresh directory under [`short_root`], removed
+/// when the returned guard is dropped.
 pub fn temp_socket_path(prefix: &str) -> InTempDir<PathBuf> {
     let dir = tempfile::Builder::new()
         .prefix(prefix)
-        .tempdir_in("/tmp")
+        .tempdir_in(short_root())
         .expect("create socket temp dir");
     let value = dir.path().join("s.sock");
     InTempDir { value, _dir: dir }
@@ -93,6 +126,29 @@ impl crate::embedding::Embedder for ConstEmbedder {
     fn model_id(&self) -> &'static str {
         "const-test"
     }
+}
+
+/// A memory as capture stores a reply of a conversation: the source of
+/// the watcher, the type and the tags of the kind, the first line as the
+/// title. The rules of noise judge such a memory and no other.
+#[cfg(test)]
+pub fn captured(kind: crate::quality::Capture, text: &str) -> crate::event::MemoryEntry {
+    use crate::event::{EventSource, MemoryEntry, MemoryType};
+    let (memory_type, tags) = match kind {
+        crate::quality::Capture::Decision => (MemoryType::Decision, ["decision", "conversation"]),
+        crate::quality::Capture::Correction => (MemoryType::Feedback, ["feedback", "correction"]),
+    };
+    let title: String = text
+        .lines()
+        .next()
+        .unwrap_or(text)
+        .chars()
+        .take(80)
+        .collect();
+    let mut entry = MemoryEntry::new(title, text, memory_type, EventSource::ConversationWatcher);
+    entry.tags = tags.iter().map(|tag| tag.to_string()).collect();
+    entry.importance = 0.7;
+    entry
 }
 
 /// An embedder that keeps every text it is given, for a test to read what
@@ -237,6 +293,30 @@ pub fn legacy_facts_fixture(conn: &rusqlite::Connection) -> LegacyFacts {
     LegacyFacts { rows, current }
 }
 
+/// The rows a query gives, each as its values joined by `|`, with a text
+/// as the text it is: for tests that compare what a table holds, or look
+/// for what it must not hold.
+pub fn rows(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+    use rusqlite::types::ValueRef;
+    let mut stmt = conn.prepare(sql).unwrap();
+    let columns = stmt.column_count();
+    stmt.query_map([], |row| {
+        Ok((0..columns)
+            .map(|at| match row.get_ref(at).unwrap() {
+                ValueRef::Null => "NULL".to_owned(),
+                ValueRef::Integer(n) => n.to_string(),
+                ValueRef::Real(x) => x.to_string(),
+                ValueRef::Text(text) => String::from_utf8_lossy(text).into_owned(),
+                ValueRef::Blob(bytes) => format!("<{} bytes>", bytes.len()),
+            })
+            .collect::<Vec<_>>()
+            .join("|"))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +328,21 @@ mod tests {
         let dir = db.parent().unwrap().to_path_buf();
         assert!(dir.is_dir());
         drop(db);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn short_directory_is_removed_when_the_test_that_made_it_fails() {
+        let seen = std::sync::Mutex::new(None);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dir = short_dir("mn-support-");
+            *seen.lock().unwrap() = Some(dir.to_path_buf());
+            assert!(dir.is_dir());
+            panic!("the test failed");
+        }));
+        assert!(outcome.is_err());
+        let dir = seen.lock().unwrap().take().unwrap();
+        assert!(dir.starts_with(short_root().canonicalize().unwrap()));
         assert!(!dir.exists());
     }
 }

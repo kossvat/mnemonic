@@ -269,6 +269,132 @@ impl<S: FolderState> RecordScope for FileScope<S> {
     }
 }
 
+/// Whether the `session_meta` record in `line` names a Codex session a
+/// program ran: `codex exec` and `codex review` (originator `codex_exec`,
+/// source `exec`) and a subagent a session spawned (a source naming a
+/// subagent). `None` for any other record.
+pub fn codex_session_is_automated(line: &str) -> Option<bool> {
+    // Cheap reject before parsing: almost every line is a message.
+    if !line.contains("session_meta") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("type")?.as_str()? != "session_meta" {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    let source = payload.get("source");
+    Some(
+        payload.get("originator").and_then(|v| v.as_str()) == Some("codex_exec")
+            || source.and_then(|v| v.as_str()) == Some("exec")
+            || source.is_some_and(|v| v.get("subagent").is_some()),
+    )
+}
+
+/// The longest first record read to learn whether a rollout is automated.
+/// A `session_meta` carries the base instructions and runs to tens of
+/// kilobytes; a longer first record is taken as saying nothing.
+const FIRST_RECORD_CAP: u64 = 1 << 20;
+
+/// Refuses the turns of a Codex session a program ran. The leading
+/// `session_meta` says so; a rollout without one is taken as before. The
+/// answer is carried per file and generation, and a file first seen past
+/// its start is asked from its first record, read from the descriptor the
+/// records come from.
+#[derive(Debug, Default)]
+pub struct CodexOrigin {
+    committed: HashMap<PathBuf, (u64, bool)>,
+    automated: bool,
+}
+
+impl CodexOrigin {
+    /// Start a transcript from its first byte, as history reads each one.
+    pub fn reset(&mut self) {
+        self.automated = false;
+    }
+}
+
+fn first_record_is_automated(file: &mut (impl Read + Seek)) -> std::io::Result<bool> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut record = Vec::new();
+    BufReader::new(file.take(FIRST_RECORD_CAP)).read_until(b'\n', &mut record)?;
+    Ok(std::str::from_utf8(&record)
+        .ok()
+        .and_then(|line| codex_session_is_automated(line.trim_end_matches('\n')))
+        .unwrap_or(false))
+}
+
+impl RecordScope for CodexOrigin {
+    fn begin(
+        &mut self,
+        file: &mut std::fs::File,
+        path: &Path,
+        generation: u64,
+        offset: u64,
+    ) -> Result<()> {
+        self.automated = match self.committed.get(path) {
+            Some((g, automated)) if *g == generation => *automated,
+            _ if offset == 0 => false,
+            _ => first_record_is_automated(file)?,
+        };
+        Ok(())
+    }
+    fn admit(&mut self, line: &str) -> bool {
+        if let Some(automated) = codex_session_is_automated(line) {
+            self.automated = automated;
+        }
+        !self.automated
+    }
+    fn commit(&mut self, path: &Path, generation: u64, _next_offset: u64) {
+        self.committed
+            .insert(path.to_path_buf(), (generation, self.automated));
+    }
+}
+
+/// What the Codex watcher admits: a turn of a session the owner drives,
+/// and, when the scope is restricted, inside the project roots. Both see
+/// every record, so each keeps its state.
+pub struct CodexSession {
+    origin: CodexOrigin,
+    folder: Option<CodexScope>,
+}
+
+impl CodexSession {
+    pub fn new(scope: ProjectScope) -> Self {
+        Self {
+            origin: CodexOrigin::default(),
+            folder: scope.is_restricted().then(|| CodexScope::new(scope)),
+        }
+    }
+}
+
+impl RecordScope for CodexSession {
+    fn begin(
+        &mut self,
+        file: &mut std::fs::File,
+        path: &Path,
+        generation: u64,
+        offset: u64,
+    ) -> Result<()> {
+        self.origin.begin(file, path, generation, offset)?;
+        if let Some(folder) = self.folder.as_mut() {
+            folder.begin(file, path, generation, offset)?;
+        }
+        Ok(())
+    }
+    fn admit(&mut self, line: &str) -> bool {
+        let from_owner = self.origin.admit(line);
+        let in_scope = self.folder.as_mut().is_none_or(|folder| folder.admit(line));
+        from_owner && in_scope
+    }
+    fn commit(&mut self, path: &Path, generation: u64, next_offset: u64) {
+        self.origin.commit(path, generation, next_offset);
+        if let Some(folder) = self.folder.as_mut() {
+            folder.commit(path, generation, next_offset);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,8 +465,8 @@ mod tests {
 
     #[test]
     fn replaying_a_prefix_gives_the_folder_in_force_at_that_byte() {
-        let dir = std::env::temp_dir().join(format!("mn-scope-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = crate::test_support::temp_dir("mn-scope-");
+        let dir = scratch.path();
         let head = "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/code/demoapp\"}}\n";
         let done = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
         let moved = "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/code/private\"}}\n";
@@ -358,7 +484,6 @@ mod tests {
             at(head.len() + done.len() + moved.len()).current(),
             Some(Path::new("/code/private"))
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

@@ -1,0 +1,95 @@
+{
+  "key": "harbor",
+  "name": "Harbor",
+  "state": "active",
+  "plan": {
+    "units": [
+      {
+        "id": "delivery",
+        "title": "First delivery",
+        "done": 3,
+        "total": 5,
+        "stage": "building",
+        "stale": false,
+        "current_task": {
+          "id": "T04",
+          "title": "Review the recorded result",
+          "source": "registry"
+        },
+        "counts": {
+          "done": 3,
+          "building": 1,
+          "planned": 1
+        },
+        "waiting_on_owner": [],
+        "weekly_count": 0,
+        "gate": {
+          "status": "passed",
+          "at": 1799913600,
+          "failed_runs": 0
+        },
+        "provider": "registry",
+        "checkouts": 1,
+        "as_of": 1800000000,
+        "tasks": [
+          {
+            "id": "T01",
+            "title": "Record the initial plan",
+            "status": "done",
+            "owner": null
+          },
+          {
+            "id": "T02",
+            "title": "Build the local cache",
+            "status": "done",
+            "owner": null
+          },
+          {
+            "id": "T03",
+            "title": "Check the response shape",
+            "status": "done",
+            "owner": null
+          },
+          {
+            "id": "T04",
+            "title": "Review the recorded result",
+            "status": "building",
+            "owner": null
+          },
+          {
+            "id": "T05",
+            "title": "Prepare the next revision",
+            "status": "planned",
+            "owner": null
+          }
+        ],
+        "error": null
+      }
+    ],
+    "message": null
+  },
+  "sessions": [],
+  "gate_detail": {
+    "delivery": {
+      "dirty": false,
+      "commits_since": 0
+    }
+  },
+  "time": [],
+  "owner_estimate": true,
+  "history": [],
+  "top_terms": [
+    {
+      "name": "Local cache",
+      "memory_count": 6
+    },
+    {
+      "name": "Response contract",
+      "memory_count": 4
+    },
+    {
+      "name": "Release review",
+      "memory_count": 3
+    }
+  ]
+}

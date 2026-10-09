@@ -24,12 +24,29 @@ use crate::watcher::scope::ProjectScope;
 /// clean text into a credential shape (`password=f(` loses the `(` that
 /// made it code). Prepare its result again, keeping the summary admission
 /// wrote, before it is embedded, scored or written.
-fn prepare_classified(entry: crate::event::MemoryEntry) -> Option<crate::event::MemoryEntry> {
+pub(crate) fn prepare_classified(
+    entry: crate::event::MemoryEntry,
+) -> Option<crate::event::MemoryEntry> {
     match crate::redaction::reprepare_entry(entry, crate::redaction::STRUCTURAL_KEYS) {
         Ok(prepared) => Some(prepared.into_entry()),
         Err(code) => {
             warn!("classified memory refused ({})", code.code());
             None
+        }
+    }
+}
+
+/// Hand a stored entry to every sink. A capture that the rules name as
+/// noise is stored and reaches no sink: the files the sinks write are
+/// what an agent reads, and a row of a table is not a memory to it.
+fn write_to_sinks(sinks: &[Box<dyn OutputSink>], entry: &crate::event::MemoryEntry) {
+    if let Some(rule) = crate::quality::judge(entry) {
+        info!("noise ({}), no sink: {}", rule.as_str(), entry.title);
+        return;
+    }
+    for sink in sinks {
+        if let Err(e) = sink.write(entry) {
+            warn!("Sink {} error: {e}", sink.name());
         }
     }
 }
@@ -60,6 +77,10 @@ impl Daemon {
 
         // Storage (shared with API server)
         let storage = Arc::new(Storage::open(&self.config.storage.db_path)?);
+        // Nothing of this daemon writes to a store an earlier daemon could
+        // still open: that one would undo what this one writes (design 8.1
+        // of live-projects).
+        storage.require_current_generation()?;
         info!("Storage ready: {} memories", storage.count()?);
 
         // Classifier
@@ -102,7 +123,8 @@ impl Daemon {
                         Box::new(backend),
                         storage.clone(),
                         &self.config.llm,
-                    );
+                    )
+                    .with_project_registry(self.config.projects.workspace.is_some());
                     info!(
                         "Graph extractor: composite (rule-based + LLM via {} {})",
                         self.config.llm.endpoint, self.config.llm.model
@@ -252,6 +274,35 @@ impl Daemon {
             });
         }
 
+        // The projects in work now (design 11 of live-projects): kept in
+        // memory, rebuilt at a start from the checkpoints of the sessions
+        // that had a record lately, told by the passes and workers below,
+        // and served as one snapshot. A failure here costs the live view
+        // and nothing else.
+        let live = match self.config.storage.db_path.parent() {
+            Some(home) => match crate::live_run::Live::of_profile(home) {
+                Ok(live) => {
+                    live.configure_plans(storage.clone(), self.config.projects.clone());
+                    if let Err(e) = live.configure_graph(storage.clone(), &self.config) {
+                        warn!("Graph: initial projection unavailable: {e}");
+                    }
+                    match live.rebuild(&storage, chrono::Utc::now()) {
+                        Ok(found) => info!("Live: {found} session(s) from before this start"),
+                        Err(e) => warn!("Live: the sessions were not rebuilt: {e}"),
+                    }
+                    live.clone()
+                        .spawn(Arc::new(crate::owner_time_day::LocalCalendar));
+                    live.started();
+                    Some(live)
+                }
+                Err(e) => {
+                    warn!("Live: off for this run: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+
         // Work-activity sampler. Reads system idle time on a tick and
         // accumulates accurate daily "time worked" into a separate
         // activity.db (never touches memory.db). Disabled via
@@ -264,6 +315,11 @@ impl Daemon {
             ) {
                 Ok(store) => {
                     let activity_store = std::sync::Arc::new(store);
+                    if let Some(live) = &live
+                        && let Err(e) = live.attach_graph_activity(activity_store.clone())
+                    {
+                        warn!("Graph: owner hours unavailable: {e}");
+                    }
                     crate::activity_worker::spawn_worker(
                         activity_store.clone(),
                         self.config.activity.clone(),
@@ -272,12 +328,23 @@ impl Daemon {
                     // memory graph to assign hours per project. Shares the same
                     // ActivityStore + the memory Storage. Backfills 14 days on
                     // startup, recomputes today every 10 min.
-                    crate::attribution_worker::spawn_worker(
-                        activity_store,
-                        storage.clone(),
-                        600,
-                        14,
-                    );
+                    if self.config.projects.root().is_some() {
+                        // With a workspace the owner's time goes to the
+                        // projects live in it (design 8 of live-projects).
+                        crate::attribution_worker::spawn_live_worker(
+                            activity_store,
+                            storage.clone(),
+                            600,
+                            live.clone(),
+                        );
+                    } else {
+                        crate::attribution_worker::spawn_worker(
+                            activity_store,
+                            storage.clone(),
+                            600,
+                            14,
+                        );
+                    }
                 }
                 Err(e) => warn!("Activity store open failed, sampler off this run: {e}"),
             }
@@ -333,21 +400,58 @@ impl Daemon {
         // when the same key emits a LATER event; sessions whose key never
         // fires again (daemon restart, one-off conversations) stayed open
         // forever, starving everything that consumes CLOSED sessions
-        // (dream consolidation, session summaries). First tick fires
-        // immediately, so sessions orphaned by a previous run are closed
-        // right at startup.
+        // (dream consolidation, session summaries).
+        //
+        // A session follows the records of its transcript, which the
+        // watchers read. So the sweep waits for them: its first pass comes
+        // one interval after the start, when the watchers have read what
+        // was written while the daemon was down, and it closes a session
+        // only once it has been quiet for the idle time and a grace on top,
+        // time for a record written just inside the idle time to be read
+        // and walked. Sessions orphaned by a previous run are closed at
+        // that first pass.
         {
             let sweep_storage = storage.clone();
             let idle_secs = self.config.sessions.idle_timeout_secs;
             tokio::spawn(async move {
-                let mut iv = tokio::time::interval(std::time::Duration::from_secs(300));
+                let every = std::time::Duration::from_secs(SESSION_SWEEP_SECS);
+                let mut iv = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
                 loop {
                     iv.tick().await;
-                    match sweep_storage.close_idle_sessions(idle_secs) {
+                    match sweep_storage.close_idle_sessions(idle_secs, SESSION_CLOSE_GRACE_SECS) {
                         Ok(0) => {}
                         Ok(n) => info!("Session sweep: closed {n} idle sessions"),
                         Err(e) => warn!("Session sweep failed: {e}"),
                     }
+                }
+            });
+        }
+
+        // The registry of projects follows the folders of the workspace
+        // (design 6 of live-projects): at start and every ten minutes.
+        // Without a workspace in the configuration nothing is discovered.
+        let projects = crate::projects::SharedMap::default();
+        crate::projects::spawn_worker(
+            storage.clone(),
+            self.config.projects.clone(),
+            600,
+            projects.clone(),
+            live.clone(),
+        );
+
+        // The model leaves memory after an idle time (design 5.2 of
+        // live-projects); the next save or search loads it again.
+        let idle = self.config.daemon.model_idle_release_secs;
+        if idle > 0 {
+            let emb = embedder.clone();
+            let idle = std::time::Duration::from_secs(idle);
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    every.tick().await;
+                    let emb = emb.clone();
+                    // Dropping a model frees a gigabyte: off the runtime.
+                    let _ = tokio::task::spawn_blocking(move || emb.release_if_idle(idle)).await;
                 }
             });
         }
@@ -373,8 +477,9 @@ impl Daemon {
             let cfg = self.config.clone();
             let st = storage.clone();
             let emb = embedder.clone();
+            let served = live.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::http::serve(cfg, st, emb).await {
+                if let Err(e) = crate::http::serve(cfg, st, emb, served).await {
                     error!("Dashboard HTTP server error: {e}");
                 }
             });
@@ -409,7 +514,15 @@ impl Daemon {
                 // Adopt legacy JSON offsets once; subsequent checkpoints live
                 // in the same SQLite transaction as the accepted transcript.
                 let mut conv_watcher = ConversationWatcher::new(sessions_dir.clone())
-                    .with_scope(ProjectScope::new(&self.config.watchers.project_roots));
+                    .with_scope(ProjectScope::new(&self.config.watchers.project_roots))
+                    .with_session_idle(self.config.sessions.idle_timeout_secs);
+                // Without a workspace there is no registry to wait for.
+                if self.config.projects.root().is_some() {
+                    conv_watcher = conv_watcher.with_projects(projects.clone());
+                }
+                if let Some(live) = &live {
+                    conv_watcher = conv_watcher.with_live(live.clone());
+                }
                 if let Some(dir) = self.config.storage.db_path.parent() {
                     conv_watcher = conv_watcher.with_state_path(dir.join("watcher_offsets.json"));
                 }
@@ -436,7 +549,14 @@ impl Daemon {
         if let Some(codex_sessions_dir) = transcripts.codex {
             if codex_sessions_dir.exists() {
                 let mut codex_watcher = CodexWatcher::new(codex_sessions_dir.clone())
-                    .with_scope(ProjectScope::new(&self.config.watchers.project_roots));
+                    .with_scope(ProjectScope::new(&self.config.watchers.project_roots))
+                    .with_session_idle(self.config.sessions.idle_timeout_secs);
+                if self.config.projects.root().is_some() {
+                    codex_watcher = codex_watcher.with_projects(projects.clone());
+                }
+                if let Some(live) = &live {
+                    codex_watcher = codex_watcher.with_live(live.clone());
+                }
                 if let Some(archived) = transcripts.codex_archive {
                     codex_watcher = codex_watcher.with_archived_dir(archived);
                 }
@@ -458,6 +578,34 @@ impl Daemon {
                     codex_sessions_dir.display()
                 );
             }
+        }
+
+        // The Records page ranks stretches of work, which the watchers
+        // keep from now on. The transcripts that were there before are
+        // read once, off the event loop: until that is done the page shows
+        // what has been written since.
+        {
+            let storage = storage.clone();
+            let config = self.config.clone();
+            tokio::task::spawn_blocking(move || match storage.work_stretches_backfilled() {
+                Ok(true) => {}
+                Ok(false) => {
+                    match crate::watcher::history::backfill_work_stretches(&storage, &config) {
+                        Ok((transcripts, stretches)) => {
+                            info!(
+                                "Stretches of work: {stretches} in {transcripts} earlier transcripts"
+                            );
+                            if let Err(e) =
+                                storage.mark_work_stretches_backfilled(chrono::Utc::now())
+                            {
+                                warn!("Stretches of work: the mark was not kept: {e}");
+                            }
+                        }
+                        Err(e) => warn!("Stretches of work: earlier transcripts not read: {e}"),
+                    }
+                }
+                Err(e) => warn!("Stretches of work: {e}"),
+            });
         }
 
         info!("mnemonic daemon running. Watching for events...");
@@ -543,6 +691,12 @@ impl Daemon {
                     if !batch.is_empty() {
                         self.process_batch(&batch, &classifier, &storage, &sinks, &*embedder, dedup_threshold, &scorer, importance_threshold, &*graph_extractor, async_extraction, attributor.as_ref(), session_tracker.as_ref());
                         batch.clear();
+                    }
+                    // The memories of the store as they are now, whoever
+                    // saved them: a count that differs is a change of the
+                    // live snapshot, and a closed client is told.
+                    if let Some(live) = &live {
+                        live.count_memories(&storage);
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -643,11 +797,7 @@ impl Daemon {
                 warn!("Graph save error: {e}");
             }
         }
-        for sink in sinks {
-            if let Err(e) = sink.write(&entry) {
-                warn!("Sink {} error: {e}", sink.name());
-            }
-        }
+        write_to_sinks(sinks, &entry);
         info!("URGENT saved: {} [{}]", entry.title, entry.memory_type);
     }
 
@@ -837,11 +987,7 @@ impl Daemon {
                             warn!("Graph save error: {e}");
                         }
                     }
-                    for sink in sinks {
-                        if let Err(e) = sink.write(&entry) {
-                            warn!("Sink {} error: {e}", sink.name());
-                        }
-                    }
+                    write_to_sinks(sinks, &entry);
                     saved += 1;
                 }
                 None => {
@@ -1407,6 +1553,13 @@ impl PeerAttributor {
         }
     }
 }
+
+/// How often the daemon looks for sessions to close.
+const SESSION_SWEEP_SECS: u64 = 300;
+/// How much longer than the idle time a session must be quiet before the
+/// sweep closes it. The watchers poll every ten seconds; a minute covers a
+/// record written just inside the idle time and not read yet.
+const SESSION_CLOSE_GRACE_SECS: u64 = 60;
 
 /// Tracks the active session per JSONL file path so all memories from
 /// one continuous chat window share the same `session_id`. Sessions

@@ -1,0 +1,142 @@
+{
+  "nodes": [
+    {
+      "id": "memory-0",
+      "title": "Keep the cache local",
+      "memory_type": "decision",
+      "timestamp": "2026-09-29T10:00:00Z",
+      "importance": 0.6,
+      "entity_count": 5,
+      "content_preview": "A synthetic memory describing the implementation and its review."
+    },
+    {
+      "id": "memory-1",
+      "title": "Verify the response contract",
+      "memory_type": "note",
+      "timestamp": "2026-09-29T10:00:00Z",
+      "importance": 0.6,
+      "entity_count": 4,
+      "content_preview": "A synthetic memory describing the implementation and its review."
+    },
+    {
+      "id": "memory-2",
+      "title": "Record the first delivery",
+      "memory_type": "session_summary",
+      "timestamp": "2026-09-29T10:00:00Z",
+      "importance": 0.6,
+      "entity_count": 3,
+      "content_preview": "A synthetic memory describing the implementation and its review."
+    },
+    {
+      "id": "memory-3",
+      "title": "Review the stored evidence",
+      "memory_type": "feedback",
+      "timestamp": "2026-09-29T10:00:00Z",
+      "importance": 0.6,
+      "entity_count": 2,
+      "content_preview": "A synthetic memory describing the implementation and its review."
+    },
+    {
+      "id": "memory-4",
+      "title": "Preserve project positions",
+      "memory_type": "decision",
+      "timestamp": "2026-09-29T10:00:00Z",
+      "importance": 0.6,
+      "entity_count": 4,
+      "content_preview": "A synthetic memory describing the implementation and its review."
+    },
+    {
+      "id": "memory-5",
+      "title": "Keep unknown hours visible",
+      "memory_type": "note",
+      "timestamp": "2026-09-29T10:00:00Z",
+      "importance": 0.6,
+      "entity_count": 2,
+      "content_preview": "A synthetic memory describing the implementation and its review."
+    },
+    {
+      "id": "memory-6",
+      "title": "Prepare the next revision",
+      "memory_type": "note",
+      "timestamp": "2026-09-29T10:00:00Z",
+      "importance": 0.6,
+      "entity_count": 1,
+      "content_preview": "A synthetic memory describing the implementation and its review."
+    },
+    {
+      "id": "memory-7",
+      "title": "Check the access boundary",
+      "memory_type": "security",
+      "timestamp": "2026-09-29T10:00:00Z",
+      "importance": 0.6,
+      "entity_count": 3,
+      "content_preview": "A synthetic memory describing the implementation and its review."
+    }
+  ],
+  "edges": [
+    {
+      "source": "memory-0",
+      "target": "memory-1",
+      "weight": 3,
+      "shared": [
+        "Harbor"
+      ]
+    },
+    {
+      "source": "memory-0",
+      "target": "memory-4",
+      "weight": 2,
+      "shared": [
+        "Harbor"
+      ]
+    },
+    {
+      "source": "memory-1",
+      "target": "memory-2",
+      "weight": 1,
+      "shared": [
+        "Harbor"
+      ]
+    },
+    {
+      "source": "memory-2",
+      "target": "memory-3",
+      "weight": 2,
+      "shared": [
+        "Harbor"
+      ]
+    },
+    {
+      "source": "memory-3",
+      "target": "memory-5",
+      "weight": 1,
+      "shared": [
+        "Harbor"
+      ]
+    },
+    {
+      "source": "memory-4",
+      "target": "memory-5",
+      "weight": 2,
+      "shared": [
+        "Harbor"
+      ]
+    },
+    {
+      "source": "memory-5",
+      "target": "memory-6",
+      "weight": 1,
+      "shared": [
+        "Harbor"
+      ]
+    },
+    {
+      "source": "memory-0",
+      "target": "memory-7",
+      "weight": 2,
+      "shared": [
+        "Harbor"
+      ]
+    }
+  ]
+}

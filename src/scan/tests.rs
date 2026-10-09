@@ -1,6 +1,9 @@
 //! The scanner against synthetic snapshots: what it reports, what it
 //! refuses, and that it changes nothing. Credential fixtures are
 //! assembled at run time; assertions never print them.
+#[path = "curated_graph_tests.rs"]
+mod curated_graph_tests;
+
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, params};
@@ -27,7 +30,7 @@ impl Fixture {
     fn new() -> Self {
         let dir = tempfile::Builder::new()
             .prefix("mn-scan-")
-            .tempdir_in("/tmp")
+            .tempdir_in(crate::test_support::short_root())
             .unwrap();
         std::fs::create_dir(dir.path().join("live")).unwrap();
         Self {
@@ -126,7 +129,10 @@ fn redaction_scan_of_a_clean_snapshot_is_complete_and_finds_nothing() {
     assert!(report.complete && report.reasons.is_empty());
     assert!(report.exit_code() == 0 && report.findings.is_empty());
     assert!(report.policy_version == crate::redaction::POLICY_VERSION);
-    assert!(report.store == Some("private") && report.schema_version == Some(2));
+    assert!(
+        report.store == Some("private")
+            && report.schema_version == Some(crate::storage::versioning::MEMORY_SCHEMA_GENERATION)
+    );
     let memories = report
         .coverage
         .tables

@@ -38,11 +38,14 @@ const MAX_KEY_FACTS: usize = 5;
 
 /// A rendered digest plus the memory ids it cites — the caller (whisper)
 /// uses the ids to avoid re-listing the same decisions in other sections.
+/// The memories of the project the digest left out as noise are reported
+/// with it.
 #[derive(Debug, Clone)]
 pub struct ProjectDigest {
     pub project: String,
     pub markdown: String,
     pub source_ids: Vec<String>,
+    pub hidden: Vec<crate::quality::Hidden>,
 }
 
 /// Build the state digest for one project, or None when the project is
@@ -57,15 +60,36 @@ pub fn build_project_digest(
         .into_iter()
         .filter(|r| !is_noise_title(&r.entry.title))
         .collect();
+    // The pool keeps its members and its conflicts. What is shown is
+    // chosen from the clean part of it: a capture the rules name as noise
+    // is left out of every section and reported.
+    let mut hidden: Vec<crate::quality::Hidden> = Vec::new();
+    let noise_of: std::collections::HashMap<&str, crate::quality::Noise> = pool
+        .iter()
+        .filter_map(|r| crate::quality::judge(&r.entry).map(|rule| (r.entry.id.as_str(), rule)))
+        .collect();
+    for r in &pool {
+        if let Some(rule) = noise_of.get(r.entry.id.as_str()) {
+            hidden.push(crate::quality::Hidden::of(
+                &r.entry,
+                crate::quality::HiddenReason::Noise(*rule),
+            ));
+        }
+    }
+    let clean: Vec<RankedEntry> = pool
+        .iter()
+        .filter(|r| !noise_of.contains_key(r.entry.id.as_str()))
+        .cloned()
+        .collect();
     // Authoritative open follow-ups are fetched up front: a project whose
     // confirmed work was recorded through the CLI/MCP has no source memory,
     // so it may sit below the memory noise floor and must still get a page
     // (review point). The floor keeps guarding against extractor noise for
-    // projects that have nothing confirmed.
+    // projects that have nothing confirmed. It counts the clean memories.
     let open = crate::followups::open_for_project(storage, project_name, MAX_FOLLOWUPS)?;
     // Stated facts are authoritative too: they carry a project page alone.
     let key_facts = crate::facts::digest::key_facts(storage, project_name, now, MAX_KEY_FACTS)?;
-    if pool.len() < MIN_PROJECT_MEMS && open.is_empty() && key_facts.is_empty() {
+    if clean.len() < MIN_PROJECT_MEMS && open.is_empty() && key_facts.is_empty() {
         return Ok(None);
     }
 
@@ -125,7 +149,7 @@ pub fn build_project_digest(
     for (old, new) in &confirmed {
         old_to_new.entry(old.clone()).or_default().push(new.clone());
     }
-    let mut forced: Vec<&RankedEntry> = pool
+    let terminals_in_pool: Vec<&RankedEntry> = pool
         .iter()
         .filter(|r| {
             r.entry.memory_type == MemoryType::Decision
@@ -133,11 +157,27 @@ pub fn build_project_digest(
                 && !old_to_new.contains_key(r.entry.id.as_str())
         })
         .collect();
+    // A terminal that is noise is never rendered and suppresses its old
+    // decision all the same, whether or not it would have made the cut.
+    let noisy_terminals: std::collections::HashSet<&str> = terminals_in_pool
+        .iter()
+        .filter(|r| noise_of.contains_key(r.entry.id.as_str()))
+        .map(|r| r.entry.id.as_str())
+        .collect();
+    let mut forced: Vec<&RankedEntry> = terminals_in_pool
+        .iter()
+        .filter(|r| !noise_of.contains_key(r.entry.id.as_str()))
+        .copied()
+        .collect();
     forced.sort_by(by_effective);
     forced.truncate(MAX_STANDING_DECISIONS);
-    // Only pairs whose (chain-terminal) replacement made the cut suppress.
-    let shown_new: std::collections::HashSet<&str> =
-        forced.iter().map(|r| r.entry.id.as_str()).collect();
+    // Only pairs whose (chain-terminal) replacement made the cut, or is
+    // noise, suppress.
+    let shown_new: std::collections::HashSet<&str> = forced
+        .iter()
+        .map(|r| r.entry.id.as_str())
+        .chain(noisy_terminals.iter().copied())
+        .collect();
     let reversed_old: std::collections::HashSet<&str> = pool
         .iter()
         .filter(|r| r.entry.memory_type == MemoryType::Decision)
@@ -148,8 +188,38 @@ pub fn build_project_digest(
                 .any(|t| shown_new.contains(t))
         })
         .collect();
+    // A forced replacement that is noise is not rendered, and the decision
+    // it replaced stays hidden all the same: the conflict holds whatever
+    // the text of the newer decision. Such a decision is reported as
+    // replaced-by-noise, with the replacement.
+    for r in &pool {
+        if r.entry.memory_type != MemoryType::Decision
+            || !reversed_old.contains(r.entry.id.as_str())
+            || noise_of.contains_key(r.entry.id.as_str())
+        {
+            continue;
+        }
+        let terminals = chain_terminals(&old_to_new, &r.entry.id);
+        let rendered = terminals
+            .iter()
+            .any(|t| shown_new.contains(t) && !noise_of.contains_key(t));
+        if rendered {
+            continue;
+        }
+        if let Some(replacement) = terminals
+            .iter()
+            .find(|t| shown_new.contains(*t) && noise_of.contains_key(*t))
+        {
+            hidden.push(crate::quality::Hidden::of(
+                &r.entry,
+                crate::quality::HiddenReason::ReplacedByNoise {
+                    replacement: (*replacement).to_string(),
+                },
+            ));
+        }
+    }
     let standing: Vec<&RankedEntry> = {
-        let mut rest: Vec<&RankedEntry> = pool
+        let mut rest: Vec<&RankedEntry> = clean
             .iter()
             .filter(|r| {
                 r.entry.memory_type == MemoryType::Decision
@@ -195,7 +265,7 @@ pub fn build_project_digest(
     }
 
     // Corrections / gotchas — the user's "no, do it this way" signals.
-    let corrections = top_by_effective(&pool, MemoryType::Feedback, MAX_CORRECTIONS, now);
+    let corrections = top_by_effective(&clean, MemoryType::Feedback, MAX_CORRECTIONS, now);
     if !corrections.is_empty() {
         lines.push("Corrections (do not repeat):".into());
         for r in &corrections {
@@ -250,7 +320,7 @@ pub fn build_project_digest(
     // Latest activity — the freshest few titles regardless of type, skipping
     // anything already shown above and anything the lint reversed (a dead
     // decision is history, not current state).
-    let recent: Vec<&RankedEntry> = pool
+    let recent: Vec<&RankedEntry> = clean
         .iter()
         .filter(|r| {
             !source_ids.iter().any(|id| id == &r.entry.id)
@@ -277,6 +347,7 @@ pub fn build_project_digest(
         project: project_name.to_string(),
         markdown: lines.join("\n"),
         source_ids,
+        hidden,
     }))
 }
 

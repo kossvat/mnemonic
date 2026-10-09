@@ -5,6 +5,10 @@ local coding agents (Claude Code, Codex, Hermes, Claude Desktop) to ONE
 project's memory. Follow the steps in order. Stop and ask the human when a step
 says so. Do not improvise paths: every path below must be absolute.
 
+This runbook is for one project kept apart. For one person who works on
+several projects and wants live projects, time by project and plans over all
+of them, follow [agent-setup-workspace.md](agent-setup-workspace.md) instead.
+
 ## What you are building
 
 - One **isolated profile**: a directory that holds this project's config,

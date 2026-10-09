@@ -287,9 +287,8 @@ fn a_rewritten_codex_transcript_starts_from_its_new_header() {
 
 #[test]
 fn an_uncommitted_poll_does_not_move_the_folder_forward() {
-    let dir =
-        std::env::temp_dir().join(format!("mn-uncommitted-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = crate::test_support::temp_dir("mn-uncommitted-");
+    let dir = scratch.path();
     let path = dir.join("rollout.jsonl");
     std::fs::write(&path, "").unwrap();
     let mut file = std::fs::File::open(&path).unwrap();
@@ -307,13 +306,12 @@ fn an_uncommitted_poll_does_not_move_the_folder_forward() {
     // The retry starts where the cursor still is, in DemoApp.
     scope.begin(&mut file, &path, 0, 100).unwrap();
     assert!(scope.admit(&codex_user("u1", "x")));
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn a_replay_reads_the_file_being_polled_not_what_the_path_names_now() {
-    let dir = std::env::temp_dir().join(format!("mn-replaced-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = crate::test_support::temp_dir("mn-replaced-");
+    let dir = scratch.path();
     let path = dir.join("rollout.jsonl");
     // Longer than the replacement's header, so a replay of the replacement
     // would read that header whole and wrongly find the project.
@@ -338,7 +336,6 @@ fn a_replay_reads_the_file_being_polled_not_what_the_path_names_now() {
         !scope.admit(&codex_user("u1", "x")),
         "the records come from the private rollout, so must its folder"
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 fn started() -> String {
@@ -410,7 +407,13 @@ fn the_production_tick_applies_the_scope() {
     // Sessions created after startup: the tick reads them from the top.
     let files = vec![f.dir.join("inside.jsonl"), f.dir.join("outside.jsonl")];
     reader
-        .tick_scoped(&files, &Map::new(), ConversationWatcher::parse_turn, None)
+        .tick_scoped(
+            &files,
+            &Map::new(),
+            ConversationWatcher::parse_turn,
+            None,
+            false,
+        )
         .unwrap();
     append(
         &files[0],
@@ -434,6 +437,7 @@ fn the_production_tick_applies_the_scope() {
             &Map::new(),
             ConversationWatcher::parse_turn,
             Some(&mut scope),
+            false,
         )
         .unwrap();
     assert_eq!(captured, 1);

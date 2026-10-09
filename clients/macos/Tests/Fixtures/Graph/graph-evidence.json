@@ -1,0 +1,25 @@
+[
+  {
+    "id": "cache-decision",
+    "title": "Keep the cache local",
+    "content": "The project keeps its cache beside the local service. A stable response allows the graph to reuse the same positions while the recorded activity changes. The review confirmed that unknown hours stay unavailable rather than becoming zero.",
+    "timestamp": "2026-09-29T10:00:00Z",
+    "memory_type": "decision",
+    "tags": [
+      "cache",
+      "review"
+    ],
+    "importance": 0.8
+  },
+  {
+    "id": "response-note",
+    "title": "Verify the response contract",
+    "content": "The fixture links the project to the technology used in the implementation. This note records the supporting work and the review of its response fields.",
+    "timestamp": "2026-09-29T11:00:00Z",
+    "memory_type": "note",
+    "tags": [
+      "contract"
+    ],
+    "importance": 0.6
+  }
+]

@@ -468,9 +468,8 @@ fn a_pending_draft_is_invisible_to_every_agent_of_both_people() {
 
 #[test]
 fn serve_refuses_a_policy_for_another_project_on_a_pinned_database() {
-    let dir = std::env::temp_dir().join(format!("mnemonic-shared-pin-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&dir).unwrap();
-    let store = SharedStore::open(&dir.join("shared.db")).unwrap();
+    let dir = crate::test_support::temp_dir("mnemonic-shared-pin-");
+    let store = SharedStore::open(&dir.path().join("shared.db")).unwrap();
     store.pin_project("alpha").unwrap();
     let mut typo = policy_v2("ann", "ann-claude", false);
     typo.project_id = "alpah".into();
@@ -481,7 +480,6 @@ fn serve_refuses_a_policy_for_another_project_on_a_pinned_database() {
             .is_err()
     );
     assert!(output.is_empty());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A sensitive observation is refused with the fixed code and nothing of

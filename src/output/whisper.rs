@@ -3,6 +3,7 @@ use chrono::Utc;
 use std::path::PathBuf;
 
 use crate::embedding::create_embedder;
+use crate::quality::{self, Hidden, HiddenReason};
 use crate::storage::{RankedEntry, Storage};
 
 /// Hard ceiling for the generated context, enforced mechanically (design
@@ -38,6 +39,139 @@ impl Budget {
     }
 }
 
+/// What composing a context gave: the text, the memories it shows in the
+/// order they stand, each with its section, and the memories it left out
+/// with the reason for each.
+#[derive(Debug, Clone)]
+pub struct Composed {
+    pub text: String,
+    pub shown: Vec<Shown>,
+    pub hidden: Vec<Hidden>,
+}
+
+/// A memory the context shows, and the section it stands in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shown {
+    pub id: String,
+    pub section: &'static str,
+}
+
+impl Composed {
+    /// What is to be recorded of this composition: the memories shown, in
+    /// order, with their sections; the characters of the text; the
+    /// memories left out.
+    pub fn record(
+        &self,
+        surface: crate::recall_log::Surface,
+        tool: crate::recall_log::Tool,
+    ) -> crate::recall_log::Record {
+        crate::recall_log::Record {
+            surface,
+            tool,
+            items: self
+                .shown
+                .iter()
+                .map(|shown| crate::recall_log::Item {
+                    memory_id: shown.id.clone(),
+                    section: crate::recall_log::Section::of(shown.section),
+                })
+                .collect(),
+            chars: self.text.chars().count(),
+            hidden: self.hidden.len(),
+        }
+    }
+}
+
+/// What a composition gathers as it goes: a memory is reported once,
+/// with the first reason it was left out for.
+#[derive(Default)]
+struct Report {
+    shown: Vec<Shown>,
+    hidden: Vec<Hidden>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl Report {
+    fn show(&mut self, id: &str, section: &'static str) {
+        self.shown.push(Shown {
+            id: id.to_string(),
+            section,
+        });
+    }
+
+    fn hide(&mut self, entry: &crate::event::MemoryEntry, reason: HiddenReason) {
+        if self.seen.insert(entry.id.clone()) {
+            self.hidden.push(Hidden::of(entry, reason));
+        }
+    }
+
+    /// Whether the memory is noise; if it is, it is reported.
+    fn noise(&mut self, entry: &crate::event::MemoryEntry) -> bool {
+        match quality::judge(entry) {
+            Some(rule) => {
+                self.hide(entry, HiddenReason::Noise(rule));
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The report of what a composition left out, for the owner: per reason a
+/// count, and per memory the start of its id, its type, the reason and
+/// its title. As JSON when asked.
+pub fn hidden_report(composed: &Composed, json: bool) -> String {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for hidden in &composed.hidden {
+        *counts.entry(hidden.reason.as_str()).or_default() += 1;
+    }
+    if json {
+        let items: Vec<serde_json::Value> = composed
+            .hidden
+            .iter()
+            .map(|hidden| {
+                let mut item = serde_json::json!({
+                    "id": hidden.id,
+                    "type": hidden.memory_type.to_string(),
+                    "reason": hidden.reason.as_str(),
+                    "title": truncate(&hidden.title, 80),
+                });
+                if let HiddenReason::ReplacedByNoise { replacement } = &hidden.reason {
+                    item["replacement"] = serde_json::Value::String(replacement.clone());
+                }
+                item
+            })
+            .collect();
+        return serde_json::json!({ "counts": counts, "hidden": items }).to_string();
+    }
+    let mut lines = vec![format!(
+        "Hidden from the context: {} memories",
+        composed.hidden.len()
+    )];
+    for (reason, count) in &counts {
+        lines.push(format!("  {reason}: {count}"));
+    }
+    if !composed.hidden.is_empty() {
+        lines.push(String::new());
+    }
+    for hidden in &composed.hidden {
+        let reason = match &hidden.reason {
+            HiddenReason::ReplacedByNoise { replacement } => {
+                format!("replaced-by-noise `{}`", short_id(replacement))
+            }
+            reason => reason.as_str().to_string(),
+        };
+        lines.push(format!(
+            "  {}  {}  {}  {}",
+            short_id(&hidden.id),
+            hidden.memory_type,
+            reason,
+            truncate(&hidden.title, 80)
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Whisper — context injection engine.
 /// Generates a CONTEXT.md file with the most relevant memories for the current project.
 /// Claude Code picks this up via memory files or CLAUDE.md includes.
@@ -64,10 +198,27 @@ impl Whisper {
     /// Sections are ranked by `decay::effective_score`, so frequently-accessed
     /// or recently-touched memories outrank stale ones — even if the stale
     /// ones have a higher static `importance`.
+    #[cfg(test)]
     pub fn generate(&self, storage: &Storage) -> Result<String> {
+        Ok(self.generate_composed(storage)?.text)
+    }
+
+    /// [`generate`](Self::generate), with what was composed.
+    pub fn generate_composed(&self, storage: &Storage) -> Result<Composed> {
+        let composed = self.compose(storage)?;
+        self.write_file(&composed.text)?;
+        Ok(composed)
+    }
+
+    /// Compose the context without writing it. A memory captured from a
+    /// conversation that the rules of noise name is left out of every
+    /// section and reported instead; nothing in the store changes, and no
+    /// access count moves.
+    pub fn compose(&self, storage: &Storage) -> Result<Composed> {
         let now = Utc::now();
         let mut sections: Vec<String> = Vec::new();
         let mut budget = Budget::new(MAX_CONTEXT_CHARS);
+        let mut report = Report::default();
 
         // Header (always fits — the cap is far above it).
         budget.push(
@@ -94,6 +245,18 @@ impl Whisper {
                         break;
                     }
                     digest_ids.extend(d.source_ids.iter().cloned());
+                    for id in &d.source_ids {
+                        report.show(id, "digest");
+                    }
+                    // What a digest hid stays hidden below, whatever the
+                    // pool of the flat sections holds: the noisy replacement
+                    // of a decision may lie outside the newest 200.
+                    for hidden in &d.hidden {
+                        digest_ids.insert(hidden.id.clone());
+                        if report.seen.insert(hidden.id.clone()) {
+                            report.hidden.push(hidden.clone());
+                        }
+                    }
                     shown_projects.push(d.project.clone());
                 }
             }
@@ -135,16 +298,14 @@ impl Whisper {
 
         // User feedback / corrections (must not repeat mistakes) — before
         // decisions per design review: corrections are the rarest signal.
-        let feedback: Vec<&RankedEntry> = top_by_effective(
-            &pool,
-            crate::event::MemoryType::Feedback,
-            self.max_feedback + digest_ids.len(),
-            now,
-        )
-        .into_iter()
-        .filter(|r| !digest_ids.contains(&r.entry.id))
-        .take(self.max_feedback)
-        .collect();
+        // Noise is left out of the candidates, so the section fills with
+        // what is clean as far as the pool holds it.
+        let feedback: Vec<&RankedEntry> =
+            top_by_effective(&pool, crate::event::MemoryType::Feedback, usize::MAX, now)
+                .into_iter()
+                .filter(|r| !digest_ids.contains(&r.entry.id) && !report.noise(&r.entry))
+                .take(self.max_feedback)
+                .collect();
 
         if !feedback.is_empty() {
             budget.push(
@@ -165,6 +326,7 @@ impl Whisper {
                 ) {
                     break;
                 }
+                report.show(&entry.id, "feedback");
             }
             budget.push(&mut sections, String::new());
         }
@@ -189,16 +351,16 @@ impl Whisper {
             pool.iter().map(|r| (r.entry.id.as_str(), r)).collect();
         // Conflicts are resolved BEFORE the max_decisions cap (review point):
         // dropped rows are backfilled from lower-ranked live decisions, so a
-        // handful of superseded top entries can't shrink the section.
-        let ranked: Vec<&RankedEntry> = top_by_effective(
-            &pool,
-            crate::event::MemoryType::Decision,
-            self.max_decisions + digest_ids.len() + edge_count,
-            now,
-        )
-        .into_iter()
-        .filter(|r| !digest_ids.contains(&r.entry.id))
-        .collect();
+        // handful of superseded top entries can't shrink the section. They
+        // are resolved on the candidates as they are, noise included: a
+        // confirmed conflict holds whatever the text of the newer decision.
+        // Noise is left out of what is shown, after that.
+        let _ = edge_count;
+        let ranked: Vec<&RankedEntry> =
+            top_by_effective(&pool, crate::event::MemoryType::Decision, usize::MAX, now)
+                .into_iter()
+                .filter(|r| !digest_ids.contains(&r.entry.id))
+                .collect();
         let mut chosen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut decisions: Vec<&RankedEntry> = Vec::with_capacity(self.max_decisions);
         for r in ranked {
@@ -210,32 +372,60 @@ impl Whisper {
             }
             let terminals = crate::digest::chain_terminals(&replacement_of, &r.entry.id);
             if terminals.is_empty() {
-                // Current decision (or a judge-confirmed cycle): keep it.
+                // Current decision (or a judge-confirmed cycle): keep it,
+                // unless it is noise.
+                if report.noise(&r.entry) {
+                    continue;
+                }
                 chosen_ids.insert(r.entry.id.as_str());
                 decisions.push(r);
-            } else if terminals
+                continue;
+            }
+            if terminals
                 .iter()
                 .any(|t| digest_ids.contains(*t) || chosen_ids.contains(*t))
             {
                 // A replacement is already visible — the old row is history.
-            } else if let Some(replacement) = terminals
+                continue;
+            }
+            // The chain-final replacements available in the pool, the
+            // strongest first.
+            let mut in_pool: Vec<&RankedEntry> = terminals
                 .iter()
                 .filter_map(|t| pool_by_id.get(*t))
-                .max_by(|a, b| {
-                    a.effective(now)
-                        .partial_cmp(&b.effective(now))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
-                // Swap the obsolete decision for its strongest chain-final
-                // replacement available in the pool.
-                chosen_ids.insert(replacement.entry.id.as_str());
-                decisions.push(replacement);
-            } else {
+                .copied()
+                .collect();
+            in_pool.sort_by(|a, b| {
+                b.effective(now)
+                    .partial_cmp(&a.effective(now))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if in_pool.is_empty() {
                 // Replacements outside the context window: keep the old
-                // decision rather than showing nothing.
+                // decision rather than showing nothing, unless it is noise.
+                if report.noise(&r.entry) {
+                    continue;
+                }
                 chosen_ids.insert(r.entry.id.as_str());
                 decisions.push(r);
+                continue;
+            }
+            // Swap the obsolete decision for its strongest clean replacement.
+            // When every replacement in the pool is noise, none is shown and
+            // the old decision stays not shown: the conflict holds.
+            let mut swapped = false;
+            for replacement in &in_pool {
+                if report.noise(&replacement.entry) {
+                    continue;
+                }
+                chosen_ids.insert(replacement.entry.id.as_str());
+                decisions.push(replacement);
+                swapped = true;
+                break;
+            }
+            if !swapped {
+                let replacement = in_pool[0].entry.id.clone();
+                report.hide(&r.entry, HiddenReason::ReplacedByNoise { replacement });
             }
         }
 
@@ -255,6 +445,7 @@ impl Whisper {
                 ) {
                     break;
                 }
+                report.show(&entry.id, "decision");
                 if !entry.tags.is_empty() {
                     budget.push(
                         &mut sections,
@@ -298,6 +489,7 @@ impl Whisper {
                 ) {
                     break;
                 }
+                report.show(&entry.id, "recent");
             }
             budget.push(&mut sections, String::new());
         }
@@ -360,10 +552,11 @@ impl Whisper {
         let content = sections.join("\n");
         debug_assert!(content.chars().count() <= MAX_CONTEXT_CHARS);
 
-        // Write to file
-        self.write_file(&content)?;
-
-        Ok(content)
+        Ok(Composed {
+            text: content,
+            shown: report.shown,
+            hidden: report.hidden,
+        })
     }
 
     /// Generate context relevant to a specific topic.
@@ -371,19 +564,24 @@ impl Whisper {
     /// Uses hybrid retrieval (BM25 + vector + 1-hop graph) fused via RRF.
     /// Each hit carries a provenance label (bm25 / vector / graph / combos)
     /// so the agent can cite which retriever surfaced it.
-    pub fn generate_for_topic(
+    /// Generate context relevant to a specific topic, with what was
+    /// composed: hybrid retrieval (BM25 + vector + 1-hop graph) fused via
+    /// RRF, noise left out, the hits shown touched. No file is written.
+    pub fn generate_for_topic_composed(
         &self,
         storage: &Storage,
         topic: &str,
         limit: usize,
-    ) -> Result<String> {
+    ) -> Result<Composed> {
         let embedder = create_embedder()?;
-        self.topic_context(storage, &*embedder, topic, limit)
+        self.topic_composed(storage, &*embedder, topic, limit)
     }
 
     /// The context for `topic` with the embedder given. A topic is new
     /// text: it is prepared once, and what is searched by and what the
-    /// heading shows are the prepared one.
+    /// heading shows are the prepared one. The hits that are shown are
+    /// touched, as returned hits are; no file is written.
+    #[cfg(test)]
     pub(crate) fn topic_context(
         &self,
         storage: &Storage,
@@ -391,14 +589,62 @@ impl Whisper {
         topic: &str,
         limit: usize,
     ) -> Result<String> {
+        Ok(self.topic_composed(storage, embedder, topic, limit)?.text)
+    }
+
+    /// [`topic_context`](Self::topic_context), with what was composed.
+    pub(crate) fn topic_composed(
+        &self,
+        storage: &Storage,
+        embedder: &dyn crate::embedding::Embedder,
+        topic: &str,
+        limit: usize,
+    ) -> Result<Composed> {
+        let composed = self.compose_topic(storage, embedder, topic, limit)?;
+        let ids: Vec<&str> = composed.shown.iter().map(|s| s.id.as_str()).collect();
+        // Best effort, as in the search: a touch that fails does not fail
+        // the context.
+        if let Err(e) = storage.touch_access(&ids) {
+            tracing::debug!("topic context: access counts not written: {e}");
+        }
+        Ok(composed)
+    }
+
+    /// Compose the context for `topic` without touching anything. The
+    /// hybrid search gives its whole fused list, with the limits per
+    /// retriever it has; noise is left out of it, and then the limit of
+    /// what is shown is applied. No ranking changes: the clean hits stand
+    /// in the order the search gave them.
+    pub(crate) fn compose_topic(
+        &self,
+        storage: &Storage,
+        embedder: &dyn crate::embedding::Embedder,
+        topic: &str,
+        limit: usize,
+    ) -> Result<Composed> {
         let now = Utc::now();
         let topic = &crate::redaction::redact_text(topic).value;
         let opts = crate::retrieval::HybridOptions {
-            limit,
+            limit: usize::MAX,
+            touch_access: false,
             ..Default::default()
         };
-        let hits = crate::retrieval::hybrid_search(storage, embedder, topic, &opts)?;
-        render_topic(storage, topic, &hits, now)
+        let fused = crate::retrieval::hybrid_search(storage, embedder, topic, &opts)?;
+        let mut report = Report::default();
+        let mut hits: Vec<crate::retrieval::HybridHit> = fused
+            .into_iter()
+            .filter(|hit| !report.noise(&hit.entry))
+            .collect();
+        hits.truncate(limit);
+        for hit in &hits {
+            report.show(&hit.entry.id, "topic");
+        }
+        let text = render_topic(storage, topic, &hits, now)?;
+        Ok(Composed {
+            text,
+            shown: report.shown,
+            hidden: report.hidden,
+        })
     }
 
     fn write_file(&self, content: &str) -> Result<()> {

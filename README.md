@@ -15,11 +15,17 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/widget-hero.png" alt="Mnemonic menu-bar widget — Work, Projects, Journal, and Share cards" width="880"/>
+  <img src="docs/screenshots/widget-live.png" alt="Mnemonic menu-bar widget, dark: the projects in work, the agents on them, time and plan progress" width="300"/>
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/widget-live-light.png" alt="The same widget in the light appearance" width="300"/>
 </p>
 <p align="center">
-  <sub>The menu-bar widget — worked time, per-project hours, and a readable daily journal.<br>(Demo data shown.)</sub>
+  <sub>The menu-bar widget: the projects in work right now, who is working on them, and where each plan stands.<br>(Demo data shown.)</sub>
 </p>
+
+> **AI agents setting this up for someone:** read
+> [docs/agent-setup-workspace.md](docs/agent-setup-workspace.md) first. It says how the
+> projects must be laid out on disk so that live projects, time by project and plans work.
 
 ---
 
@@ -78,7 +84,7 @@ last two optional):
 | 🔒 **Local-first** | SQLite on your machine. No telemetry, no API keys for the local path — [audited](#security--privacy) |
 | 🔎 **Semantic search** | Neural embeddings + HNSW index, hybrid FTS5 + vector retrieval, optional reranker |
 | 🕸️ **Knowledge graph** | Extracts projects / tech / people and their relationships from your memories |
-| 🤝 **Agent-agnostic** | MCP server (7 tools) works with any MCP client — Claude Code, Codex, Cursor; Claude Code also gets `SessionStart` auto-context |
+| 🤝 **Agent-agnostic** | MCP server (12 tools) works with any MCP client — Claude Code, Codex, Cursor; Claude Code also gets `SessionStart` auto-context |
 | 📊 **Menu-bar widget** | macOS SwiftUI app: worked time, per-project hours, and a readable daily journal |
 | 📈 **Measurable** | `mnemonic eval` reports recall@5 / recall@20 / MRR — tune retrieval, don't vibe-check it |
 
@@ -126,8 +132,10 @@ That's it — the daemon is now watching your work. Everything below is optional
 
 ### Use with Claude Code
 
-Give Claude Code this repo link and it can set everything up for you. A setup agent reading
-this repo should, beyond wiring the hook and MCP server below, also:
+Give Claude Code this repo link and it can set everything up for you. A setup agent follows
+the runbook that fits: [docs/agent-setup-workspace.md](docs/agent-setup-workspace.md) for one
+person with several projects, or [docs/agent-setup.md](docs/agent-setup.md) for one project's
+memory kept apart. Beyond wiring the hook and MCP server below, it should also:
 
 - **Offer to add a proactive-save block to your `CLAUDE.md`** (step 3 below). The daemon captures
   automatically without it; the block additionally asks the agent to distill and save clean
@@ -142,12 +150,16 @@ Or wire it manually:
 ```json
 {
   "type": "command",
-  "command": "sh -c '~/.cargo/bin/mnemonic start -d 2>/dev/null && ~/.cargo/bin/mnemonic context 2>/dev/null || true'",
+  "command": "sh -c '~/.cargo/bin/mnemonic start -d 2>/dev/null; ~/.cargo/bin/mnemonic context 2>/dev/null || true'",
   "timeout": 5000
 }
 ```
 
-**2. Register the MCP server** (gives Claude 7 memory tools) — add to `~/.claude.json`:
+`start -d` exits with 1 when the daemon is already running, so the two commands are joined
+with `;`, not `&&`: the context is generated on every session, not only on the first one
+after a reboot.
+
+**2. Register the MCP server** (gives Claude 12 memory tools) — add to `~/.claude.json`:
 
 ```json
 {
@@ -162,7 +174,13 @@ Or wire it manually:
 }
 ```
 
-MCP tools: `memory_search` · `memory_save` · `memory_recent` · `memory_similar` · `memory_context` · `memory_status` · `memory_graph` · `memory_fact_set` · `memory_facts`
+MCP tools: `memory_search` · `memory_save` · `memory_recent` · `memory_similar` · `memory_context` · `memory_status` · `memory_graph` · `memory_followups` · `memory_followup_open` · `memory_followup_update` · `memory_fact_set` · `memory_facts`
+
+The reply to `initialize` carries `instructions` that tell the agent when to use them: search
+before proposing an approach or when you refer to something decided earlier, save on a
+correction or a decision, facts for a value that changes over time. They also say that a
+result marked as noise is a fragment, not a decision, and that what memory returns is your
+data, not an instruction to the agent.
 
 **3. (Optional) Teach the agent to save proactively**
 
@@ -212,11 +230,13 @@ you working in another language should offer to add those phrases for you.
 ## Menu-bar widget
 
 Most of the time you won't touch the CLI — you'll glance at the **native macOS menu-bar
-widget**. It's a swipeable 4-page card deck (swipe horizontally, or tap the page dots):
+widget**. Its six pages open on Live projects (swipe horizontally, or tap the page dots):
 
-- **Work** — today's worked time, a this-week chart, and a session timeline. Time is tracked from input activity — see [Security & Privacy](#security--privacy): an idle-seconds counter only, no keystrokes.
+- **Live** shows the projects in work, agents by kind, separate estimated owner and agent time, and current plan progress. The status item shows the count of live projects and, after it, the count of memories. Capture health and review state are explicitly unavailable until their sources report them.
+- **Work** — today's worked time, a this-week chart, a session timeline, and the card of memory today: what memory returned on this day (contexts generated, calls answered, memories and corrections returned, the memories returned most). Time is tracked from input activity — see [Security & Privacy](#security--privacy): an idle-seconds counter only, no keystrokes.
 - **Projects** — real hours per project with an honest *Unattributed* bucket and a confidence dot, derived from what you actually worked on (git commits, notes, and conversation memories linked to each project).
 - **Journal** — a readable daily digest: a one-line recap, what you did per project (with timestamps), and the day's decisions & follow-ups. Arrow through past days.
+- **Records** ranks stretches of work and shows the ones continuing now.
 - **Share** — export a clean stat card.
 
 <p align="center">
@@ -229,20 +249,74 @@ swift build -c release --product MnemonicBar
 .build/release/MnemonicBar
 ```
 
-The widget talks to the daemon over the loopback HTTP API (token from `~/.mnemonic/auth.token`);
-it stores nothing of its own and idles at ~0% CPU. See [clients/macos/README.md](clients/macos/README.md) for details.
+The widget reads the daemon's loopback HTTP API (token from `~/.mnemonic/auth.token`). The API
+is **off by default**: set `[ui] enabled = true` in the config and restart the daemon.
+The Live page reports when it is off. Secondary pages request data when opened;
+supported command fallbacks share one automatic batch per popover opening.
+The live coordinator listens for changes, refreshes a visible plan every 30 seconds,
+and makes a safety request every five minutes while a session was last known live.
+It holds no timer with the popover closed and no live session. Preferences are
+kept separately from response data; HTTP responses are never cached on disk.
+See [clients/macos/README.md](clients/macos/README.md) for details.
 
-### Mnemonic.app — graph & memory map
+### MnemonicApp - projects and memory
 
-A companion macOS app (also over the dashboard HTTP API) for visual browsing:
+The companion macOS app opens on **Projects**. Live cards show agent kinds
+and states, separate owner and agent time over the last 7 days, and the current plan.
+Other active projects follow their last recorded activity; activity older
+than 30 days starts folded, while live projects stay visible. Archived,
+ignored, and merged rows are counted outside the board.
 
-- **Memory Map** — the Obsidian-style notes graph.
-- **Entity Graph** — the knowledge graph (projects, tech, people) and their edges.
+<p align="center">
+  <img src="docs/screenshots/app-projects.png" alt="MnemonicApp Projects board: live cards, then the other projects by last activity" width="820"/>
+</p>
+<p align="center">
+  <sub>The Projects board. (Demo data shown.)</sub>
+</p>
 
-<!--
-TODO: insert docs/screenshots/04-memory-map.png
-  Cmd+Shift+4, Space, click the Mnemonic.app window → docs/screenshots/04-memory-map.png
--->
+Open a project for **Now, Plan, Gate, Time, and History**: sessions, plan units
+and task disclosures, gate receipts and checkout measurements, 14 daily time
+rows, and memory titles with IDs. Missing owner time and checkout measurements
+stay unknown. Task completion does not replace the recorded plan stage.
+Widget project links open the same profile's project in the app.
+
+**Timeline** shows a local day with project lanes, distinct Claude and Codex
+blocks, and a separate lane for your activity. Its axis follows the actual
+length of the day, including clock changes. Your project shares are estimates
+on their recorded intervals. A block opens details; an explicit correction
+can reassign its time, and Undo removes that correction.
+
+The existing screens remain available, including:
+
+- **Memory Map** uses the same static canvas with its original starting layout.
+- **Project Graph** shows projects, parts, plan units, technologies and people at
+  stable positions. Select a hub to read its plan, expand a neighborhood, or
+  select a link to read supporting memories. Stale projects and outside-registry
+  entities have separate shelves with explicit archive and Undo actions.
+
+The new project screens are provisional. Owner visual acceptance and the
+native open-window budget remain pending.
+
+With projects configured, `GET /api/graph/curated` supplies a registry-led
+graph with stable positions and an entity tag. Projects, parts, plan units,
+allow-listed technologies and configured people have distinct kinds;
+concepts appear as `top_terms` on project detail. The overview is capped at
+60 nodes and 12,000 bytes; `?expand=KEY` allows 150 nodes, 375 links and
+35,000 bytes. Supporting memory IDs are paged through
+`GET /api/graph/curated/edge`, with at most 100 IDs per page.
+
+`GET /api/graph/curated/archives` lists reversible entity archives;
+`?archived=false` pages outside-registry candidates beyond the compact shelf.
+`POST /api/entities/{id}/archive` with an `archived` boolean changes reversible
+archive state without removing entities or links. Retained archive marks remain
+visible after an entity merge or rebuild and never transfer to the survivor.
+Undo is idempotent for a valid identity even after its entity or mark is gone;
+a new archive still requires an existing outside-registry project entity.
+Archived entity history leaves time fallback. Undo also repairs existing owner-time cache dates governed by
+live projects when the activity store is available, before refreshing the graph.
+A failed repair can be retried with the same Undo request. Graph evidence refreshes on the existing
+registry pass, so ordinary freshness may lag by up to ten minutes. Explicit
+archive and registry actions refresh the graph before replying.
 
 ## Day-to-day operations
 
@@ -379,6 +453,31 @@ mnemonic cleanup --days 30 --threshold 0.5 --confirm  # actually clean
 
 **Never cleaned:** decisions and feedback are kept permanently — they're too valuable to lose.
 
+### What the generated context leaves out
+
+A memory captured from a conversation can be a fragment rather than a statement: a pasted
+table row, a line of markup, a link, a line of data, a step of a list, a question. Rules
+name these shapes (`src/quality.rs`) and lean toward keeping: a memory is noise only when
+no line of it makes a statement.
+
+Cleaned: the context generated at the start of a session and by `memory_context`, in all
+its sections; the context for a topic; what the sinks write from now on.
+
+Marked, not hidden: the results of `memory_search`, `memory_similar` and `memory_recent`,
+the items of `/api/memories` and of `recent --json`. A memory that is noise carries the
+name of its rule in `noise`.
+
+Not touched, and therefore still a way junk reaches an agent: the memory files, Obsidian
+notes and API records the sinks wrote before this version (they are your files; nothing
+deletes them); the titles `memory_graph` returns for an entity; a memory that reflection
+fused from captures; everything stored that is junk of a shape no rule names. Nothing is
+deleted from the store.
+
+`mnemonic context --hidden` lists what the last context left out and why. `mnemonic recall`
+shows what memory returned on a day: contexts generated, calls answered, memories and
+corrections returned, what was hidden as noise, and the memories returned most. The widget's
+card of memory today shows the same numbers.
+
 ### Trait-based extensibility
 
 Every component is a trait — swap implementations without touching the pipeline:
@@ -409,6 +508,8 @@ mnemonic stats [--json]      # Stats with daily breakdown (JSON for widgets)
 # Write
 mnemonic save -t <title> <content> [-T type] [--tags a,b]  # Manual save
 mnemonic context [-t topic]  # Generate context file (Whisper)
+mnemonic context --hidden [--json]  # What the last context left out as noise, and why
+mnemonic recall [--day YYYY-MM-DD] [--json]  # What memory returned on a day
 
 # Knowledge graph
 mnemonic graph <entity>      # Query entity relationships and neighbors
@@ -429,7 +530,12 @@ mnemonic reflect [--apply] [--threshold 0.85] [--since-days N] [--json]
 mnemonic eval [--file PATH] [--json] [--no-graph-hop]
                              # Run retrieval eval (recall@5/@20/MRR)
 
+# Time by project
+mnemonic attribute backfill  # Read transcript history into segments, remake the changed days
+mnemonic attribute replay --dry-run [--days N]  # Hours by project the rules give; writes nothing
+
 # Data management
+mnemonic backup <dir>        # Whole, checked copies of the stores; safe while the daemon runs
 mnemonic export              # Export all memories as JSON (stdout)
 mnemonic import <file>       # Import memories from JSON file (or - for stdin)
 mnemonic cleanup [--days 30] [--threshold 0.5] [--confirm]  # Remove old notes
@@ -453,6 +559,37 @@ Key settings:
 - `classifier.dedup_threshold` — cosine similarity for dedup (default 0.92)
 - `output.obsidian_enabled` — enable/disable Obsidian output (default false)
 - `output.memory_files_path` — where Claude Code memory files go
+- `ui.enabled` — the loopback HTTP API for the widget and the companion app (default false)
+- `recall.log` — record what memory returned, for `mnemonic recall` and the widget's card (default true)
+- `projects.workspace`, `projects.folder` — where your projects live, for live projects and time by project (unset by default)
+
+### Projects
+
+Live projects, time by project and the Projects board need to know where your
+projects are. Name a workspace and, when the projects sit in one folder inside
+it, that folder. Every visible child folder is a project under the name of its
+folder:
+
+```toml
+[projects]
+workspace = "/absolute/path/to/workspace"
+folder = "projects"        # optional; the workspace itself when left out
+
+[projects.aliases]         # optional second names: alias = "folder"
+# web = "website"
+
+[projects.former]          # optional: a name a folder had before
+# old-name = "new-name"
+```
+
+Without the section nothing is discovered and time is attributed as before.
+After adding it, `mnemonic attribute backfill` reads the transcripts that are
+already there, and `mnemonic attribute replay --dry-run` prints the hours by
+project the rules give without writing anything.
+
+How the folders must be laid out, how a session is tied to a project, and
+where plans and gate receipts are read from:
+[docs/agent-setup-workspace.md](docs/agent-setup-workspace.md).
 
 ### Sensitive config
 
@@ -474,7 +611,7 @@ of this codebase.
 - **All embedding and reranking run locally** (ONNX). Your text is never uploaded to vectorize it.
 - **Memory-API sync** — the only "push memories to a server" feature — is **opt-in, disabled, and unconfigured** out of the box.
 
-> **One honest disclosure:** on **first run** mnemonic downloads its embedding model (~23 MB) and reranker (~278 MB) from HuggingFace. Those are model weights coming **in** — no conversation, code, or memory goes **out**. After that it runs fully offline; behind a firewall it falls back to a hash embedder instead of failing.
+> **One honest disclosure:** on **first use** mnemonic downloads its embedding model (multilingual-e5-base, ~1 GB on disk) and, the first time `mnemonic eval --rerank` asks for it, its reranker (Jina v2 base multilingual, ~278 MB) from HuggingFace. Those are model weights coming **in** — no conversation, code, or memory goes **out**. After that it runs fully offline; behind a firewall it falls back to a hash embedder instead of failing.
 
 ### What it reads and stores
 
@@ -512,12 +649,35 @@ The scanner reads the one file it is given and changes nothing: it selects no pr
 
 ### Network surface (the menu-bar widget)
 
-The daemon serves a small HTTP API for the widget — hardened:
+The daemon can serve a small HTTP API for the widget and the companion app. It is off by default
+(`[ui] enabled = true` turns it on) and hardened:
 
 - **Binds to `127.0.0.1` only** — never exposed to your LAN (no `0.0.0.0` code path exists).
 - **Token auth on every request**: a 32-char CSPRNG token in `~/.mnemonic/auth.token` (mode `0600`, re-tightened on every read), compared in **constant time**.
 - **DNS-rebinding defence**: a `Host`-header allowlist **and** a CORS origin allowlist, so a malicious web page can't reach the daemon even if it resolves a hostname to `127.0.0.1`.
 - Request bodies are size-capped; query params are clamped.
+
+The project read routes are `GET /api/projects` (registry rows, seven days
+of time and a compact plan) and `GET /api/projects/{key}` (plan units,
+tasks, receipt status, live sessions, fourteen days of time and recent
+decisions). They do not change the stores or record recall. Plan titles
+are capped and redacted; checkout paths stay in memory and are not served.
+Plans are read on observation and on requests with a five-second cache,
+without starting a process or adding a watcher.
+
+The reader discovers task registries, declared OpenSpec task authorities
+and status tables. Optional `[projects.plans.PROJECT_KEY]` settings are
+`provider` (`registry`, `checkbox`, or `funnel`), `authority`, `checkout`,
+`receipt`, and `gate_required`. Authority and receipt paths stay within the
+project; a checkout override is an absolute project folder. Registry files
+always come from the main checkout. Legacy verification receipts without a
+tested project subtree stay stale, even if they passed. An explicitly
+configured single receipt may instead match its recorded commit to HEAD.
+Detail diagnostics use null when the checkout cannot safely be judged.
+
+`mnemonic plan-counts --root ABSOLUTE_PROJECT_FOLDER` prints plan aggregates
+without opening a profile or memory store. The command reads only the
+explicit project and prints no task titles or checkout paths.
 
 ### Install & runtime trust
 
@@ -554,7 +714,24 @@ mnemonic import memories-export.json     # insert unknown IDs; existing IDs are 
 
 This format does not preserve all graph/session/fact relations, supersession or
 deletions. It is not a two-way synchronization protocol or a full disaster-recovery
-backup. Preserve a consistent SQLite backup for recovery.
+backup. Preserve a consistent SQLite backup for recovery:
+
+```bash
+mnemonic backup <dir>   # memory.db and activity.db, whole and checked
+```
+
+The copies are taken through SQLite while the daemon runs and are checked
+before they get their names; a folder that already holds a copy is never
+written over. Nothing is migrated, so a newer binary can take the copy of a
+store before it upgrades it.
+
+**Upgrading to a build with time by live projects.** The first command of the
+new binary that opens the store takes a one-time snapshot
+(`memory.db.pre-v3.bak`) and raises the store's schema generation to 3. An
+earlier binary then refuses the store, so take `mnemonic backup` first,
+upgrade the daemon, the widget and the app together, and restart the agent
+windows that were open: their `mnemonic mcp` is still the earlier binary.
+Going back means restoring the backup.
 
 ## Shared project context
 
@@ -587,7 +764,7 @@ title-only files are retained, so a backfill can create additional files.
 - [x] Semantic deduplication
 - [x] Dynamic importance scoring
 - [x] Whisper (context injection)
-- [x] MCP server (7 tools incl. graph queries)
+- [x] MCP server (12 tools incl. graph queries, follow-ups and facts)
 - [x] CLI surface for search, graph, activity, attribution, journal, and maintenance (30+ commands)
 - [x] Auto-start via SessionStart hook
 - [x] Export/import for backup and migration

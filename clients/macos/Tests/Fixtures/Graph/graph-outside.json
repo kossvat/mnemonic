@@ -1,0 +1,22 @@
+{
+  "entities": [
+    {
+      "id": "sketch",
+      "name": "Sketch board",
+      "memory_count": 2,
+      "last_memory": null,
+      "archived_at": null
+    },
+    {
+      "id": "draft",
+      "name": "Draft board",
+      "memory_count": 1,
+      "last_memory": 1796112000,
+      "archived_at": null
+    }
+  ],
+  "offset": 0,
+  "limit": 2,
+  "total": 4,
+  "next_offset": 2
+}

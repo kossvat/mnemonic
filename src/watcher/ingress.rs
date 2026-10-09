@@ -3,12 +3,15 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, ensure};
 use chrono::Utc;
 use tracing::warn;
 
+use super::discovery::FileStamp;
 use super::tail;
 use crate::event::{Event, EventKind, EventSource};
 use crate::ingest::{IngestCursor, IngestPayload, IngestRecord};
@@ -195,6 +198,40 @@ pub(super) struct IngressTail {
     adoption_retries: Mutex<Option<HashSet<PathBuf>>>,
     /// Transcripts refused for their path, so each is reported once.
     refused_paths: Mutex<HashSet<PathBuf>>,
+    /// The idle time of a session, in seconds.
+    session_idle_secs: u64,
+    /// The stamp of each transcript as of its last successful read. A
+    /// transcript whose stamp did not move since is not opened.
+    stamps: Mutex<HashMap<PathBuf, FileStamp>>,
+    /// Transcripts opened by this reader, for the tests of the tick.
+    #[cfg(test)]
+    opened: AtomicUsize,
+}
+
+/// The idle time of a session where none is configured: the default of
+/// the configuration.
+pub(super) const DEFAULT_SESSION_IDLE_SECS: u64 = 1800;
+
+/// The time a record of a transcript was written at: the top-level
+/// `timestamp` both formats stamp on every record. `None` for a record
+/// without one, and for a record of a Claude Code session a program ran
+/// (`entrypoint` of `sdk-*`): that is not the owner at work. A Codex
+/// session a program ran is refused by the scope before this is asked.
+pub(super) fn written_at(line: &str) -> Option<chrono::DateTime<Utc>> {
+    #[derive(serde::Deserialize)]
+    struct Stamp<'a> {
+        #[serde(borrow)]
+        timestamp: Option<std::borrow::Cow<'a, str>>,
+        #[serde(borrow)]
+        entrypoint: Option<std::borrow::Cow<'a, str>>,
+    }
+    let stamp: Stamp = serde_json::from_str(line).ok()?;
+    if stamp.entrypoint.is_some_and(|e| e.starts_with("sdk-")) {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(&stamp.timestamp?)
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
 }
 
 /// Outcome of adopting one pre-existing transcript.
@@ -212,7 +249,37 @@ impl IngressTail {
             namespace,
             adoption_retries: Mutex::new(None),
             refused_paths: Mutex::new(HashSet::new()),
+            session_idle_secs: DEFAULT_SESSION_IDLE_SECS,
+            stamps: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            opened: AtomicUsize::new(0),
         }
+    }
+
+    /// How many transcripts this reader has opened so far.
+    #[cfg(test)]
+    pub fn opened(&self) -> usize {
+        self.opened.load(Ordering::Relaxed)
+    }
+
+    /// The stamp of a transcript as the last tick left it: the one it was
+    /// read at, or the one that had not moved. `None` for a transcript the
+    /// tick did not stamp or failed to read. The observation pass asks
+    /// this instead of asking the file system a second time.
+    pub(super) fn stamp_of(&self, path: &Path) -> Option<FileStamp> {
+        self.stamps.lock().ok()?.get(path).cloned()
+    }
+
+    fn open(&self, path: &Path) -> std::io::Result<File> {
+        #[cfg(test)]
+        self.opened.fetch_add(1, Ordering::Relaxed);
+        File::open(path)
+    }
+
+    /// The idle time sessions close by, as the daemon is configured.
+    pub fn with_session_idle(mut self, secs: u64) -> Self {
+        self.session_idle_secs = secs;
+        self
     }
 
     /// Whether this transcript is left alone: its path is copied into every
@@ -220,6 +287,13 @@ impl IngressTail {
     /// escaping can join differently) into every cursor, so both must be
     /// admissible. Reported once per path.
     fn refused_path(&self, path: &Path) -> bool {
+        if self
+            .refused_paths
+            .lock()
+            .is_ok_and(|seen| seen.contains(path))
+        {
+            return true;
+        }
         let clean = redaction::check_identity(&path.to_string_lossy()).is_ok()
             && redaction::check_identity(&self.stream(path)).is_ok();
         if clean {
@@ -246,7 +320,7 @@ impl IngressTail {
         self.storage.ingest_cursors_with_prefix(&prefix)
     }
 
-    /// [`Self::tick_scoped`] with no project scope (tests).
+    /// [`Self::tick_scoped`] with no project scope and no full pass (tests).
     #[cfg(test)]
     pub fn tick(
         &self,
@@ -254,43 +328,70 @@ impl IngressTail {
         legacy: &HashMap<PathBuf, u64>,
         parse: fn(&Path, &str) -> Option<ParsedTurn>,
     ) -> Result<usize> {
-        self.tick_scoped(files, legacy, parse, None)
+        self.tick_scoped(files, legacy, parse, None, false)
     }
 
-    /// One poll tick: adopt what is still pending, read this namespace's
-    /// cursors ONCE, then poll every transcript against that snapshot,
-    /// keeping only the records `scope` admits when there is one.
-    /// Returns how many turns were captured.
+    /// One poll tick: adopt what is still pending, then poll every
+    /// transcript whose stamp moved since its last successful read (every
+    /// one on a `full` pass), keeping only the records `scope` admits when
+    /// there is one. The namespace's cursors are read ONCE, when the first
+    /// transcript needs them: an idle tick opens no file and reads no
+    /// cursor. Returns how many turns were captured.
     ///
     /// Adoption or snapshot failure fails the whole tick, and it is retried on
     /// the next one; a failure on one transcript is logged and does not stop
-    /// the rest. A stale snapshot is safe: `append_ingest` re-reads the cursor
-    /// inside its write transaction and refuses a compare-and-swap that no
-    /// longer matches, so the worst case is one skipped poll for that file.
+    /// the rest, and that transcript is read again at the next tick whatever
+    /// its stamp says. A stale snapshot is safe: `append_ingest` re-reads the
+    /// cursor inside its write transaction and refuses a compare-and-swap
+    /// that no longer matches, so the worst case is one skipped poll.
     pub fn tick_scoped(
         &self,
         files: &[PathBuf],
         legacy: &HashMap<PathBuf, u64>,
         parse: fn(&Path, &str) -> Option<ParsedTurn>,
         mut scope: Option<&mut dyn RecordScope>,
+        full: bool,
     ) -> Result<usize> {
         let adopting = self.bootstrap(files, legacy)?;
-        let mut snapshot = self.cursor_snapshot()?;
+        let mut stamps = self
+            .stamps
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        if full {
+            // Transcripts that are gone are forgotten with the pass.
+            let listed: HashSet<&PathBuf> = files.iter().collect();
+            stamps.retain(|path, _| listed.contains(path));
+        }
+        let mut snapshot = None;
         let mut captured = 0;
         for path in files {
             if adopting.contains(path) {
                 continue;
             }
+            let stamp = FileStamp::now(path);
+            if !full && stamp.is_some() && stamps.get(path) == stamp.as_ref() {
+                continue;
+            }
             if self.refused_path(path) {
                 continue;
             }
-            match self.poll(path, parse, &mut snapshot, scope.as_deref_mut()) {
-                Ok(n) => captured += n,
-                Err(e) => warn!(
-                    "{} ingress failed for {}: {e}",
-                    self.namespace,
-                    path.display()
-                ),
+            if snapshot.is_none() {
+                snapshot = Some(self.cursor_snapshot()?);
+            }
+            let snapshot = snapshot.as_mut().expect("read just above");
+            match self.poll(path, parse, snapshot, scope.as_deref_mut()) {
+                Ok((n, read)) => {
+                    captured += n;
+                    stamps.insert(path.clone(), read);
+                }
+                Err(e) => {
+                    stamps.remove(path);
+                    warn!(
+                        "{} ingress failed for {}: {e}",
+                        self.namespace,
+                        path.display()
+                    );
+                }
             }
         }
         Ok(captured)
@@ -416,7 +517,7 @@ impl IngressTail {
         // from byte zero, replaying its whole history the moment it becomes
         // readable. Only a vanished path is settled. Store errors propagate.
         let fingerprinted = (|| -> std::io::Result<Option<IngestCursor>> {
-            let mut file = File::open(path)?;
+            let mut file = self.open(path)?;
             let meta = file.metadata()?;
             let saved = legacy.get(path).copied();
             let truncated = saved.is_some_and(|offset| offset > meta.len());
@@ -461,7 +562,7 @@ impl IngressTail {
         parse: fn(&Path, &str) -> Option<ParsedTurn>,
         snapshot: &mut HashMap<String, IngestCursor>,
     ) -> Result<usize> {
-        self.poll(path, parse, snapshot, None)
+        Ok(self.poll(path, parse, snapshot, None)?.0)
     }
 
     /// `poll_file` limited to the records `scope` admits (tests; production
@@ -474,16 +575,19 @@ impl IngressTail {
         scope: &mut dyn RecordScope,
     ) -> Result<usize> {
         let mut snapshot = self.cursor_snapshot()?;
-        self.poll(path, parse, &mut snapshot, Some(scope))
+        Ok(self.poll(path, parse, &mut snapshot, Some(scope))?.0)
     }
 
+    /// Read what is new in one transcript. Returns the turns captured and
+    /// the stamp of the file as it was when the read began: a file that grew
+    /// while it was read has another stamp by now, and is read again.
     fn poll<'s>(
         &self,
         path: &Path,
         parse: fn(&Path, &str) -> Option<ParsedTurn>,
         snapshot: &mut HashMap<String, IngestCursor>,
         mut scope: Option<&mut (dyn RecordScope + 's)>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, FileStamp)> {
         // Stat/read/fingerprint the same descriptor: a path may rotate at any
         // time. Its replacement is detected on the next poll.
         let stream = self.stream(path);
@@ -492,7 +596,7 @@ impl IngressTail {
             "transcript name refused ({})",
             RedactionError::SensitiveContent.code()
         );
-        let mut file = File::open(path)?;
+        let mut file = self.open(path)?;
         let meta = file.metadata()?;
         let previous = snapshot.get(&stream).cloned();
         let (generation, offset, known_prefix) = match previous.as_ref() {
@@ -516,6 +620,10 @@ impl IngressTail {
         let chunk = tail::read_snapshot(&mut file, meta.len(), offset)?;
         let observed_at = Utc::now();
         let mut records = Vec::new();
+        // When each record the scope admits was written, whatever it
+        // holds: a transcript that grows is a session at work, with or
+        // without a turn to take.
+        let mut written = Vec::new();
         let mut begun = false;
         for (position, line) in chunk.records(offset) {
             // Only a file with new records pays for the scope's setup.
@@ -529,6 +637,9 @@ impl IngressTail {
                 }
                 None => true,
             };
+            if admitted {
+                written.extend(written_at(line));
+            }
             let Some(mut turn) = parse(path, line) else {
                 continue;
             };
@@ -599,6 +710,32 @@ impl IngressTail {
                 "transcript rewritten while reading"
             );
         }
+        // The session of this transcript, and its stretch of work, follow
+        // what was read. Before the cursor moves: a poll that fails after
+        // this reads the same records again, and times already walked are
+        // passed over. Neither failing stops the transcript from being read.
+        let transcript = path.to_string_lossy();
+        let now = Utc::now();
+        if let Err(e) =
+            self.storage
+                .follow_transcript(&transcript, &written, self.session_idle_secs, now)
+        {
+            tracing::warn!(
+                "{} session could not follow its transcript: {e}",
+                self.namespace
+            );
+        }
+        // The stretch is kept under the stream, which a move into the
+        // archive does not change; the session is keyed by the path.
+        if let Err(e) =
+            self.storage
+                .extend_work_stretches(&next.stream, &written, self.session_idle_secs, now)
+        {
+            tracing::warn!(
+                "{} stretch of work could not be extended: {e}",
+                self.namespace
+            );
+        }
         if previous.as_ref() != Some(&next) || !records.is_empty() {
             self.storage
                 .append_ingest(previous.as_ref(), &next, &records)?;
@@ -610,7 +747,7 @@ impl IngressTail {
         if begun && let Some(scope) = scope {
             scope.commit(path, generation, chunk.next_offset);
         }
-        Ok(records.len())
+        Ok((records.len(), FileStamp::of(&meta)))
     }
 }
 
@@ -648,7 +785,11 @@ fn fingerprint(file: &mut File, start: u64, len: u64) -> Result<String> {
 /// read and hash the same bytes of the same descriptor a second time: on an
 /// idle transcript that duplicate pass is half of this feature's steady-state
 /// read volume, on the tokio runtime, every tick, forever.
-fn unchanged(file: &mut File, meta: &Metadata, cursor: &IngestCursor) -> Result<Option<String>> {
+pub(super) fn unchanged(
+    file: &mut File,
+    meta: &Metadata,
+    cursor: &IngestCursor,
+) -> Result<Option<String>> {
     if cursor.file_id != file_id(meta) || meta.len() < cursor.offset {
         return Ok(None);
     }
@@ -663,7 +804,7 @@ fn unchanged(file: &mut File, meta: &Metadata, cursor: &IngestCursor) -> Result<
 }
 /// `known_prefix` is a `(len, hash)` pair already computed over this same
 /// descriptor; it is reused only when the prefix has not moved.
-fn checkpoint(
+pub(super) fn checkpoint(
     file: &mut File,
     meta: &Metadata,
     stream: String,
@@ -694,3 +835,6 @@ mod redaction_tests;
 #[cfg(test)]
 #[path = "ingress_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "ingress_tick_tests.rs"]
+mod tick_tests;

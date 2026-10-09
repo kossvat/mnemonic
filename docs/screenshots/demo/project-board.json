@@ -1,0 +1,88 @@
+{
+ "projects": [
+  {
+   "key": "acme-api",
+   "name": "acme-api",
+   "state": "active",
+   "merged_into": null,
+   "last_active_at": 1790765940,
+   "week": {
+    "owner_s": 24000.0,
+    "agent_s": 43200,
+    "owner_estimate": true
+   },
+   "plan": {
+    "unit": "auth-hardening",
+    "done": 3,
+    "total": 7,
+    "stage": "building",
+    "task": "Rotate refresh tokens on every use",
+    "gate": "passed"
+   },
+   "plan_message": null
+  },
+  {
+   "key": "web-client",
+   "name": "web-client",
+   "state": "active",
+   "merged_into": null,
+   "last_active_at": 1790765700,
+   "week": {
+    "owner_s": 11700.0,
+    "agent_s": 19800,
+    "owner_estimate": true
+   },
+   "plan": null,
+   "plan_message": null
+  },
+  {
+   "key": "mobile-app",
+   "name": "mobile-app",
+   "state": "active",
+   "merged_into": null,
+   "last_active_at": 1790593200,
+   "week": {
+    "owner_s": 5400.0,
+    "agent_s": 9000,
+    "owner_estimate": true
+   },
+   "plan": {
+    "unit": "offline-sync",
+    "done": 2,
+    "total": 9,
+    "stage": "planned",
+    "task": "Queue writes while the device is offline",
+    "gate": "none"
+   },
+   "plan_message": null
+  },
+  {
+   "key": "infra-scripts",
+   "name": "infra-scripts",
+   "state": "active",
+   "merged_into": null,
+   "last_active_at": 1790334000,
+   "week": {
+    "owner_s": 2400.0,
+    "agent_s": 3000,
+    "owner_estimate": true
+   },
+   "plan": null,
+   "plan_message": null
+  },
+  {
+   "key": "design-system",
+   "name": "design-system",
+   "state": "active",
+   "merged_into": null,
+   "last_active_at": 1789815600,
+   "week": {
+    "owner_s": 0.0,
+    "agent_s": 1200,
+    "owner_estimate": true
+   },
+   "plan": null,
+   "plan_message": null
+  }
+ ]
+}

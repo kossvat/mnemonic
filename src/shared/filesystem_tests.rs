@@ -168,17 +168,33 @@ fn missing_directory_and_symlink_cycles_fail_without_creating_paths() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn macos_system_var_alias_is_supported_for_private_temporary_directories() {
+fn macos_system_alias_is_supported_for_private_temporary_directories() {
     // Do not assume the caller's TMPDIR uses /var (it may be /tmp or custom).
-    let directory = Path::new("/var/tmp").join(format!("mnemonic-var-{}", uuid::Uuid::new_v4()));
+    // `/var` and `/tmp` are links of the system into `/private`: `/var/tmp`
+    // here, and the directory of a runner that names one, read through the
+    // link it is under.
+    // A named directory that is under no link of the system (one in a
+    // home, on a volume) has no other spelling to read it by.
+    let named = crate::test_support::short_root();
+    let linked = named
+        .canonicalize()
+        .is_ok_and(|real| real.starts_with("/private/tmp") || real.starts_with("/private/var"));
+    let named = std::env::var_os(crate::test_support::SHORT_ROOT).is_some() && linked;
+    let base = if named {
+        crate::test_support::short_root()
+    } else {
+        PathBuf::from("/var/tmp")
+    };
+    let directory = base.join(format!("mnemonic-var-{}", uuid::Uuid::new_v4()));
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&directory)
         .unwrap();
     let f = Fixture(directory);
     let canonical = f.0.canonicalize().unwrap();
-    let tail = canonical.strip_prefix("/private/var").unwrap();
-    let alias = Path::new("/var").join(tail).join("shared.db");
+    let tail = canonical.strip_prefix("/private").unwrap();
+    assert!(tail.starts_with("var") || tail.starts_with("tmp"));
+    let alias = Path::new("/").join(tail).join("shared.db");
     assert_eq!(
         trusted_file_path(&alias).unwrap(),
         canonical.join("shared.db")

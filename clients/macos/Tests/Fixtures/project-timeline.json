@@ -1,0 +1,121 @@
+{
+  "day": "2026-09-29",
+  "from": 1790640000.0,
+  "to": 1790726400.0,
+  "projects": [
+    {
+      "key": "demoapp",
+      "name": "Demo app"
+    },
+    {
+      "key": "notes",
+      "name": "Notes"
+    }
+  ],
+  "segments": [
+    {
+      "id": "segment-1-1790672400000-1790676000000",
+      "stream": "fixture-claude",
+      "project": "demoapp",
+      "agent": "claude",
+      "driver": "owner",
+      "from": 1790672400.0,
+      "to": 1790676000.0
+    },
+    {
+      "id": "segment-2-1790672700000-1790675100000",
+      "stream": "fixture-codex",
+      "project": "notes",
+      "agent": "codex",
+      "driver": "owner",
+      "from": 1790672700.0,
+      "to": 1790675100.0
+    },
+    {
+      "id": "segment-3-1790674800000-1790674800000",
+      "stream": "fixture-point",
+      "project": "demoapp",
+      "agent": "codex",
+      "driver": "owner",
+      "from": 1790674800.0,
+      "to": 1790674800.0
+    },
+    {
+      "id": "segment-4-1790686800000-1790687700000",
+      "stream": "fixture-program",
+      "project": null,
+      "agent": "unknown",
+      "driver": "program",
+      "from": 1790686800.0,
+      "to": 1790687700.0
+    }
+  ],
+  "owner": [
+    {
+      "id": "owner-1790672400000-1790672700000",
+      "from": 1790672400.0,
+      "to": 1790672700.0,
+      "assignments": [
+        {
+          "project": "demoapp",
+          "share": 1.0,
+          "confidence": "high"
+        }
+      ]
+    },
+    {
+      "id": "owner-1790672700000-1790673300000",
+      "from": 1790672700.0,
+      "to": 1790673300.0,
+      "assignments": [
+        {
+          "project": "demoapp",
+          "share": 0.5,
+          "confidence": "high"
+        },
+        {
+          "project": "notes",
+          "share": 0.5,
+          "confidence": "high"
+        }
+      ]
+    },
+    {
+      "id": "owner-1790673300000-1790673600000",
+      "from": 1790673300.0,
+      "to": 1790673600.0,
+      "assignments": [
+        {
+          "project": "notes",
+          "share": 1.0,
+          "confidence": "high"
+        }
+      ]
+    },
+    {
+      "id": "owner-1790677800000-1790678400000",
+      "from": 1790677800.0,
+      "to": 1790678400.0,
+      "assignments": [
+        {
+          "project": null,
+          "share": 1.0,
+          "confidence": null
+        }
+      ]
+    },
+    {
+      "id": "owner-1790679600250-1790679900750",
+      "from": 1790679600.25,
+      "to": 1790679900.75,
+      "assignments": [
+        {
+          "project": "demoapp",
+          "share": 1.0,
+          "confidence": "low"
+        }
+      ]
+    }
+  ],
+  "owner_available": true
+}

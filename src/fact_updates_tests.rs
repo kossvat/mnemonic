@@ -56,7 +56,8 @@ impl Harness {
                 None,
                 &[],
             )
-            .expect("a request gets a reply");
+            .expect("a request gets a reply")
+            .line;
         let reply: Value = serde_json::from_str(&out).unwrap();
         if let Some(error) = reply.get("error") {
             return Err(error.to_string());

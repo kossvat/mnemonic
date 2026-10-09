@@ -1,4 +1,5 @@
 import AppKit
+import MnemonicShared
 import SwiftUI
 
 /// Headless preview renderer — `MnemonicBar --render-previews [dir]`.
@@ -13,6 +14,14 @@ enum PreviewRender {
     @MainActor
     static func runIfRequested() -> Bool {
         let args = CommandLine.arguments
+        if args.contains("--render-live-fixture") {
+            do { try LiveFixturePreview.run(arguments: args) }
+            catch {
+                FileHandle.standardError.write(Data("Fixture preview failed\n".utf8))
+                exit(2)
+            }
+            return true
+        }
         guard let i = args.firstIndex(of: "--render-previews") else { return false }
         let dir = i + 1 < args.count ? args[i + 1] : "/tmp/mnemonic-previews"
         render(to: dir)
@@ -25,7 +34,16 @@ enum PreviewRender {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
         let service = MnemonicService()
-        service.data = service.fetchDataNow()
+        var shown = service.fetchDataNow()
+        // Dev-only: MN_PREVIEW_RECALL names a file with the object of
+        // `mnemonic recall --json`, so the card of memory today renders a
+        // chosen day (a filled one, an empty one, the log off) without a
+        // daemon that has the route.
+        if let path = ProcessInfo.processInfo.environment["MN_PREVIEW_RECALL"] {
+            let bytes = try? Data(contentsOf: URL(fileURLWithPath: path))
+            shown.recallToday = RecallDay.load([.command { bytes }]).state
+        }
+        service.present(shown)
 
         // Journal: fetch + parse synchronously so the page renders content,
         // not its loading state.
@@ -51,17 +69,22 @@ enum PreviewRender {
 
         // Records: fetch + parse synchronously so the page renders content,
         // not its loading state (same reasoning as the journal above).
-        let records: [SessionRecord]? = service
-            .httpObject("/api/leaderboard/sessions?limit=10")
-            .flatMap { $0["sessions"] as? [[String: Any]] }
-            .map { $0.compactMap(SessionRecord.fromJSON) }
+        let leaderboard = service.httpObject("/api/leaderboard/sessions?limit=10")
+        let records: [SessionRecord]? = leaderboard
+            .flatMap { board in board["sessions"] as? [[String: Any]] }
+            .map { rows in rows.compactMap(SessionRecord.fromJSON) }
+        let going: [SessionRecord] = (leaderboard?["now"] as? [[String: Any]] ?? [])
+            .compactMap(SessionRecord.fromJSON)
 
         let pagePad = EdgeInsets(top: 6, leading: 16, bottom: 16, trailing: 16)
+        let live = WidgetLiveController(clock: SystemLiveClock()) { .failed(.off) }
+        live.present(.failed(.off), at: Date())
         let pages: [(String, AnyView)] = [
-            ("deck-work", AnyView(PagedContainerView(service: service, previewPage: 0))),
+            ("deck-work", AnyView(PagedContainerView(service: service, live: live, previewPage: 1))),
             ("page-projects", AnyView(ProjectsPageView(data: service.data, onOpenApp: {}).padding(pagePad))),
             ("page-journal", AnyView(JournalPageView(service: service, previewDay: journalDay).padding(pagePad))),
-            ("page-records", AnyView(RecordsPageView(service: service, previewRecords: records).padding(pagePad))),
+            ("page-records", AnyView(RecordsPageView(service: service, previewRecords: records,
+                                                     previewGoing: going).padding(pagePad))),
             ("page-share", AnyView(ShareComposerView(data: service.data, service: service, inPage: true))),
             ("share-card-yesterday", AnyView(
                 ShareCardView(data: service.data, mode: .today, tone: .dark, includeMemory: false,

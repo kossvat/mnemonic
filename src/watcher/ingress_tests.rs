@@ -416,7 +416,8 @@ fn append_line(path: &Path, text: String) {
 
 /// A tick reads its whole namespace in ONE query. Before, every transcript
 /// cost its own lookup and its own lock of the shared connection, every ten
-/// seconds, on ~1,700 files.
+/// seconds, on ~1,700 files. Since the tick looks at stamps first, a tick
+/// with nothing to read reads no cursor at all.
 #[test]
 fn ingress_an_idle_tick_reads_the_cursors_once_not_once_per_file() {
     let fixture = Fixture::new();
@@ -442,6 +443,18 @@ fn ingress_an_idle_tick_reads_the_cursors_once_not_once_per_file() {
     let lookups = || crate::ingest::CURSOR_LOOKUPS.with(|c| c.get());
     let before = lookups();
     assert_eq!(reader.tick(&files, &HashMap::new(), parse).unwrap(), 0);
+    assert_eq!(
+        lookups() - before,
+        1,
+        "the marker check, and no cursor read"
+    );
+    let before = lookups();
+    assert_eq!(
+        reader
+            .tick_scoped(&files, &HashMap::new(), parse, None, true)
+            .unwrap(),
+        0
+    );
     assert_eq!(
         lookups() - before,
         2,
@@ -552,14 +565,19 @@ fn ingress_a_failed_cursor_read_fails_the_tick_instead_of_rereading_history() {
     let files = vec![path];
     assert_eq!(reader.tick(&files, &HashMap::new(), parse).unwrap(), 0);
 
+    // Full passes, so that the ticks read the transcript whatever its stamp.
     crate::ingest::FAIL_NEXT_BULK_READ.with(|f| f.set(true));
     assert!(
-        reader.tick(&files, &HashMap::new(), parse).is_err(),
+        reader
+            .tick_scoped(&files, &HashMap::new(), parse, None, true)
+            .is_err(),
         "no snapshot, no poll"
     );
     assert_eq!(ingest_event_count(&fixture), 0);
     assert_eq!(
-        reader.tick(&files, &HashMap::new(), parse).unwrap(),
+        reader
+            .tick_scoped(&files, &HashMap::new(), parse, None, true)
+            .unwrap(),
         0,
         "history stays history"
     );
@@ -974,5 +992,206 @@ fn ingress_rewrite_during_read_is_retried_without_acknowledging_mixed_bytes() {
             .event
             .content
             .contains("replacement")
+    );
+}
+
+fn append_lines(path: &Path, lines: &[String]) {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    for line in lines {
+        writeln!(file, "{line}").unwrap();
+    }
+}
+
+/// The reader walks the session of a transcript along the times its
+/// records were written at, whatever the records hold: a tool result and
+/// a record of the app count as much as a turn.
+#[test]
+fn session_follow_the_reader_walks_the_session_along_the_records() {
+    let f = Fixture::new();
+    let reader = IngressTail::new(f.storage.clone(), "conversation").with_session_idle(1800);
+    let path = f.dir.join("s.jsonl");
+    std::fs::write(&path, "").unwrap();
+    let peer = f.storage.upsert_peer("claude", None, "agent").unwrap();
+    let session = f
+        .storage
+        .open_or_reuse_session_for_key(&peer, &path.to_string_lossy(), None, "jsonl", 1800)
+        .unwrap();
+    let last = |storage: &Storage| {
+        let conn = storage.conn.lock().unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT last_activity_at FROM sessions WHERE id = ?1",
+                rusqlite::params![session],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::storage::parse_session_timestamp(&raw).unwrap()
+    };
+    let began = (Utc::now() - chrono::Duration::hours(2))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    {
+        let conn = f.storage.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET last_activity_at = ?1 WHERE id = ?2",
+            rusqlite::params![began, session],
+        )
+        .unwrap();
+    }
+    let began = last(&f.storage);
+    let at = |minutes: i64| (began + chrono::Duration::minutes(minutes)).to_rfc3339();
+    let record = |kind: &str, minutes: i64| {
+        serde_json::json!({"type": kind, "timestamp": at(minutes),
+            "message": {"content": [{"type": "tool_result", "content": "ok"}]}})
+        .to_string()
+    };
+    // An hour and a half of records that hold no turn, none of them the
+    // idle time after the one before.
+    let lines: Vec<String> = [
+        ("user", 20),
+        ("assistant", 45),
+        ("system", 60),
+        ("user", 85),
+    ]
+    .into_iter()
+    .map(|(kind, minutes)| record(kind, minutes))
+    .collect();
+    append_lines(&path, &lines);
+    assert_eq!(
+        reader
+            .poll_file(&path, ConversationWatcher::parse_turn)
+            .unwrap(),
+        0
+    );
+    assert_eq!(last(&f.storage), began + chrono::Duration::minutes(85));
+    // A record without a time, and one that is not JSON, say nothing.
+    append_lines(
+        &path,
+        &[
+            serde_json::json!({"type": "summary"}).to_string(),
+            "not a record".to_owned(),
+        ],
+    );
+    reader
+        .poll_file(&path, ConversationWatcher::parse_turn)
+        .unwrap();
+    assert_eq!(last(&f.storage), began + chrono::Duration::minutes(85));
+}
+
+/// The reader keeps the stretches of work of a transcript as it reads:
+/// every record of the owner's session counts, a record of a session a
+/// program ran does not, and a pause begins a new stretch.
+#[test]
+fn work_stretch_the_reader_keeps_stretches_as_it_reads() {
+    let f = Fixture::new();
+    let reader = IngressTail::new(f.storage.clone(), "conversation").with_session_idle(1800);
+    let path = f.dir.join("work.jsonl");
+    std::fs::write(&path, "").unwrap();
+    let stretches = |storage: &Storage| -> Vec<(String, String)> {
+        let conn = storage.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT started_at, last_at FROM work_stretches ORDER BY started_at")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let record = |at: &str, entrypoint: &str| {
+        serde_json::json!({"type": "user", "timestamp": at, "entrypoint": entrypoint,
+            "message": {"content": [{"type": "tool_result", "content": "ok"}]}})
+        .to_string()
+    };
+    append_lines(
+        &path,
+        &[
+            record("2026-09-20T18:00:00.250Z", "claude-desktop"),
+            record("2026-09-20T18:20:00Z", "claude-desktop"),
+            // A session a program ran is not the owner at work.
+            record("2026-09-20T18:40:00Z", "sdk-py"),
+        ],
+    );
+    reader
+        .poll_file(&path, ConversationWatcher::parse_turn)
+        .unwrap();
+    assert_eq!(
+        stretches(&f.storage),
+        vec![(
+            "2026-09-20 18:00:00".to_owned(),
+            "2026-09-20 18:20:00".to_owned()
+        )]
+    );
+    // The next poll: the same stretch goes on, then a pause and a new one.
+    append_lines(
+        &path,
+        &[
+            record("2026-09-20T18:45:00Z", "claude-desktop"),
+            record("2026-09-20T20:00:00Z", "claude-desktop"),
+        ],
+    );
+    reader
+        .poll_file(&path, ConversationWatcher::parse_turn)
+        .unwrap();
+    assert_eq!(
+        stretches(&f.storage),
+        vec![
+            (
+                "2026-09-20 18:00:00".to_owned(),
+                "2026-09-20 18:45:00".to_owned()
+            ),
+            (
+                "2026-09-20 20:00:00".to_owned(),
+                "2026-09-20 20:00:00".to_owned()
+            ),
+        ]
+    );
+}
+
+/// A rollout moved into the archive is the same transcript: the reader
+/// resumes it under the same stream, and its stretch goes on in one row.
+#[test]
+fn work_stretch_a_transcript_moved_into_the_archive_keeps_its_stretch() {
+    let f = Fixture::new();
+    let reader = IngressTail::new(f.storage.clone(), "codex").with_session_idle(1800);
+    let live = f.dir.join("sessions");
+    let archive = f.dir.join("archived_sessions");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&archive).unwrap();
+    let record = |at: &str| {
+        serde_json::json!({"type": "response_item", "timestamp": at,
+            "payload": {"type": "reasoning"}})
+        .to_string()
+    };
+    let before = live.join("rollout-moved.jsonl");
+    append_lines(
+        &before,
+        &[
+            record("2026-09-21T09:00:00Z"),
+            record("2026-09-21T09:10:00Z"),
+        ],
+    );
+    reader.poll_file(&before, CodexWatcher::parse_turn).unwrap();
+    let after = archive.join("rollout-moved.jsonl");
+    std::fs::rename(&before, &after).unwrap();
+    append_lines(&after, &[record("2026-09-21T09:25:00Z")]);
+    reader.poll_file(&after, CodexWatcher::parse_turn).unwrap();
+    let conn = f.storage.conn.lock().unwrap();
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT started_at, last_at FROM work_stretches")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "2026-09-21 09:00:00".to_owned(),
+            "2026-09-21 09:25:00".to_owned()
+        )]
     );
 }

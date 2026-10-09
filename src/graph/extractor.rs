@@ -51,7 +51,7 @@ pub struct ExtractionResult {
 }
 
 /// Known tech names for auto-detection
-const KNOWN_TECH: &[&str] = &[
+pub(crate) const KNOWN_TECH: &[&str] = &[
     "rust",
     "python",
     "typescript",

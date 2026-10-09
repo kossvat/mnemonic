@@ -6,8 +6,10 @@ use tracing::{info, warn};
 use super::conversation::ConversationWatcher;
 use std::sync::Arc;
 
+use super::discovery::{Discovery, FULL_PASS_EVERY, FullPass, is_rollout};
 use super::ingress::{IngressTail, ParsedTurn, RecordScope};
-use super::scope::{CodexScope, ProjectScope};
+use super::observe::{self, Observation};
+use super::scope::{CodexSession, ProjectScope};
 use crate::event::EventSource;
 use crate::storage::Storage;
 
@@ -36,6 +38,14 @@ pub struct CodexWatcher {
     /// Capture only sessions working inside these project roots.
     /// Unrestricted by default.
     scope: ProjectScope,
+    /// The idle time of a session, in seconds: its last activity follows
+    /// the records of its transcript across steps shorter than this.
+    session_idle_secs: u64,
+    /// The map of the workspace's projects, when one is configured: with
+    /// it the observation pass runs beside admission.
+    projects: Option<crate::projects::SharedMap>,
+    /// The live state of the daemon, told what the pass observes.
+    live: Option<std::sync::Arc<crate::live_run::Live>>,
 }
 
 impl CodexWatcher {
@@ -46,7 +56,16 @@ impl CodexWatcher {
             poll_interval_secs: 10,
             state_path: None,
             scope: ProjectScope::default(),
+            session_idle_secs: super::ingress::DEFAULT_SESSION_IDLE_SECS,
+            projects: None,
+            live: None,
         }
+    }
+
+    /// The idle time sessions close by, as the daemon is configured.
+    pub fn with_session_idle(mut self, secs: u64) -> Self {
+        self.session_idle_secs = secs;
+        self
     }
 
     /// Limit capture to sessions working inside the scope's project roots.
@@ -56,6 +75,18 @@ impl CodexWatcher {
     }
 
     /// Also scan an archived-sessions directory (flat list of rollouts).
+    /// Observe the rollouts into segments of projects, by this map.
+    pub fn with_projects(mut self, projects: crate::projects::SharedMap) -> Self {
+        self.projects = Some(projects);
+        self
+    }
+
+    /// Tell the live state of the daemon what the pass observes.
+    pub fn with_live(mut self, live: std::sync::Arc<crate::live_run::Live>) -> Self {
+        self.live = Some(live);
+        self
+    }
+
     pub fn with_archived_dir(mut self, dir: PathBuf) -> Self {
         self.archived_dir = Some(dir);
         self
@@ -147,12 +178,7 @@ fn collect_rollout(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect_rollout(&path, out);
-        } else if path.extension().is_some_and(|e| e == "jsonl")
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("rollout-"))
-        {
+        } else if is_rollout(&path) {
             out.push(path);
         }
     }
@@ -220,13 +246,15 @@ impl CodexWatcher {
             .as_deref()
             .map(ConversationWatcher::load_positions)
             .unwrap_or_default();
-        let ingress = IngressTail::new(storage, "codex");
-        // The folder in force is carried between polls, so one scope lives
-        // as long as the watcher does.
-        let mut scoped = self
-            .scope
-            .is_restricted()
-            .then(|| CodexScope::new(self.scope.clone()));
+        let observation = Observation::new(storage.clone(), observe::CODEX, self.session_idle_secs)
+            .with_live(self.live.clone());
+        let ingress = IngressTail::new(storage, "codex").with_session_idle(self.session_idle_secs);
+        // The origin of each session, and the folder in force when the
+        // scope is restricted, are carried between polls, so one scope
+        // lives as long as the watcher does.
+        let mut session = CodexSession::new(self.scope.clone());
+        let mut discovery = Discovery::default();
+        let mut pass = FullPass::new(FULL_PASS_EVERY);
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(self.poll_interval_secs));
         loop {
@@ -234,14 +262,36 @@ impl CodexWatcher {
             if wake.is_closed() {
                 return Ok(());
             }
-            let files = self.find_rollout_files();
-            let scope = scoped.as_mut().map(|scope| scope as &mut dyn RecordScope);
-            match ingress.tick_scoped(&files, &legacy, Self::parse_turn, scope) {
+            let full = pass.due(std::time::Instant::now());
+            if full {
+                discovery.forget();
+            }
+            let mut files = Vec::new();
+            discovery.codex_rollouts(&self.sessions_dir, &mut files);
+            if let Some(archive) = &self.archived_dir {
+                discovery.codex_rollouts(archive, &mut files);
+            }
+            let scope = Some(&mut session as &mut dyn RecordScope);
+            match ingress.tick_scoped(&files, &legacy, Self::parse_turn, scope, full) {
                 Ok(n) if n > 0 => {
                     let _ = wake.try_send(());
                 }
                 Ok(_) => {}
                 Err(e) => warn!("Codex ingress tick will retry: {e}"),
+            }
+            // The observation pass, beside admission and never through it.
+            // A profile with no workspace has no registry and keeps no
+            // segment: its sessions are only told to the live state.
+            let observed = match &self.projects {
+                Some(projects) => crate::projects::current(projects).map(|map| {
+                    observation.tick_seen(&files, &map, full, |path| ingress.stamp_of(path))
+                }),
+                None => {
+                    Some(observation.tick_unstored(&files, full, |path| ingress.stamp_of(path)))
+                }
+            };
+            if let Some(Err(e)) = observed {
+                warn!("Codex observation tick will retry: {e}");
             }
         }
     }

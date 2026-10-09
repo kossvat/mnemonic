@@ -32,6 +32,17 @@ use crate::embedding::Embedder;
 use crate::retrieval::{HybridOptions, hybrid_search};
 use crate::storage::Storage;
 
+#[path = "http_curated_graph.rs"]
+mod curated_graph;
+#[path = "http_overrides.rs"]
+mod overrides;
+#[path = "http_project_read.rs"]
+mod project_read;
+#[path = "http_projects.rs"]
+mod projects;
+#[path = "http_timeline.rs"]
+mod timeline;
+
 const TOKEN_HEADER: &str = "x-mnemonic-token";
 
 #[derive(Clone)]
@@ -50,6 +61,9 @@ struct AppState {
     /// reads never disturb the live sampler. None when activity has
     /// never run.
     activity: Option<Arc<crate::activity::ActivityStore>>,
+    /// The projects in work now, kept by the daemon. None where no daemon
+    /// keeps one.
+    live: Option<Arc<crate::live_run::Live>>,
 }
 
 /// Build the axum router. `bind_test` is a hook for tests to pass a
@@ -85,7 +99,13 @@ fn router(state: AppState) -> Router {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([header::CONTENT_TYPE, HeaderName::from_static(TOKEN_HEADER)])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::IF_NONE_MATCH,
+            HeaderName::from_static(TOKEN_HEADER),
+        ])
+        // The tag of the live snapshot, which a page sends back.
+        .expose_headers([header::ETAG])
         // Explicit allowlist — replaces previous `Any`. Combined with the
         // 127.0.0.1 bind + Host header guard, this defends against DNS
         // rebinding: even if a malicious site resolves a hostname to
@@ -95,14 +115,24 @@ fn router(state: AppState) -> Router {
     Router::new()
         // Read endpoints
         .route("/api/status", get(handle_status))
+        // The projects in work now: one snapshot, with a tag (design 11).
+        .route("/api/live", get(handle_live))
+        .route("/api/projects", get(project_read::board))
+        .route("/api/projects/timeline", get(timeline::read))
+        .route("/api/projects/{key}", get(project_read::detail))
         .route("/api/memories", get(handle_memories))
         .route("/api/memories/{id}", get(handle_memory_get))
         .route("/api/memories/{id}/sources", get(handle_memory_sources))
         .route("/api/entities", get(handle_entities))
         .route("/api/entities/{name}", get(handle_entity_get))
         .route("/api/graph", get(handle_graph))
+        .route("/api/graph/curated", get(curated_graph::graph))
+        .route("/api/graph/curated/edge", get(curated_graph::edge))
+        .route("/api/graph/curated/archives", get(curated_graph::archives))
+        .route("/api/entities/{name}/archive", post(curated_graph::archive))
         .route("/api/memory-graph", get(handle_memory_graph))
         .route("/api/stats/daily", get(handle_daily))
+        .route("/api/recall", get(handle_recall))
         .route("/api/activity/today", get(handle_activity_today))
         .route("/api/activity/week", get(handle_activity_week))
         .route("/api/activity/summary", get(handle_activity_summary))
@@ -120,6 +150,17 @@ fn router(state: AppState) -> Router {
         .route("/api/cleanup", post(handle_cleanup))
         .route("/api/reflect", post(handle_reflect))
         .route("/api/entities/{name}/merge", post(handle_entity_merge))
+        // The registry of projects: a change of one row each, with its undo.
+        .route("/api/projects/{key}/archive", post(projects::archive))
+        .route("/api/projects/{key}/unarchive", post(projects::unarchive))
+        .route("/api/projects/{key}/merge", post(projects::merge))
+        .route("/api/projects/{key}/unmerge", post(projects::unmerge))
+        // The owner's corrections of attribution: one kept, one undone.
+        .route("/api/attribution/overrides", post(overrides::add))
+        .route(
+            "/api/attribution/overrides/{id}",
+            axum::routing::delete(overrides::remove),
+        )
         .route("/api/memories/{id}", axum::routing::delete(handle_forget))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(middleware::from_fn(host_guard))
@@ -187,6 +228,7 @@ pub async fn serve(
     config: Config,
     storage: Arc<Storage>,
     embedder: Arc<dyn Embedder>,
+    live: Option<Arc<crate::live_run::Live>>,
 ) -> Result<()> {
     let token = load_or_create_token(&config.ui.token_file)?;
     let bind = format!("127.0.0.1:{}", config.ui.port);
@@ -220,6 +262,7 @@ pub async fn serve(
         token,
         config: config.clone(),
         activity,
+        live,
     });
     axum::serve(listener, app).await?;
     Ok(())
@@ -339,6 +382,52 @@ struct StatusResponse {
 struct TypeCount {
     memory_type: String,
     count: usize,
+}
+
+/// GET /api/live: the snapshot of the projects in work now. A request
+/// that carries the tag of the snapshot it holds gets 304 and no body.
+/// A due plan sweep reads files and registry rows, the memories of the
+/// store are counted, and nothing is written.
+async fn handle_live(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+    use axum::response::IntoResponse;
+    let Some(live) = &state.live else {
+        return AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no live state in this process".into(),
+        )
+        .into_response();
+    };
+    let (refresh, storage) = (live.clone(), state.storage.clone());
+    if tokio::task::spawn_blocking(move || {
+        refresh.refresh_plans();
+        refresh.count_memories(&storage);
+    })
+    .await
+    .is_err()
+    {
+        return AppError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "plan reader unavailable".into(),
+        )
+        .into_response();
+    }
+    let (tag, body) = live.state.snapshot();
+    let held = headers
+        .get(IF_NONE_MATCH)
+        .is_some_and(|held| held.as_bytes() == tag.as_bytes());
+    if held {
+        return (StatusCode::NOT_MODIFIED, [(ETAG, tag)]).into_response();
+    }
+    (
+        StatusCode::OK,
+        [(ETAG, tag), (CONTENT_TYPE, "application/json".to_string())],
+        body.as_ref().clone(),
+    )
+        .into_response()
 }
 
 async fn handle_status(State(state): State<AppState>) -> Result<Json<StatusResponse>, AppError> {
@@ -500,35 +589,23 @@ struct LeaderboardQuery {
     limit: Option<usize>,
 }
 
-/// GET /api/leaderboard/sessions?limit=10 — the longest COMPLETED sessions,
+/// GET /api/leaderboard/sessions?limit=10 — the longest stretches of work,
 /// longest first: `{"sessions": [{session_id, started_at, duration_seconds,
-/// duration_human, top_project}]}`. Wrapped in an object (not a bare array)
-/// because the widget's httpObject client parses top-level JSON objects
-/// only — and it leaves room for response metadata later. Open sessions
-/// and malformed rows are excluded by the storage query; `top_project` is
-/// null when no project memory is linked to the session.
+/// duration_human, top_project, live}]}`. Wrapped in an object (not a bare
+/// array) because the widget's httpObject client parses top-level JSON
+/// objects only — and it leaves room for response metadata later. A
+/// stretch still going on is in the list with the length it has so far and
+/// `live: true`; `top_project` is null when no project memory falls in its
+/// window. `now` holds the stretches going on, longest first, whatever
+/// their rank: the same rows, at most three.
 async fn handle_session_leaderboard(
     State(state): State<AppState>,
     Query(q): Query<LeaderboardQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
-    let rows = state
-        .storage
-        .longest_sessions(limit)
-        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let payload: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|r| {
-            serde_json::json!({
-                "session_id": r.session_id,
-                "started_at": r.started_at,
-                "duration_seconds": r.duration_seconds,
-                "duration_human": crate::storage::human_duration(r.duration_seconds),
-                "top_project": r.top_project,
-            })
-        })
-        .collect();
-    Ok(Json(serde_json::json!({ "sessions": payload })))
+    crate::storage::leaderboard_payload(&state.storage, limit, chrono::Utc::now())
+        .map(Json)
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 /// GET /api/activity/day?date=YYYY-MM-DD — one day's detail + session
@@ -812,6 +889,32 @@ async fn handle_daily(
 }
 
 #[derive(Deserialize)]
+struct RecallQuery {
+    day: Option<String>,
+}
+
+/// The summary of a day of the recall log: the same bytes as
+/// `mnemonic recall --json` for the same store, timezone and
+/// configuration. A day that is not a date is refused; an empty day is
+/// an object of zeros.
+async fn handle_recall(
+    State(state): State<AppState>,
+    Query(q): Query<RecallQuery>,
+) -> Result<Json<crate::recall_day::DaySummary>, AppError> {
+    let day = match q.day {
+        Some(text) => chrono::NaiveDate::parse_from_str(&text, "%Y-%m-%d").map_err(|_| {
+            AppError(
+                StatusCode::BAD_REQUEST,
+                "day is not a day of the form YYYY-MM-DD".to_string(),
+            )
+        })?,
+        None => chrono::Local::now().date_naive(),
+    };
+    let summary = crate::recall_day::summary(&state.storage, day, state.config.recall.log)?;
+    Ok(Json(summary))
+}
+
+#[derive(Deserialize)]
 struct SearchBody {
     query: String,
     #[serde(default)]
@@ -999,7 +1102,8 @@ async fn handle_reextract(
                     Box::new(backend),
                     state.storage.clone(),
                     &state.config.llm,
-                );
+                )
+                .with_project_registry(state.config.projects.workspace.is_some());
                 Box::new(crate::graph::extractor_llm::CompositeExtractor::new(
                     Box::new(RuleExtractor::new()),
                     Box::new(llm),
@@ -1101,6 +1205,7 @@ async fn handle_reextract_stream(
     // spawn_blocking which iterates the DB.
     let storage = state.storage.clone();
     let cfg_llm = state.config.llm.clone();
+    let projects_configured = state.config.projects.workspace.is_some();
     let llm_enabled = cfg_llm.enabled;
     let llm_model = cfg_llm.model.clone();
 
@@ -1139,7 +1244,8 @@ async fn handle_reextract_stream(
                         Box::new(backend),
                         storage.clone(),
                         &cfg_llm,
-                    );
+                    )
+                    .with_project_registry(projects_configured);
                     Box::new(crate::graph::extractor_llm::CompositeExtractor::new(
                         Box::new(RuleExtractor::new()),
                         Box::new(llm),
@@ -1352,7 +1458,7 @@ async fn handle_forget(
 }
 
 fn memory_to_json(entry: &crate::event::MemoryEntry) -> serde_json::Value {
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "id": entry.id,
         "timestamp": entry.timestamp.to_rfc3339(),
         "title": entry.title,
@@ -1360,7 +1466,13 @@ fn memory_to_json(entry: &crate::event::MemoryEntry) -> serde_json::Value {
         "memory_type": entry.memory_type.to_string(),
         "tags": entry.tags,
         "importance": entry.importance,
-    })
+    });
+    // A capture the rules name as noise says so; other items carry no
+    // such field.
+    if let Some(rule) = crate::quality::judge(entry) {
+        json["noise"] = serde_json::Value::String(rule.as_str().to_string());
+    }
+    json
 }
 
 // ───────────────────────── errors ─────────────────────────
@@ -1416,6 +1528,7 @@ mod tests {
             token: "test-token".to_string(),
             config: Config::default(),
             activity: None,
+            live: None,
         }
     }
 
@@ -1452,6 +1565,107 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The items of /api/memories carry `noise` for a capture the rules
+    /// name, and no such field for the others.
+    #[tokio::test]
+    async fn context_quality_api_memories_marks_noise() {
+        use crate::quality::Capture;
+        let db = tmp_db();
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let noise = crate::test_support::captured(Capture::Decision, "| Option | Decided |");
+        let clean =
+            crate::test_support::captured(Capture::Decision, "Decision: use SQLite for the index");
+        storage.save(&noise).unwrap();
+        storage.save(&clean).unwrap();
+        let mut app = router(test_state(storage));
+        let request = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/api/memories")
+            .header(header::HOST, "localhost")
+            .header(TOKEN_HEADER, "test-token")
+            .body(Body::empty())
+            .unwrap();
+        let json = response_json(app.call(request).await.unwrap()).await;
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        let of = |id: &str| results.iter().find(|r| r["id"] == id).unwrap();
+        assert_eq!(of(&noise.id)["noise"], "table-row");
+        assert!(of(&clean.id).get("noise").is_none());
+    }
+
+    /// The route returns the bytes of the summary, answers 401 without the
+    /// token, and refuses a day that is not a date.
+    #[tokio::test]
+    async fn recall_day_the_route_returns_the_same_bytes_as_the_command() {
+        let db = tmp_db();
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let entry = crate::event::MemoryEntry::new(
+            "Decision: use SQLite for the index",
+            "body",
+            crate::event::MemoryType::Decision,
+            crate::event::EventSource::Socket,
+        );
+        storage.save(&entry).unwrap();
+        let writer = crate::recall_log::Writer::new(&db, true);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+        let (start, _) = crate::activity::local_day_bounds_utc(day).unwrap();
+        writer
+            .write(
+                &crate::recall_log::Record {
+                    surface: crate::recall_log::Surface::Mcp,
+                    tool: crate::recall_log::Tool::MemorySearch,
+                    items: vec![crate::recall_log::Item {
+                        memory_id: entry.id.clone(),
+                        section: None,
+                    }],
+                    chars: 10,
+                    hidden: 0,
+                },
+                start + chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let expected =
+            serde_json::to_string(&crate::recall_day::summary(&storage, day, true).unwrap())
+                .unwrap();
+        assert!(expected.contains("\"calls_answered\":1"), "{expected}");
+        let mut app = router(test_state(storage));
+        let get = |path: &str, token: Option<&str>| {
+            let mut builder = axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header(header::HOST, "localhost");
+            if let Some(token) = token {
+                builder = builder.header(TOKEN_HEADER, token);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        let response = app
+            .call(get("/api/recall?day=2026-03-08", Some("test-token")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), expected);
+        let response = app
+            .call(get("/api/recall?day=2026-03-08", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .call(get("/api/recall?day=yesterday", Some("test-token")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Without a day: today, an object of zeros here.
+        let response = app
+            .call(get("/api/recall", Some("test-token")))
+            .await
+            .unwrap();
+        let json = response_json(response).await;
+        assert_eq!(json["calls_answered"], 0);
+        assert_eq!(json["log_enabled"], true);
     }
 
     #[test]

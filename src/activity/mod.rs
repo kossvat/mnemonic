@@ -27,8 +27,13 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
+#[cfg(test)]
+use chrono::TimeZone;
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use rusqlite::Connection;
+
+mod cached_days;
+mod day_bounds;
 
 /// An open or closed span of continuous work.
 #[derive(Debug, Clone, PartialEq)]
@@ -794,26 +799,42 @@ impl ActivityStore {
     {
         let day_sessions = self.day_sessions_with_signals(day, cfg, pad, get_signals)?;
         let result = crate::attribution::carry_forward_day(&day_sessions, mem_times, carry);
+        let rows: Vec<(&str, f64, &str)> = result
+            .per_project
+            .iter()
+            .map(|(key, seconds, confidence)| (key.as_str(), *seconds, confidence.as_str()))
+            .collect();
+        self.write_day(day, &rows, result.unattributed_seconds)
+    }
 
+    /// Replace the rows of one local day: the seconds of each project key
+    /// with the confidence in them, and the seconds given to none. Rows
+    /// that carry one key are summed.
+    pub fn write_day(
+        &self,
+        day: NaiveDate,
+        rows: &[(&str, f64, &str)],
+        mut unattributed: f64,
+    ) -> Result<()> {
         let day_str = day.format("%Y-%m-%d").to_string();
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM project_attribution WHERE day = ?1", [&day_str])?;
-        let mut unattributed = result.unattributed_seconds;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO project_attribution (day, project_key, seconds, confidence)
-                 VALUES (?1, ?2, ?3, ?4)",
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(day, project_key) DO UPDATE SET seconds = seconds + excluded.seconds",
             )?;
-            for (k, secs, conf) in &result.per_project {
+            for (k, secs, conf) in rows {
                 // A project key the redaction policy refuses (a name stored
                 // before it) is not written again: its time is counted, as
                 // unattributed, and the day is still recomputed.
-                if crate::redaction::state::check_identities([k.as_str()]).is_err() {
+                if crate::redaction::state::check_identities([*k]).is_err() {
                     unattributed += secs;
                     continue;
                 }
-                stmt.execute(rusqlite::params![day_str, k, secs, conf.as_str()])?;
+                stmt.execute(rusqlite::params![day_str, k, secs, conf])?;
             }
         }
         tx.execute(
@@ -822,6 +843,38 @@ impl ActivityStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Every interval of activity that overlaps `[from, to)`, cut to it,
+    /// in order. Unlike the blocks a day shows, a fragment under a minute
+    /// is here: its seconds are in the day's total, so they are in the
+    /// split of that total too.
+    pub fn intervals_between(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<(DateTime<Utc>, DateTime<Utc>)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT started_at, ended_at FROM work_sessions
+             WHERE julianday(ended_at) > julianday(?1)
+               AND julianday(started_at) < julianday(?2)
+             ORDER BY started_at",
+        )?;
+        let rows = stmt.query_map([from.to_rfc3339(), to.to_rfc3339()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (started, ended) = row?;
+            if let (Some(started), Some(ended)) = (parse_dt(&started), parse_dt(&ended)) {
+                let (started, ended) = (started.max(from), ended.min(to));
+                if ended > started {
+                    out.push((started, ended));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Per-project time for today + the last 7 local days, plus the
@@ -953,24 +1006,15 @@ impl ActivityStore {
     }
 }
 
-/// Local-day → UTC `[start, end)` bounds. Public so the journal can read a
-/// day's memory window with the same local-midnight semantics as activity.
+/// Local-day → UTC `[start, end)` bounds, using the first representable
+/// instant when midnight is skipped. A wholly skipped local date has no bounds.
+/// Every day reader shares these boundaries.
 pub fn local_day_bounds_utc(day: NaiveDate) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     local_day_bounds(day)
 }
 
 fn local_day_bounds(day: NaiveDate) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-    let start_naive = day.and_hms_opt(0, 0, 0)?;
-    let end_naive = (day + chrono::Duration::days(1)).and_hms_opt(0, 0, 0)?;
-    let start = Local
-        .from_local_datetime(&start_naive)
-        .earliest()?
-        .with_timezone(&Utc);
-    let end = Local
-        .from_local_datetime(&end_naive)
-        .earliest()?
-        .with_timezone(&Utc);
-    Some((start, end))
+    day_bounds::in_zone(&Local, day)
 }
 
 fn seconds_overlapping_local_date(conn: &Connection, day: NaiveDate) -> Result<f64> {

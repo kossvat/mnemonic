@@ -148,6 +148,9 @@ async fn handle_request(
                 "embedding": {
                     "model_id": embedder.model_id(),
                     "dim": embedder.dim_hint(),
+                    // The time the first query after a release waited
+                    // for the model, when it was released before.
+                    "last_reload_ms": embedder.last_reload().map(|took| took.as_millis() as u64),
                 },
             });
             json_response(200, &body)

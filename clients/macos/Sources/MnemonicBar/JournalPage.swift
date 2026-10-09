@@ -187,6 +187,7 @@ struct JournalPageView: View {
             }
         }
         .onAppear {
+            service.selectPage(3)
             if loadedDay == nil { loadDay(selectedDate) }
         }
     }
@@ -364,24 +365,22 @@ struct JournalPageView: View {
     }
 
     private func loadDay(_ date: Date) {
+        guard service.isOpen, service.selectedPage == 3 else { return }
         let id = journalDayID(date)
         isLoading = true
         errorText = nil
-        DispatchQueue.global(qos: .utility).async {
-            let obj = service.httpObject("/api/journal?day=\(id)")
-            DispatchQueue.main.async {
-                guard journalDayID(selectedDate) == id else { return }
-                if let obj, let parsed = JournalDay.fromJSON(obj, fallbackDate: date) {
-                    loadedDay = parsed
-                    errorText = nil
-                } else {
-                    // No fabricated fallback on a live build — show the empty /
-                    // error state rather than inventing a day's work.
-                    loadedDay = nil
-                    errorText = "Journal backend is not ready yet."
-                }
-                isLoading = false
+        service.loadJournal(day: id) { obj in
+            guard journalDayID(selectedDate) == id else { return }
+            if let obj, let parsed = JournalDay.fromJSON(obj, fallbackDate: date) {
+                loadedDay = parsed
+                errorText = nil
+            } else {
+                // No fabricated fallback on a live build — show the empty /
+                // error state rather than inventing a day's work.
+                loadedDay = nil
+                errorText = "Journal backend is not ready yet."
             }
+            isLoading = false
         }
     }
 

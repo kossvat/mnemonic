@@ -2,6 +2,8 @@
 //! printed and exported. Credential fixtures are assembled at run time.
 #![cfg(unix)]
 
+mod common;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -38,7 +40,7 @@ fn redaction_memory_cli_save_and_import_store_prepared_text_only() {
     let token = token();
     let root = tempfile::Builder::new()
         .prefix("mn-redact-cli-")
-        .tempdir_in("/tmp")
+        .tempdir_in(common::short_root())
         .unwrap();
     let user_home = root.path().join("user");
     std::fs::create_dir_all(&user_home).unwrap();
@@ -201,7 +203,7 @@ fn redaction_state_cli_refuses_identities_and_prepares_narrative() {
     let value: String = "a1B2c3D4e5F6".chars().cycle().take(24).collect();
     let root = tempfile::Builder::new()
         .prefix("mn-redact-state-cli-")
-        .tempdir_in("/tmp")
+        .tempdir_in(common::short_root())
         .unwrap();
     let user_home = root.path().join("user");
     std::fs::create_dir_all(&user_home).unwrap();
@@ -333,7 +335,7 @@ fn redaction_generated_cli_prepares_queries_and_topics_and_refuses_a_path() {
     let token = token();
     let root = tempfile::Builder::new()
         .prefix("mn-redact-gen-")
-        .tempdir_in("/tmp")
+        .tempdir_in(common::short_root())
         .unwrap();
     let user_home = root.path().join("user");
     std::fs::create_dir_all(&user_home).unwrap();
@@ -412,7 +414,7 @@ fn redaction_outputs_cli_no_file_holds_what_a_save_redacted() {
     let token = token();
     let root = tempfile::Builder::new()
         .prefix("mn-redact-out-")
-        .tempdir_in("/tmp")
+        .tempdir_in(common::short_root())
         .unwrap();
     let user_home = root.path().join("user");
     std::fs::create_dir_all(&user_home).unwrap();
@@ -464,7 +466,7 @@ fn redaction_outputs_cli_does_not_say_back_what_the_policy_refuses() {
     let token = token();
     let root = tempfile::Builder::new()
         .prefix("mn-redact-err-")
-        .tempdir_in("/tmp")
+        .tempdir_in(common::short_root())
         .unwrap();
     let user_home = root.path().join("user");
     std::fs::create_dir_all(&user_home).unwrap();

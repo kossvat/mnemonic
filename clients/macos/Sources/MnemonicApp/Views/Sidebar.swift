@@ -9,10 +9,12 @@ struct Sidebar: View {
         let routes: [AppRoute]
     }
 
-    private let groups: [Group] = [
-        Group(label: "Workspace", routes: [.overview, .memories, .search, .entities, .graph, .memoryMap]),
-        Group(label: "Admin",     routes: [.manage])
-    ]
+    private var groups: [Group] {
+        [Group(label: "Workspace", routes: [
+            .projects, .timeline(TimelineDay.today()), .overview, .memories,
+            .search, .entities, .graph, .memoryMap
+        ]), Group(label: "Admin", routes: [.manage])]
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -64,9 +66,9 @@ struct Sidebar: View {
     }
 
     private func sidebarRow(_ route: AppRoute) -> some View {
-        let isActive = selection == route
+        let isActive = selection.sidebarRoute == route.sidebarRoute
         return Button {
-            selection = route
+            selection = route.sidebarRoute
         } label: {
             HStack(spacing: Theme.Space.sm) {
                 // Active indicator

@@ -117,7 +117,8 @@ pub fn collect(storage: &Storage, activity: &ActivityStore, day: NaiveDate) -> R
     };
 
     // Measured hours per project + the honest unattributed bucket.
-    let (attr_rows, unattributed_seconds) = activity.project_attribution_for_day(day)?;
+    let (attr_rows, unattributed_seconds) =
+        storage.rekeyed_day_with_unattributed(activity.project_attribution_for_day(day)?)?;
 
     // The day's project-linked memories, for per-project bullets/events + names.
     let proj_mems = storage.project_memories_in_window(start, end, MIN_PROJECT_MEMS)?;
@@ -136,13 +137,25 @@ pub fn collect(storage: &Storage, activity: &ActivityStore, day: NaiveDate) -> R
         }
     }
 
+    let keys = storage.attribution_keys_now()?;
     let mut memory_candidates: Vec<(MemoryEntry, Vec<(String, String)>)> =
         memory_candidates.into_values().collect();
     memory_candidates.sort_by_key(|(m, _)| m.timestamp);
     for (m, candidates) in memory_candidates {
+        // The project of a memory is chosen among the names its entities
+        // carry, the title being matched against those. What was chosen
+        // is then joined to the time rows under the key it stands for
+        // now, as the rows are: a project merged into another keeps its
+        // lines under the one it was merged into, with that one's name.
         let Some((key, name)) = primary_project_for_memory(&m, &candidates) else {
             continue;
         };
+        let now = keys.now(&key);
+        let name = match now == key {
+            true => name,
+            false => storage.entity_name(&now).ok().flatten().unwrap_or(name),
+        };
+        let key = now;
         let text = clean_line(&m.title);
         if text.is_empty() {
             continue;

@@ -26,7 +26,8 @@ use serde::Serialize;
 use super::codex::CodexWatcher;
 use super::conversation::ConversationWatcher;
 use super::ingress::{CONVERSATION_NAMESPACE, ParsedTurn, RecordScope, message_key, stream_of};
-use super::scope::{ClaudeScope, CodexScope, ProjectScope};
+use super::origin::ClaudeOrigin;
+use super::scope::{ClaudeScope, CodexOrigin, CodexScope, ProjectScope};
 use crate::config::Config;
 use crate::ingest::{IngestPayload, IngestRecord};
 use crate::redaction;
@@ -132,7 +133,7 @@ fn refused_path(path: &Path, stream: &str) -> bool {
 
 /// One transcript's complete records, in order. A trailing record still
 /// being written is left for live capture.
-fn complete_records(path: &Path, mut visit: impl FnMut(&str)) -> Result<()> {
+pub(super) fn complete_records(path: &Path, mut visit: impl FnMut(&str)) -> Result<()> {
     let mut reader = BufReader::new(std::fs::File::open(path)?);
     let mut record = Vec::new();
     loop {
@@ -240,6 +241,74 @@ pub fn history_floor(storage: &Storage, config: &Config) -> Result<Option<DateTi
 
 /// Count, and with `apply` queue, the history of every transcript this store
 /// reads.
+/// Bring in the stretches of work of the transcripts that were there
+/// before stretches were kept: every transcript the watchers would read is
+/// read from its first byte, by the same scopes and the same rule for a
+/// session a program ran, and its stretches become what its records give.
+/// Reading it again changes nothing. Returns the transcripts read and the
+/// stretches they hold.
+pub fn backfill_work_stretches(storage: &Storage, config: &Config) -> Result<(usize, usize)> {
+    let dirs = TranscriptDirs::of(config);
+    let scope = ProjectScope::new(&config.watchers.project_roots);
+    let idle = config.sessions.idle_timeout_secs;
+    let (mut transcripts, mut stretches) = (0, 0);
+    // A transcript is named by its stream, as the live reader names it.
+    let mut bring = |stream: &str, written: &[DateTime<Utc>]| -> Result<()> {
+        stretches += storage.bring_in_work_stretches(stream, written, idle, Utc::now())?;
+        transcripts += 1;
+        Ok(())
+    };
+    if let Some(dir) = dirs.conversation.filter(|dir| dir.exists()) {
+        let mut claude = ClaudeScope::new(scope.clone());
+        let mut origin = ClaudeOrigin::default();
+        for path in ConversationWatcher::new(dir).find_jsonl_files() {
+            let stream = stream_of(CONVERSATION_NAMESPACE, &path);
+            if refused_path(&path, &stream) {
+                continue;
+            }
+            claude.reset();
+            origin.reset();
+            let mut written = Vec::new();
+            complete_records(&path, |line| {
+                // Both see every record, so each keeps its state.
+                let from_owner = origin.admit(line);
+                let in_scope = !scope.is_restricted() || claude.admit(line);
+                if from_owner && in_scope {
+                    written.extend(super::ingress::written_at(line));
+                }
+            })?;
+            bring(&stream, &written)?;
+        }
+    }
+    if let Some(dir) = dirs.codex.filter(|dir| dir.exists()) {
+        let mut watcher = CodexWatcher::new(dir);
+        if let Some(archive) = dirs.codex_archive {
+            watcher = watcher.with_archived_dir(archive);
+        }
+        let mut codex = CodexScope::new(scope.clone());
+        let mut origin = CodexOrigin::default();
+        for path in watcher.find_rollout_files() {
+            let stream = stream_of("codex", &path);
+            if refused_path(&path, &stream) {
+                continue;
+            }
+            codex.reset();
+            origin.reset();
+            let mut written = Vec::new();
+            complete_records(&path, |line| {
+                // Both see every record, so each keeps its state.
+                let from_owner = origin.admit(line);
+                let in_scope = !scope.is_restricted() || codex.admit(line);
+                if from_owner && in_scope {
+                    written.extend(super::ingress::written_at(line));
+                }
+            })?;
+            bring(&stream, &written)?;
+        }
+    }
+    Ok((transcripts, stretches))
+}
+
 pub fn ingest_history(
     storage: &Storage,
     config: &Config,
@@ -264,6 +333,7 @@ pub fn ingest_history(
 
     if let Some(dir) = dirs.conversation.filter(|dir| dir.exists()) {
         let mut claude = ClaudeScope::new(scope.clone());
+        let mut origin = ClaudeOrigin::default();
         for path in ConversationWatcher::new(dir).find_jsonl_files() {
             let stream = stream_of(CONVERSATION_NAMESPACE, &path);
             if refused_path(&path, &stream) {
@@ -271,8 +341,12 @@ pub fn ingest_history(
                 continue;
             }
             claude.reset();
+            origin.reset();
             complete_records(&path, |line| {
-                let admitted = !scope.is_restricted() || claude.admit(line);
+                // Both see every record, so each keeps its state.
+                let from_owner = origin.admit(line);
+                let in_scope = !scope.is_restricted() || claude.admit(line);
+                let admitted = from_owner && in_scope;
                 let turn = ConversationWatcher::parse_turn(&path, line);
                 collector.take(CONVERSATION_NAMESPACE, &stream, turn, admitted);
             })?;
@@ -285,6 +359,7 @@ pub fn ingest_history(
             watcher = watcher.with_archived_dir(archive);
         }
         let mut codex = CodexScope::new(scope.clone());
+        let mut origin = CodexOrigin::default();
         for path in watcher.find_rollout_files() {
             let stream = stream_of("codex", &path);
             if refused_path(&path, &stream) {
@@ -292,8 +367,12 @@ pub fn ingest_history(
                 continue;
             }
             codex.reset();
+            origin.reset();
             complete_records(&path, |line| {
-                let admitted = !scope.is_restricted() || codex.admit(line);
+                // Both see every record, so each keeps its state.
+                let from_owner = origin.admit(line);
+                let in_scope = !scope.is_restricted() || codex.admit(line);
+                let admitted = from_owner && in_scope;
                 let turn = CodexWatcher::parse_turn(&path, line);
                 collector.take("codex", &stream, turn, admitted);
             })?;

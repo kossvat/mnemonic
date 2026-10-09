@@ -6,9 +6,13 @@ use tracing::{info, warn};
 
 use std::sync::Arc;
 
+use super::discovery::{Discovery, FULL_PASS_EVERY, FullPass};
 use super::ingress::{IngressTail, ParsedTurn, RecordScope};
-use super::scope::{ClaudeScope, ProjectScope};
+use super::observe::{self, Observation};
+use super::origin::ClaudeSession;
+use super::scope::ProjectScope;
 use crate::event::EventSource;
+use crate::projects::facts::{MACHINE_TURN_ORIGINS, is_written_by_the_app};
 use crate::storage::Storage;
 
 /// Watches Claude Code conversation JSONL files for user messages.
@@ -23,6 +27,14 @@ pub struct ConversationWatcher {
     /// Capture only sessions working inside these project roots.
     /// Unrestricted by default.
     scope: ProjectScope,
+    /// The idle time of a session, in seconds: its last activity follows
+    /// the records of its transcript across steps shorter than this.
+    session_idle_secs: u64,
+    /// The map of the workspace's projects, when one is configured: with
+    /// it the observation pass runs beside admission.
+    projects: Option<crate::projects::SharedMap>,
+    /// The live state of the daemon, told what the pass observes.
+    live: Option<std::sync::Arc<crate::live_run::Live>>,
 }
 
 /// Strong correction markers — self-sufficient anywhere in the message.
@@ -95,7 +107,28 @@ impl ConversationWatcher {
             poll_interval_secs: 10,
             state_path: None,
             scope: ProjectScope::default(),
+            session_idle_secs: super::ingress::DEFAULT_SESSION_IDLE_SECS,
+            projects: None,
+            live: None,
         }
+    }
+
+    /// The idle time sessions close by, as the daemon is configured.
+    pub fn with_session_idle(mut self, secs: u64) -> Self {
+        self.session_idle_secs = secs;
+        self
+    }
+
+    /// Observe the transcripts into segments of projects, by this map.
+    pub fn with_projects(mut self, projects: crate::projects::SharedMap) -> Self {
+        self.projects = Some(projects);
+        self
+    }
+
+    /// Tell the live state of the daemon what the pass observes.
+    pub fn with_live(mut self, live: std::sync::Arc<crate::live_run::Live>) -> Self {
+        self.live = Some(live);
+        self
     }
 
     /// Limit capture to sessions working inside the scope's project roots.
@@ -236,6 +269,9 @@ impl ConversationWatcher {
         if v.get("type")?.as_str()? != expected_role {
             return None;
         }
+        if !written_in_an_owner_session(&v, expected_role) {
+            return None;
+        }
 
         // Codex P1: real Claude Code JSONL uses TWO shapes for
         // `message.content`:
@@ -265,6 +301,9 @@ impl ConversationWatcher {
         if content.contains("<system-reminder>") {
             return None;
         }
+        if expected_role == "user" && !begun_by_the_owner(&v) && is_written_by_the_app(&content) {
+            return None;
+        }
 
         Some((content.to_string(), timestamp))
     }
@@ -284,6 +323,41 @@ impl ConversationWatcher {
             "role": role,
         })
     }
+}
+
+/// Was this record written in a session the owner drives, by the role it
+/// claims? A transcript also holds what a program ran (the Agent SDKs and
+/// the headless CLI stamp `entrypoint` as `sdk-*`), what a subagent was
+/// told and said (`isSidechain`), and records the app writes into the
+/// user's role: skill bodies and command wrappers (`isMeta`), the summary a
+/// compaction writes (`isCompactSummary`, also on a turn the owner began),
+/// notices of finished tasks and messages of other sessions
+/// (`turnOrigin`), system prompts (`promptSource`). None of them is the
+/// owner speaking. A record without these fields, as older transcripts
+/// are, is taken as before, and so is a value of them this list does not
+/// name.
+fn written_in_an_owner_session(record: &serde_json::Value, role: &str) -> bool {
+    let text = |key: &str| record.get(key).and_then(|v| v.as_str());
+    let flag = |key: &str| record.get(key).and_then(|v| v.as_bool()) == Some(true);
+    if text("entrypoint").is_some_and(|e| e.starts_with("sdk-")) || flag("isSidechain") {
+        return false;
+    }
+    if role == "user"
+        && (flag("isMeta")
+            || flag("isCompactSummary")
+            || text("promptSource") == Some("system")
+            || text("turnOrigin").is_some_and(|o| MACHINE_TURN_ORIGINS.contains(&o)))
+    {
+        return false;
+    }
+    true
+}
+
+/// A record that says the owner began its turn. Such a record is not
+/// judged by how its text begins: the owner may start a message with any
+/// words.
+fn begun_by_the_owner(record: &serde_json::Value) -> bool {
+    record.get("turnOrigin").and_then(|v| v.as_str()) == Some("human")
 }
 
 /// Extract the textual content of a Claude Code message field.
@@ -365,11 +439,17 @@ impl ConversationWatcher {
             .as_deref()
             .map(Self::load_positions)
             .unwrap_or_default();
-        let ingress = IngressTail::new(storage, "conversation");
-        let mut scoped = self
-            .scope
-            .is_restricted()
-            .then(|| ClaudeScope::new(self.scope.clone()));
+        let observation =
+            Observation::new(storage.clone(), observe::CLAUDE, self.session_idle_secs)
+                .with_live(self.live.clone());
+        let ingress =
+            IngressTail::new(storage, "conversation").with_session_idle(self.session_idle_secs);
+        // Who drives each session, and the folder in force when the scope
+        // is restricted, are carried between polls, so one scope lives as
+        // long as the watcher does.
+        let mut session = ClaudeSession::new(self.scope.clone());
+        let mut discovery = Discovery::default();
+        let mut pass = FullPass::new(FULL_PASS_EVERY);
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(self.poll_interval_secs));
         loop {
@@ -377,14 +457,32 @@ impl ConversationWatcher {
             if wake.is_closed() {
                 return Ok(());
             }
-            let files = self.find_jsonl_files();
-            let scope = scoped.as_mut().map(|scope| scope as &mut dyn RecordScope);
-            match ingress.tick_scoped(&files, &legacy, Self::parse_turn, scope) {
+            let full = pass.due(std::time::Instant::now());
+            if full {
+                discovery.forget();
+            }
+            let files = discovery.claude_transcripts(&self.sessions_dir);
+            let scope = Some(&mut session as &mut dyn RecordScope);
+            match ingress.tick_scoped(&files, &legacy, Self::parse_turn, scope, full) {
                 Ok(n) if n > 0 => {
                     let _ = wake.try_send(());
                 }
                 Ok(_) => {}
                 Err(e) => warn!("Conversation ingress tick will retry: {e}"),
+            }
+            // The observation pass, beside admission and never through it.
+            // A profile with no workspace has no registry and keeps no
+            // segment: its sessions are only told to the live state.
+            let observed = match &self.projects {
+                Some(projects) => crate::projects::current(projects).map(|map| {
+                    observation.tick_seen(&files, &map, full, |path| ingress.stamp_of(path))
+                }),
+                None => {
+                    Some(observation.tick_unstored(&files, full, |path| ingress.stamp_of(path)))
+                }
+            };
+            if let Some(Err(e)) = observed {
+                warn!("Conversation observation tick will retry: {e}");
             }
         }
     }
@@ -409,6 +507,31 @@ fn strip_attachment_refs(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// For the tests of the rules of noise, which hold their own copy of these
+/// and have to stay equal to them.
+#[cfg(test)]
+pub(super) fn strip_attachment_refs_for_tests(text: &str) -> String {
+    strip_attachment_refs(text)
+}
+
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(super) fn lists_for_tests() -> (
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+) {
+    (
+        CORRECTION_PATTERNS_STRONG,
+        CORRECTION_PATTERNS_NEGATABLE,
+        CORRECTION_NEGATED,
+        CORRECTION_PATTERNS_WEAK,
+        DECISION_PATTERNS,
+    )
 }
 
 #[cfg(test)]

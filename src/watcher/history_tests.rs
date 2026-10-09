@@ -350,3 +350,174 @@ fn archived_codex_sessions_are_read_in_a_profile_only_under_a_project_scope() {
     // An unscoped profile names its own folder and gets nothing beside it.
     assert_eq!(archive_of(&[], true), None);
 }
+
+/// History refuses what live capture refuses: a Claude session a program
+/// ran, a notice the app wrote into the user's role, a Codex session a
+/// program ran. The replies are kept fixtures.
+#[test]
+fn capture_origin_history_import_refuses_what_capture_refuses() {
+    let f = Fixture::new();
+    let correction = "stop, use the other configuration for demoapp";
+    let with = |line: String, fields: serde_json::Value| {
+        let mut value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        for (key, field) in fields.as_object().unwrap() {
+            value[key] = field.clone();
+        }
+        value.to_string()
+    };
+    write(
+        &f.claude.join("-code-demoapp/mixed.jsonl"),
+        &[
+            with(
+                claude("/code/demoapp", "o1", "2026-09-01", correction),
+                serde_json::json!({"entrypoint": "sdk-py"}),
+            ),
+            with(
+                claude("/code/demoapp", "o2", "2026-09-01", correction),
+                serde_json::json!({"turnOrigin": "task_notification"}),
+            ),
+            with(
+                claude("/code/demoapp", "o3", "2026-09-01", correction),
+                serde_json::json!({"entrypoint": "claude-desktop", "turnOrigin": "human"}),
+            ),
+        ],
+    );
+    let meta = |payload: serde_json::Value| {
+        serde_json::json!({"type": "session_meta", "payload": payload}).to_string()
+    };
+    write(
+        &f.codex.join("2026/09/01/rollout-exec.jsonl"),
+        &[
+            meta(
+                serde_json::json!({"cwd": "/code/demoapp", "originator": "codex_exec",
+                "source": "exec"}),
+            ),
+            codex_user("x1", "2026-09-01", correction),
+        ],
+    );
+    write(
+        &f.codex.join("2026/09/01/rollout-desktop.jsonl"),
+        &[
+            meta(
+                serde_json::json!({"cwd": "/code/demoapp", "originator": "Codex Desktop",
+                "source": "vscode"}),
+            ),
+            codex_user("d1", "2026-09-01", correction),
+        ],
+    );
+    f.run(&[], None, true);
+    let queued: Vec<(crate::event::EventSource, String)> = f
+        .queued()
+        .into_iter()
+        .map(|event| (event.source, event.content))
+        .collect();
+    assert_eq!(queued.len(), 2, "{queued:?}");
+    assert!(queued.iter().all(|(_, content)| content == correction));
+    assert!(
+        queued
+            .iter()
+            .any(|(source, _)| *source == crate::event::EventSource::ConversationWatcher)
+    );
+    assert!(
+        queued
+            .iter()
+            .any(|(source, _)| *source == crate::event::EventSource::CodexWatcher)
+    );
+}
+
+/// The transcripts that were there before stretches were kept are read
+/// whole: the owner's sessions give their stretches, a session a program
+/// ran gives none, and reading them again changes nothing.
+#[test]
+fn work_stretch_earlier_transcripts_are_brought_in_once() {
+    let f = Fixture::new();
+    let record = |at: &str, entrypoint: &str| {
+        serde_json::json!({"type": "assistant", "timestamp": at, "entrypoint": entrypoint,
+            "cwd": "/code/demoapp", "message": {"content": "ok"}})
+        .to_string()
+    };
+    write(
+        &f.claude.join("-code-demoapp/long.jsonl"),
+        &[
+            record("2026-09-20T18:00:00Z", "claude-desktop"),
+            record("2026-09-20T18:25:00Z", "claude-desktop"),
+            record("2026-09-20T18:50:00Z", "claude-desktop"),
+            record("2026-09-20T21:00:00Z", "claude-desktop"),
+        ],
+    );
+    write(
+        &f.claude.join("-code-demoapp/review.jsonl"),
+        &[
+            record("2026-09-20T18:00:00Z", "sdk-py"),
+            record("2026-09-20T18:10:00Z", "sdk-py"),
+        ],
+    );
+    let meta = |payload: serde_json::Value| {
+        serde_json::json!({"type": "session_meta", "timestamp": "2026-09-21T09:00:00Z",
+            "payload": payload})
+        .to_string()
+    };
+    let codex = |at: &str| {
+        serde_json::json!({"type": "response_item", "timestamp": at,
+            "payload": {"type": "reasoning"}})
+        .to_string()
+    };
+    write(
+        &f.codex.join("2026/09/01/rollout-desktop.jsonl"),
+        &[
+            meta(
+                serde_json::json!({"cwd": "/code/demoapp", "originator": "Codex Desktop",
+                "source": "vscode"}),
+            ),
+            codex("2026-09-21T09:10:00Z"),
+            codex("2026-09-21T09:20:00Z"),
+        ],
+    );
+    write(
+        &f.codex.join("2026/09/01/rollout-exec.jsonl"),
+        &[
+            meta(
+                serde_json::json!({"cwd": "/code/demoapp", "originator": "codex_exec",
+                "source": "exec"}),
+            ),
+            codex("2026-09-21T09:10:00Z"),
+        ],
+    );
+    let stretches = |storage: &Storage| -> Vec<(String, String)> {
+        let conn = storage.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT started_at, last_at FROM work_stretches ORDER BY started_at")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let expected = vec![
+        (
+            "2026-09-20 18:00:00".to_owned(),
+            "2026-09-20 18:50:00".to_owned(),
+        ),
+        (
+            "2026-09-20 21:00:00".to_owned(),
+            "2026-09-20 21:00:00".to_owned(),
+        ),
+        (
+            "2026-09-21 09:00:00".to_owned(),
+            "2026-09-21 09:20:00".to_owned(),
+        ),
+    ];
+    let (transcripts, count) = backfill_work_stretches(&f.storage, &f.config(&[])).unwrap();
+    assert_eq!((transcripts, count), (4, 3));
+    assert_eq!(stretches(&f.storage), expected);
+    backfill_work_stretches(&f.storage, &f.config(&[])).unwrap();
+    assert_eq!(stretches(&f.storage), expected);
+    // A restricted scope keeps what is outside it out.
+    let other = Fixture::new();
+    write(
+        &other.claude.join("-code-demoapp/long.jsonl"),
+        &[record("2026-09-20T18:00:00Z", "claude-desktop")],
+    );
+    backfill_work_stretches(&other.storage, &other.config(&["/code/elsewhere"])).unwrap();
+    assert!(stretches(&other.storage).is_empty());
+}

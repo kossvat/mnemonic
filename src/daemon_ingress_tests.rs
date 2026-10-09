@@ -256,7 +256,7 @@ fn ingress_daemon_replay_records_every_outcome_and_exports_only_derived_content(
         ),
         (
             EventKind::UserCorrection,
-            "No, switch the configuration for example-org",
+            "Stop, switch the configuration for example-org",
         ),
     ]
     .into_iter()
@@ -322,7 +322,7 @@ fn ingress_daemon_replay_records_every_outcome_and_exports_only_derived_content(
     let mut urgent = Event::new(
         EventSource::CodexWatcher,
         EventKind::UserCorrection,
-        "No, use the other configuration for example-org",
+        "Stop, use the other configuration for example-org",
     );
     urgent.timestamp = source_time;
     let mut next = cursor.clone();
@@ -391,9 +391,8 @@ fn ingress_daemon_replay_records_every_outcome_and_exports_only_derived_content(
 /// as a session happening today, and the dream worker would summarise it.
 #[test]
 fn a_turn_from_history_opens_no_session_a_live_one_does() {
-    let dir =
-        std::env::temp_dir().join(format!("mnemonic-history-session-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = crate::test_support::temp_dir("mnemonic-history-session-");
+    let dir = scratch.path();
     let storage = Storage::open(&dir.join("memory.db")).unwrap();
     let daemon = Daemon::new(Config::default());
     let classifier = RuleClassifier::new(daemon.config.classifier.clone());
@@ -472,8 +471,6 @@ fn a_turn_from_history_opens_no_session_a_live_one_does() {
             assert!(session.is_none(), "a history turn opens no session");
         }
     }
-    drop(storage);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Queue one decision turn through durable ingress and process it the way

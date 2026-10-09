@@ -25,6 +25,25 @@ let package = Package(
             name: "MnemonicApp",
             dependencies: ["MnemonicShared"],
             path: "Sources/MnemonicApp"
+        ),
+        // The model of the card of memory today, on the fixture file the
+        // daemon's tests print (Tests/Fixtures/recall-day.json).
+        .testTarget(
+            name: "MnemonicSharedTests",
+            dependencies: ["MnemonicShared"],
+            path: "Tests/MnemonicSharedTests"
+        ),
+        // The widget at rest: what it assigns, asks and mounts while its
+        // popover is closed, over a source and a clock the tests stand in for.
+        .testTarget(
+            name: "MnemonicBarTests",
+            dependencies: ["MnemonicBar", "MnemonicShared"],
+            path: "Tests/MnemonicBarTests"
+        ),
+        .testTarget(
+            name: "MnemonicAppTests",
+            dependencies: ["MnemonicApp", "MnemonicShared"],
+            path: "Tests/MnemonicAppTests"
         )
     ]
 )

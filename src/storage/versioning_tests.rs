@@ -196,3 +196,139 @@ fn the_snapshot_is_copied_inside_an_owner_only_directory() {
 fn filetime_dir(path: &Path, when: SystemTime) -> std::io::Result<()> {
     std::fs::File::open(path)?.set_modified(when)
 }
+
+/// The tables this binary's generation brought: a store of the earlier
+/// one has none of them.
+const SINCE_THE_EARLIER_GENERATION: [&str; 9] = [
+    "attribution_state",
+    "attribution_overrides",
+    "segment_activity",
+    "work_segments",
+    "owner_prompts",
+    "observation_checkpoints",
+    "attribution_dirty",
+    "project_aliases",
+    "projects",
+];
+
+/// A populated store as the binary of the earlier generation left it.
+fn earlier_store(dir: &Path) -> PathBuf {
+    let path = dir.join("memory.db");
+    drop(Storage::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    for table in SINCE_THE_EARLIER_GENERATION {
+        conn.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+    }
+    conn.execute_batch(
+        "INSERT INTO memories (id, timestamp, title, content, memory_type, source)
+         VALUES ('m1', '2026-09-20T10:00:00+00:00', 'a note', 'kept as it is', 'note', 'test'),
+                ('m2', '2026-09-21T10:00:00+00:00', 'a decision', 'kept too', 'decision', 'test');
+         INSERT INTO entities (id, name, entity_type) VALUES ('e1', 'demoapp', 'project');
+         INSERT INTO memory_entities (memory_id, entity_id) VALUES ('m1', 'e1');
+         INSERT INTO work_stretches (transcript, started_at, last_at)
+         VALUES ('t', '2026-09-20 10:00:00', '2026-09-20 10:05:00');",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", MEMORY_SCHEMA_GENERATION - 1)
+        .unwrap();
+    let _ = std::fs::remove_file(snapshot_path(&path));
+    path
+}
+
+/// Every row of every table of a store, by table, as text.
+fn every_row(path: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+    let conn = Connection::open(path).unwrap();
+    let tables = crate::test_support::rows(
+        &conn,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            AND sql NOT LIKE 'CREATE VIRTUAL%' AND name NOT LIKE '%_fts%'
+          ORDER BY name",
+    );
+    tables
+        .into_iter()
+        .map(|table| {
+            let rows = crate::test_support::rows(&conn, &format!("SELECT * FROM {table}"));
+            (table, rows)
+        })
+        .collect()
+}
+
+#[test]
+fn migration_over_a_populated_store_keeps_every_row_and_raises_the_generation() {
+    let dir = crate::test_support::temp_dir("mnemonic-gen-migrate-");
+    let path = earlier_store(dir.path());
+    let before = every_row(&path);
+    assert!(before["memories"].len() == 2 && !before.contains_key("projects"));
+
+    let storage = Storage::open(&path).unwrap();
+    assert_eq!(
+        generation(&storage.conn.lock().unwrap()).unwrap(),
+        MEMORY_SCHEMA_GENERATION
+    );
+    storage.require_current_generation().unwrap();
+    drop(storage);
+    // The way back was taken first, as the store was.
+    let snapshot = Connection::open(snapshot_path(&path)).unwrap();
+    assert_eq!(generation(&snapshot).unwrap(), MEMORY_SCHEMA_GENERATION - 1);
+    drop(snapshot);
+    let after = every_row(&path);
+    for (table, rows) in &before {
+        assert_eq!(&after[table], rows, "{table} changed");
+    }
+    for table in SINCE_THE_EARLIER_GENERATION {
+        assert!(after[table].is_empty(), "{table} was not made empty");
+    }
+}
+
+#[test]
+fn migration_interrupted_leaves_the_store_usable_and_lets_no_writer_start() {
+    let dir = crate::test_support::temp_dir("mnemonic-gen-interrupted-");
+    let path = earlier_store(dir.path());
+    let before = every_row(&path);
+    FAIL_NEXT_SNAPSHOT.with(|f| f.set(true));
+    let storage = Storage::open(&path).unwrap();
+    // The store is open and answers, at the generation it had.
+    assert_eq!(
+        generation(&storage.conn.lock().unwrap()).unwrap(),
+        MEMORY_SCHEMA_GENERATION - 1
+    );
+    assert_eq!(storage.count().unwrap(), 2);
+    // The daemon asks this before it starts anything, and stops.
+    let refused = storage
+        .require_current_generation()
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(refused.contains("Nothing was written"), "{refused}");
+    drop(storage);
+    // What it held is as it was: a binary of the earlier generation
+    // still opens it, and finds its rows.
+    refuse_newer_than(
+        &Connection::open(&path).unwrap(),
+        MEMORY_SCHEMA_GENERATION - 1,
+    )
+    .unwrap();
+    let after = every_row(&path);
+    for (table, rows) in &before {
+        assert_eq!(&after[table], rows, "{table} changed");
+    }
+
+    // The next open finishes the migration.
+    let storage = Storage::open(&path).unwrap();
+    storage.require_current_generation().unwrap();
+    assert!(snapshot_path(&path).exists());
+}
+
+#[test]
+fn migration_a_binary_of_the_earlier_generation_refuses_the_migrated_store() {
+    let dir = crate::test_support::temp_dir("mnemonic-gen-refuse-");
+    let path = earlier_store(dir.path());
+    drop(Storage::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    refuse_newer_than(&conn, MEMORY_SCHEMA_GENERATION).unwrap();
+    let refused = refuse_newer_than(&conn, MEMORY_SCHEMA_GENERATION - 1)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(refused.contains("newer than this binary"), "{refused}");
+}

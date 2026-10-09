@@ -1,12 +1,65 @@
 import SwiftUI
+import AppKit
+import MnemonicShared
 
 @main
+@MainActor
 struct MnemonicApp: App {
-    @StateObject private var model = MnemonicAppModel()
+    @NSApplicationDelegateAdaptor(NativeAppDelegate.self) private var delegate
+    @StateObject private var model: MnemonicAppModel
+
+    init() {
+        let arguments = CommandLine.arguments
+        if arguments.contains("--render-project-fixtures") {
+            do {
+                try AppFixturePreview.run(arguments: arguments)
+                exit(0)
+            } catch {
+                FileHandle.standardError.write(Data("Project fixture rendering failed.\n".utf8))
+                exit(2)
+            }
+        }
+        if arguments.contains("--render-timeline-fixtures") {
+            do {
+                try TimelineFixturePreview.run(arguments: arguments)
+                exit(0)
+            } catch {
+                FileHandle.standardError.write(Data("Timeline fixture rendering failed.\n".utf8))
+                exit(2)
+            }
+        }
+        if arguments.contains("--render-graph-fixtures") {
+            do {
+                try GraphFixturePreview.run(arguments: arguments)
+                exit(0)
+            } catch {
+                FileHandle.standardError.write(Data("Graph fixture rendering failed.\n".utf8))
+                exit(2)
+            }
+        }
+        if arguments.contains("--fixture-graph"), !arguments.contains("--fixture-window") {
+            FileHandle.standardError.write(Data("The graph fixture requires the fixture window.\n".utf8))
+            exit(2)
+        }
+        if arguments.contains("--fixture-window"), !MnemonicProfile.current.isolated {
+            FileHandle.standardError.write(Data("The fixture window requires an isolated profile.\n".utf8))
+            exit(2)
+        }
+        let model = MnemonicAppModel()
+        if arguments.contains("--fixture-graph") { model.route = .graph }
+        if let index = arguments.firstIndex(of: "--open-url"), arguments.count > index + 1,
+           let url = URL(string: arguments[index + 1]) {
+            model.open(url)
+        }
+        if let identity = model.identity {
+            AppLinkReadiness.announce(arguments: arguments, identity: identity)
+        }
+        _model = StateObject(wrappedValue: model)
+    }
 
     var body: some Scene {
-        WindowGroup {
-            ContentView(model: model)
+        WindowGroup(id: DashboardActivation.sceneID) {
+            DashboardRoot(model: model)
                 .frame(minWidth: 980, minHeight: 640)
                 .preferredColorScheme(colorScheme)
         }
@@ -29,7 +82,7 @@ struct MnemonicApp: App {
                     Button(route.title) {
                         NotificationCenter.default.post(
                             name: .mnemonicSelectRoute,
-                            object: route.rawValue
+                            object: route.sidebarRoute.rawValue
                         )
                     }
                     .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: [.command])
@@ -50,4 +103,36 @@ struct MnemonicApp: App {
         default: nil
         }
     }
+}
+
+@MainActor
+private struct DashboardRoot: View {
+    @ObservedObject var model: MnemonicAppModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        ContentView(model: model)
+            .environment(\.mnemonicDashboardWindowAttached, {
+                model.dashboardActivation.windowDidAttach()
+            })
+            .onAppear {
+                let action = openWindow
+                model.dashboardActivation.registerOpener {
+                    action(id: DashboardActivation.sceneID)
+                }
+            }
+    }
+}
+
+@MainActor
+final class NativeAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async {
+            DashboardActivation().activate()
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }

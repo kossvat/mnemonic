@@ -1,0 +1,15 @@
+{
+  "entities": [
+    {
+      "id": "retired",
+      "name": "Retired board",
+      "memory_count": 3,
+      "last_memory": 1792224000,
+      "archived_at": 1799913600
+    }
+  ],
+  "offset": 0,
+  "limit": 2,
+  "total": 1,
+  "next_offset": null
+}

@@ -4,6 +4,9 @@ pub mod memory_files;
 pub mod obsidian;
 pub mod whisper;
 
+#[cfg(test)]
+mod context_quality_tests;
+
 use crate::config::Config;
 use crate::storage::OutputSink;
 use tracing::warn;

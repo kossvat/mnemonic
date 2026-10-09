@@ -1,0 +1,25 @@
+{
+  "projects": [
+    {
+      "key": "demoapp",
+      "name": "demoapp",
+      "state": "active",
+      "merged_into": null,
+      "last_active_at": 1790762460,
+      "week": {
+        "owner_s": 1500.0,
+        "agent_s": 3600,
+        "owner_estimate": true
+      },
+      "plan": {
+        "unit": "plan",
+        "done": 1,
+        "total": 2,
+        "stage": "building",
+        "task": "Review the result",
+        "gate": "none"
+      },
+      "plan_message": null
+    }
+  ]
+}

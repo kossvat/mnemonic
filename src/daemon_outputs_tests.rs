@@ -186,6 +186,27 @@ fn holds(bytes: &[u8], text: &str) -> bool {
         .any(|window| window == text.as_bytes())
 }
 
+/// A capture the rules name as noise is stored and reaches no sink; one
+/// that is not reaches every sink.
+#[test]
+fn context_quality_a_capture_that_is_noise_reaches_no_sink() {
+    let f = Fixture::new();
+    f.capture("| Option | Decided | Owner |");
+    assert_eq!(f.storage.recent(10).unwrap().len(), 1, "stored");
+    assert!(f.written.lock().unwrap().is_empty(), "no sink");
+    assert!(f.files().is_empty(), "no file");
+
+    let f = Fixture::new();
+    f.capture("Decision: use SQLite for the index");
+    assert_eq!(f.storage.recent(10).unwrap().len(), 1);
+    let written = f.written.lock().unwrap();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].title, "Decision: use SQLite for the index");
+    drop(written);
+    let files = f.files();
+    assert_eq!(files.len(), 2, "every sink wrote the clean one: {files:?}");
+}
+
 #[test]
 fn redaction_outputs_daemon_every_copy_of_a_turn_is_of_the_prepared_entry() {
     let token = token();
@@ -247,7 +268,7 @@ fn redaction_outputs_daemon_every_copy_of_a_correction_is_of_the_prepared_entry(
     let token = token();
     let f = Fixture::new();
     f.urgent(&format!(
-        "No, switch the configuration for example-org to {token} <private>and a plan</private>"
+        "Stop, switch the configuration for example-org to {token} <private>and a plan</private>"
     ));
     assert!(f.storage.count().unwrap() == 1);
 
@@ -294,7 +315,7 @@ fn redaction_outputs_daemon_failed_urgent_commit_reaches_no_sink() {
         )
         .unwrap();
     f.urgent(&format!(
-        "No, switch the configuration for example-org to {token}"
+        "Stop, switch the configuration for example-org to {token}"
     ));
     assert!(f.storage.count().unwrap() == 0);
     assert!(f.written.lock().unwrap().is_empty(), "a sink was written");

@@ -3,11 +3,16 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var model: MnemonicAppModel
     @State private var tokenPath = ""
+    @State private var endpoint = ""
 
     var body: some View {
         Form {
             Section("Connection") {
-                TextField("Endpoint", text: $model.endpoint)
+                TextField("Endpoint", text: $endpoint)
+                Button("Apply endpoint") { Task { await model.applyEndpoint(endpoint) } }
+                if let message = model.setupMessage {
+                    Text(verbatim: message).font(.caption).foregroundStyle(.secondary)
+                }
                 HStack {
                     Text("Token file")
                     Spacer()
@@ -19,12 +24,9 @@ struct SettingsView: View {
             }
 
             Section("Refresh") {
-                Stepper(
-                    "Interval: \(Int(model.refreshInterval))s",
-                    value: $model.refreshInterval,
-                    in: 10...300,
-                    step: 5
-                )
+                Text("Visible project and overview screens refresh every 30 seconds.")
+                Text("Hidden windows make no automatic requests.")
+                    .foregroundStyle(.secondary)
             }
 
             Section("Appearance") {
@@ -46,6 +48,7 @@ struct SettingsView: View {
         }
         .padding(20)
         .task {
+            endpoint = model.endpoint
             tokenPath = await model.tokenPath
         }
     }

@@ -3,6 +3,8 @@
 //! at run time.
 #![cfg(unix)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -61,7 +63,7 @@ fn redaction_scan_cli_exit_codes_tell_clean_from_found_from_unread() {
     let token = token();
     let root = tempfile::Builder::new()
         .prefix("mn-scan-cli-")
-        .tempdir_in("/tmp")
+        .tempdir_in(common::short_root())
         .unwrap();
     let home = root.path().join("home");
     std::fs::create_dir(&home).unwrap();
@@ -117,7 +119,7 @@ fn redaction_scan_cli_bad_command_lines_are_bad_input_and_are_not_echoed() {
     let token = token();
     let root = tempfile::Builder::new()
         .prefix("mn-scan-cli-")
-        .tempdir_in("/tmp")
+        .tempdir_in(common::short_root())
         .unwrap();
     let home = root.path().join("home");
     std::fs::create_dir(&home).unwrap();

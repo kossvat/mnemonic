@@ -1,8 +1,22 @@
 import SwiftUI
 import MnemonicShared
 
+@MainActor
 struct ContentView: View {
     @ObservedObject var model: MnemonicAppModel
+    @ObservedObject private var projects: AppProjectController
+    @ObservedObject private var live: LiveStore
+    @ObservedObject private var timeline: AppTimelineController
+    @ObservedObject private var graph: AppGraphController
+    @State private var windowVisible = false
+
+    init(model: MnemonicAppModel) {
+        self.model = model
+        projects = model.projects
+        live = model.projects.live
+        timeline = model.timeline
+        graph = model.curatedGraph
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -57,10 +71,15 @@ struct ContentView: View {
                         .font(.system(size: 12, weight: .medium))
                 }
                 .disabled(model.isLoading)
-                .help("Refresh all (⌘R)")
+                .help("Refresh this screen")
             }
         }
-        .task { await model.refreshAll() }
+        .background(AppWindowVisibility { id, visible in
+            windowVisible = visible
+            model.window(id, visible: visible)
+        })
+        .environment(\.mnemonicWindowVisible, windowVisible)
+        .onOpenURL { url in model.open(url) }
         .onReceive(NotificationCenter.default.publisher(for: .mnemonicRefresh)) { _ in
             Task { await model.refreshAll() }
         }
@@ -75,17 +94,43 @@ struct ContentView: View {
 
     @ViewBuilder
     private var detailView: some View {
-        if let message = model.setupMessage, model.status == nil {
-            SetupView(message: message, model: model)
-        } else {
-            switch model.route {
-            case .overview:  OverviewView(model: model)
-            case .memories:  MemoriesView(model: model)
-            case .search:    SearchView(model: model)
-            case .entities:  EntitiesView(model: model)
-            case .graph:     GraphView(model: model)
-            case .memoryMap: MemoryMapView(model: model)
-            case .manage:    ManageView(model: model)
+        switch model.route {
+        case .projects:
+            ProjectsView(board: projects.board, live: live.shown,
+                         failure: projects.failure ?? live.failure, loading: projects.loading,
+                         now: projects.now, onOpen: { key in model.route = .project(key) })
+        case .timeline(let day):
+            TimelinePage(
+                day: day, snapshot: timeline.snapshot, loading: timeline.loading,
+                failure: timeline.failure, mutationInFlight: timeline.mutationInFlight,
+                message: timeline.message, canUndo: timeline.canUndo,
+                onDay: { chosen in model.route = .timeline(chosen) },
+                onToday: { model.route = .timeline(TimelineDay.today()) },
+                onRefresh: { Task { await model.refreshAll() } },
+                onApply: { correction, chosen in await timeline.apply(correction, for: chosen) },
+                onUndo: { await timeline.undo() })
+        case .graph:
+            GraphView(controller: graph, onOpenProject: { key in model.route = .project(key) },
+                      onDraw: { snapshot in
+                          if windowVisible { model.graphDidDraw(snapshot) }
+                      })
+        case .project(let key):
+            ProjectPage(key: key, detail: projects.detail,
+                        failure: projects.failure, loading: projects.loading,
+                        liveFailure: live.failure, onBack: { model.route = .projects })
+        default:
+            if let message = model.setupMessage, model.status == nil {
+                SetupView(message: message, model: model)
+            } else {
+                switch model.route {
+                case .overview: OverviewView(model: model)
+                case .memories: MemoriesView(model: model)
+                case .search: SearchView(model: model)
+                case .entities: EntitiesView(model: model)
+                case .memoryMap: MemoryMapView(model: model)
+                case .manage: ManageView(model: model)
+                default: EmptyView()
+                }
             }
         }
     }

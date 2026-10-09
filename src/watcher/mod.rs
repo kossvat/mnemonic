@@ -1,9 +1,20 @@
+pub mod backfill;
 pub mod codex;
 pub mod conversation;
+mod discovery;
 pub mod files;
 pub mod git;
 pub mod history;
 mod ingress;
+mod observe;
+mod origin;
+#[cfg(test)]
+mod origin_claude_tests;
+#[cfg(test)]
+mod origin_tests;
+#[cfg(test)]
+mod quality_tests;
+pub mod replay;
 pub mod scope;
 mod tail;
 

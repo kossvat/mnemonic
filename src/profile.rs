@@ -234,10 +234,10 @@ pub fn merge(base: &mut toml::Value, overlay: toml::Value) {
 mod tests {
     use super::*;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mn-{tag}-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.canonicalize().unwrap()
+    fn temp_dir(tag: &str) -> crate::test_support::InTempDir<PathBuf> {
+        crate::test_support::InTempDir::new(&format!("mn-{tag}-"), |dir| {
+            dir.canonicalize().unwrap()
+        })
     }
 
     #[test]
@@ -294,7 +294,6 @@ mod tests {
         // Neither exists yet: only an identical spelling agrees.
         assert!(same_location(&root.join("new"), &root.join("new")));
         assert!(!same_location(&root.join("new"), &root.join("newer")));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -318,7 +317,6 @@ mod tests {
         let home = prepare_for(&root.join("profile"), None).unwrap();
         let mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -338,7 +336,6 @@ mod tests {
             mode, 0o755,
             "the refused target must not be re-permissioned"
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -351,7 +348,6 @@ mod tests {
         let link = root.join("client");
         std::os::unix::fs::symlink(&store, &link).unwrap();
         assert!(prepare_for(&link, Some(&user_home)).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -363,7 +359,6 @@ mod tests {
         assert!(ensure_inside(&home, "db_path", &root.join("other/memory.db")).is_err());
         assert!(ensure_inside(&home, "db_path", Path::new("memory.db")).is_err());
         assert!(ensure_inside(&home, "db_path", &home.join("../other/memory.db")).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -375,7 +370,6 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         std::os::unix::fs::symlink(&other, home.join("link")).unwrap();
         assert!(ensure_inside(&home, "db_path", &home.join("link/memory.db")).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -386,7 +380,6 @@ mod tests {
         // Target does not exist yet: a later create would land outside.
         std::os::unix::fs::symlink(root.join("owner/auth.token"), home.join("auth.token")).unwrap();
         assert!(ensure_inside(&home, "ui.token_file", &home.join("auth.token")).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

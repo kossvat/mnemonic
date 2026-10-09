@@ -44,10 +44,7 @@ struct OverviewView: View {
             .padding(Theme.Space.xl)
         }
         .background(Theme.Palette.bgPrimary)
-        .task { await model.refreshOverview() }
-        .onReceive(Timer.publish(every: model.refreshInterval, on: .main, in: .common).autoconnect()) { _ in
-            Task { await model.refreshOverview() }
-        }
+
     }
 
     private var header: some View {

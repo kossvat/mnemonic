@@ -2,6 +2,8 @@
 //! Every child gets a fake `$HOME`, so the developer's own store is never read.
 #![cfg(unix)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -11,7 +13,7 @@ impl Temp {
         // `/tmp`, not `temp_dir()`: the profile socket path must stay under
         // the Unix limit.
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let path = PathBuf::from("/tmp").join(format!("mn-cli-{tag}-{}", &id[..8]));
+        let path = common::short_root().join(format!("mn-cli-{tag}-{}", &id[..8]));
         std::fs::create_dir_all(&path).unwrap();
         Self(path.canonicalize().unwrap())
     }

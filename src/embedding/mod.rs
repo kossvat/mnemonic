@@ -1,4 +1,5 @@
 pub mod daemon_client;
+pub mod release;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -32,6 +33,17 @@ pub trait Embedder: Send + Sync {
     /// Output dimension when statically known (None when it would require
     /// loading the model to find out).
     fn dim_hint(&self) -> Option<usize> {
+        None
+    }
+
+    /// Drop what the embedder holds when it was not used for `idle`, to be
+    /// built again on the next use. Whether anything was dropped.
+    fn release_if_idle(&self, _idle: std::time::Duration) -> bool {
+        false
+    }
+
+    /// How long the last build after a release took, if there was one.
+    fn last_reload(&self) -> Option<std::time::Duration> {
         None
     }
 }
@@ -232,7 +244,13 @@ pub fn create_embedder() -> Result<Box<dyn Embedder>> {
         match NeuralEmbedder::new() {
             Ok(e) => {
                 tracing::info!("Using neural embedder (multilingual-e5-base, 768-dim)");
-                return Ok(Box::new(e));
+                // The same model is built again after a release: a model
+                // that then fails to load is an error, not the hash
+                // embedder, whose vectors would not match the store's.
+                return Ok(Box::new(release::ReleasingEmbedder::new(
+                    Box::new(e),
+                    || -> Result<Box<dyn Embedder>> { Ok(Box::new(NeuralEmbedder::new()?)) },
+                )));
             }
             Err(e) => {
                 tracing::warn!(

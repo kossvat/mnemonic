@@ -87,17 +87,16 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
-    fn private_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mnemonic-schema-{tag}-{}", uuid::Uuid::new_v4()));
-        let mut builder = std::fs::DirBuilder::new();
+    fn private_dir(tag: &str) -> tempfile::TempDir {
+        let prefix = format!("mnemonic-schema-{tag}-");
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(&prefix);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
         }
-        builder.create(&dir).unwrap();
-        dir
+        builder.tempdir().unwrap()
     }
 
     fn write_version(path: &std::path::Path, version: i64) {
@@ -126,7 +125,7 @@ mod tests {
     #[test]
     fn version_one_database_upgrades_in_place_and_keeps_everything() {
         let dir = private_dir("v1");
-        let path = dir.join("shared.db");
+        let path = dir.path().join("shared.db");
         write_version(&path, 1);
 
         let store = SharedStore::open(&path).unwrap();
@@ -150,13 +149,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_migrated_row_cannot_publish_text_a_direct_publish_would_refuse() {
         let dir = private_dir("legacy");
-        let path = dir.join("shared.db");
+        let path = dir.path().join("shared.db");
         write_version(&path, 1);
         // Written before the rule existed: an invisible tag character that a
         // human reviewing the inbox cannot see, but a model reads.
@@ -182,15 +180,13 @@ mod tests {
                 .is_err()
         );
         assert!(store.get("alpha", "draft").unwrap().is_none());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_newer_schema_is_refused() {
         let dir = private_dir("v3");
-        let path = dir.join("shared.db");
+        let path = dir.path().join("shared.db");
         write_version(&path, SCHEMA_VERSION + 1);
         assert!(SharedStore::open(&path).is_err());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -49,3 +49,16 @@ obsidian_path = "~/Documents/Obsidian/Vault"
 # Batch write interval (seconds)
 # Events are collected and processed in batches
 batch_interval_secs = 5
+
+# Where your projects live: needed for live projects, time by project and the
+# Projects board. Every visible child folder of the folder of projects is a
+# project under the name of its folder. See docs/agent-setup-workspace.md.
+# [projects]
+# workspace = "/absolute/path/to/workspace"
+# folder = "projects"        # leave out when the workspace itself holds them
+#
+# [projects.aliases]         # optional second names: alias = "folder"
+# web = "web-client"
+#
+# [projects.former]          # optional: a name a folder had before
+# old-name = "new-name"

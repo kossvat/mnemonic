@@ -35,7 +35,7 @@ struct EntitiesView: View {
                     model: model,
                     onMerged: {
                         Task {
-                            await model.refreshEntities()
+                            await model.refreshEntities(invalidate: true)
                             if let selected {
                                 await loadDetail(selected)
                             }
@@ -72,7 +72,7 @@ struct EntitiesView: View {
             }
             Spacer()
             Button {
-                Task { await model.refreshEntities() }
+                Task { await model.refreshEntities(invalidate: true) }
             } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
                     .font(Theme.Font.caption)

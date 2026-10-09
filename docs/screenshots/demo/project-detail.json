@@ -1,0 +1,161 @@
+{
+ "key": "acme-api",
+ "name": "acme-api",
+ "state": "active",
+ "plan": {
+  "units": [
+   {
+    "id": "plan",
+    "title": "plan",
+    "done": 1,
+    "total": 2,
+    "stage": "building",
+    "stale": false,
+    "current_task": {
+     "id": "T02",
+     "title": "Review the result",
+     "source": "first_open"
+    },
+    "counts": {
+     "done": 1,
+     "planned": 1
+    },
+    "waiting_on_owner": [],
+    "weekly_count": 0,
+    "gate": {
+     "status": "none",
+     "at": null,
+     "failed_runs": 0
+    },
+    "provider": "checkbox",
+    "checkouts": 0,
+    "as_of": 1790762460,
+    "tasks": [
+     {
+      "id": "T01",
+      "title": "Build the fixture",
+      "status": "done",
+      "owner": null
+     },
+     {
+      "id": "T02",
+      "title": "Review the result",
+      "status": "planned",
+      "owner": null
+     }
+    ],
+    "error": null
+   }
+  ],
+  "message": null
+ },
+ "sessions": [
+  {
+   "agent": "claude",
+   "driver": "owner",
+   "state": "running",
+   "started_at": 1790762400
+  }
+ ],
+ "gate_detail": {
+  "plan": {
+   "dirty": null,
+   "commits_since": null
+  }
+ },
+ "time": [
+  {
+   "day": "2026-09-17",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-18",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-19",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-20",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-21",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-22",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-23",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-24",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-25",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-26",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-27",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-28",
+   "owner_s": 0.0,
+   "agent_s": 0,
+   "confidence": null
+  },
+  {
+   "day": "2026-09-29",
+   "owner_s": 1200.0,
+   "agent_s": 3600,
+   "confidence": "high"
+  },
+  {
+   "day": "2026-09-30",
+   "owner_s": 300.0,
+   "agent_s": 0,
+   "confidence": "medium"
+  }
+ ],
+ "top_terms": [],
+ "owner_estimate": true,
+ "history": [
+  {
+   "id": "decision-a",
+   "title": "Use the local cache",
+   "at": 1790762460
+  }
+ ]
+}

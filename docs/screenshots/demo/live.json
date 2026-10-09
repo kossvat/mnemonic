@@ -1,0 +1,69 @@
+{
+ "boot": "0123456789abcdef",
+ "v": 7,
+ "projects": [
+  {
+   "key": "acme-api",
+   "name": "acme-api",
+   "state": "running",
+   "sessions": [
+    {
+     "agent": "claude",
+     "driver": "owner",
+     "state": "running",
+     "started_at": 1790762400
+    },
+    {
+     "agent": "codex",
+     "driver": "program",
+     "state": "running",
+     "started_at": 1790762405
+    }
+   ],
+   "more_sessions": 0,
+   "today": {
+    "owner_s": 5400,
+    "agent_s": 9000,
+    "confidence": "high"
+   },
+   "plan": {
+    "unit": "auth-hardening",
+    "done": 3,
+    "total": 7,
+    "stage": "building",
+    "task": "Rotate refresh tokens on every use",
+    "gate": "passed"
+   }
+  },
+  {
+   "key": "web-client",
+   "name": "web-client",
+   "state": "waiting",
+   "sessions": [
+    {
+     "agent": "codex",
+     "driver": "owner",
+     "state": "waiting",
+     "started_at": 1790763300
+    }
+   ],
+   "more_sessions": 0,
+   "today": {
+    "owner_s": 1500,
+    "agent_s": 2400,
+    "confidence": "high"
+   },
+   "plan": null
+  }
+ ],
+ "more_projects": 0,
+ "unknown": {
+  "sessions": [],
+  "more_sessions": 0
+ },
+ "today": {
+  "owner_s": 6900,
+  "agent_s": 11400
+ },
+ "memories": 312
+}

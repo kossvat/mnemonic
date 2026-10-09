@@ -1,4 +1,5 @@
 import Foundation
+import MnemonicShared
 
 enum MnemonicClientError: LocalizedError {
     case missingToken(URL)
@@ -25,6 +26,7 @@ enum MnemonicClientError: LocalizedError {
 
 actor MnemonicClient {
     private var endpoint: URL
+    private let profile: MnemonicProfile
     private let tokenURL: URL
     private var cachedToken: String?
     private let session: URLSession
@@ -32,21 +34,19 @@ actor MnemonicClient {
     private let encoder = JSONEncoder()
 
     init(
-        endpoint: URL = URL(string: "http://127.0.0.1:3737")!,
-        tokenURL: URL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".mnemonic/auth.token"),
-        session: URLSession = .shared
+        profile: MnemonicProfile = .current,
+        session: URLSession? = nil,
+        endpoint: URL? = nil
     ) {
-        self.endpoint = endpoint
-        self.tokenURL = tokenURL
+        self.profile = profile
+        self.endpoint = endpoint ?? profile.endpoint
+        self.tokenURL = profile.tokenURL
         self.session = session
+            ?? URLSession(configuration: profile.sessionConfiguration())
     }
 
     func setEndpoint(_ value: String) throws {
-        guard let url = URL(string: value), let scheme = url.scheme, !scheme.isEmpty else {
-            throw MnemonicClientError.badEndpoint(value)
-        }
-        endpoint = url
+        endpoint = try LocalAPI.validatedEndpoint(value, profile: profile)
     }
 
     func currentEndpoint() -> URL {
@@ -226,9 +226,9 @@ actor MnemonicClient {
         if !force, let cachedToken {
             return cachedToken
         }
-        let token = try String(contentsOf: tokenURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else {
+        // The profile reads its own token: in an isolated profile a file
+        // that leads out of the home is another store's and is not read.
+        guard let token = profile.token() else {
             throw MnemonicClientError.missingToken(tokenURL)
         }
         cachedToken = token

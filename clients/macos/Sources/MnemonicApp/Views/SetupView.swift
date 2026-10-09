@@ -33,9 +33,7 @@ struct SetupView: View {
                 .buttonStyle(SubtleButtonStyle())
 
                 Button {
-                    let config = FileManager.default.homeDirectoryForCurrentUser
-                        .appendingPathComponent(".config/mnemonic/config.toml")
-                    NSWorkspace.shared.open(config)
+                    NSWorkspace.shared.open(MnemonicProfile.current.configURL)
                 } label: {
                     Label("Open config", systemImage: "gearshape")
                         .font(Theme.Font.bodyMedium)
@@ -43,9 +41,7 @@ struct SetupView: View {
                 .buttonStyle(SubtleButtonStyle())
 
                 Button {
-                    let log = FileManager.default.homeDirectoryForCurrentUser
-                        .appendingPathComponent(".mnemonic/daemon.log")
-                    NSWorkspace.shared.open(log)
+                    NSWorkspace.shared.open(MnemonicProfile.current.logURL)
                 } label: {
                     Label("Open log", systemImage: "doc.text")
                         .font(Theme.Font.bodyMedium)

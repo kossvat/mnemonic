@@ -63,7 +63,7 @@ struct MemoriesView: View {
             }
             Spacer()
             Button {
-                Task { await model.refreshMemories() }
+                Task { await model.refreshMemories(invalidate: true) }
             } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
                     .font(Theme.Font.caption)
@@ -130,7 +130,7 @@ struct MemoriesView: View {
             model.showToast("Memory removed")
             pendingForget = nil
             selected = nil
-            await model.refreshMemories()
+            await model.refreshMemories(invalidate: true)
         } catch {
             model.showToast(error.localizedDescription)
         }

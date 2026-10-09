@@ -20,8 +20,14 @@ use rusqlite::Connection;
 use tracing::{info, warn};
 
 /// Bumped by each schema change old readers must not mistake for their own:
-/// 1 update links, 2 facts v2.
-pub const MEMORY_SCHEMA_GENERATION: i64 = 2;
+/// 1 update links, 2 facts v2, 3 the owner's time by live projects.
+///
+/// Generation 3 changes no table an earlier binary reads. It changes what
+/// the rows of attribution mean: an earlier daemon would make them again
+/// by its own rule and undo what the owner corrected. So an earlier binary
+/// must refuse the store, and the daemon of this one writes nothing until
+/// the store is of this generation (`Storage::require_current_generation`).
+pub const MEMORY_SCHEMA_GENERATION: i64 = 3;
 
 /// A temporary snapshot older than this belongs to a process that died.
 const STALE_TMP: Duration = Duration::from_secs(3600);
@@ -32,11 +38,32 @@ pub fn generation(conn: &Connection) -> Result<i64> {
 
 /// Refuse a store a newer binary has already moved on.
 pub(super) fn refuse_newer(conn: &Connection) -> Result<()> {
+    refuse_newer_than(conn, MEMORY_SCHEMA_GENERATION)
+}
+
+/// What a binary that knows generations up to `known` does with a store.
+pub(super) fn refuse_newer_than(conn: &Connection, known: i64) -> Result<()> {
     let found = generation(conn)?;
     ensure!(
-        found <= MEMORY_SCHEMA_GENERATION,
+        found <= known,
         "memory.db schema generation {found} is newer than this binary knows \
-         ({MEMORY_SCHEMA_GENERATION}); upgrade mnemonic"
+         ({known}); upgrade mnemonic"
+    );
+    Ok(())
+}
+
+/// The store is of the generation this binary writes for. It is not when
+/// the snapshot before the upgrade could not be taken, or the raise failed:
+/// the open went on with the store as it was, and a writer whose rows mean
+/// something new under this generation must not start.
+pub(super) fn require_current(conn: &Connection, db_path: &Path) -> Result<()> {
+    let found = generation(conn)?;
+    ensure!(
+        found == MEMORY_SCHEMA_GENERATION,
+        "memory.db is of schema generation {found}, not {MEMORY_SCHEMA_GENERATION}: the \
+         snapshot before the upgrade ({}) could not be taken or the raise failed. \
+         Nothing was written. Free space beside the store and start again",
+        snapshot_path(db_path).display()
     );
     Ok(())
 }
