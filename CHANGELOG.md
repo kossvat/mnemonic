@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reflection consolidates a cluster with a member stored before the policy (its text is redacted in the consolidated memory) instead of skipping it. A cluster with a member filed under an id the policy refuses is left as it is.
 
 ### Fixed
+- The crate builds without warnings under the linter of the current stable toolchain: the replay sorts its chosen segments by key.
 - A stretch of work is extended even when another process writes to the store at the same moment: the reader waits for the lock, where it used to give up and lose the times of that poll.
 - Writes of the project registry and of attribution corrections wait for another process that is writing the store, where they could fail with a locked database and lose the change.
 - A day marked to be made again is no longer lost when two passes read the same mark and a later record marks the day again.

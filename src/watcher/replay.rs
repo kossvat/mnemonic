@@ -294,7 +294,7 @@ fn sample(mut segments: Vec<Shown>, count: usize) -> Vec<Shown> {
     for step in 0..rest {
         chosen.push(segments[step * segments.len() / rest].clone());
     }
-    chosen.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+    chosen.sort_by_key(|shown| shown.started_at);
     chosen
 }
 
