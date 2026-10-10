@@ -150,9 +150,9 @@ pub(super) fn stream_of(namespace: &str, path: &Path) -> String {
 /// or a resume carries earlier turns into a new transcript, but rewrites
 /// `sessionId`. Scoping the key by transcript would re-ingest every copied
 /// turn under a new key, and an ingress UserCorrection bypasses semantic
-/// dedup, so it would land twice in the store. Measured on this corpus:
-/// 10,084 uuids appear in two transcripts with DIFFERENT session ids, and no
-/// uuid binds two different captured texts.
+/// dedup, so it would land twice in the store. In practice the same uuid
+/// appears in two transcripts with DIFFERENT session ids, and no uuid binds
+/// two different captured texts.
 ///
 /// Codex ids are only known to be unique within one rollout, so that
 /// namespace keeps the transcript scope.

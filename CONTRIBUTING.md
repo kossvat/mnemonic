@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Rust 1.70+
+- The Rust toolchain pinned in `rust-toolchain.toml` (rustup installs it on the first build)
 - git
 
 ## Build
@@ -34,7 +34,7 @@ The codebase is trait-based with four core abstractions:
 
 | Trait | Purpose |
 |-------|---------|
-| `Embedder` | Generates SimHash vectors for semantic similarity |
+| `Embedder` | Generates document and query vectors: multilingual-e5-base by default, a hash-based fallback |
 | `Classifier` | Assigns memory type (decision, feedback, note, etc.) |
 | `OutputSink` | Writes memories to a destination (Claude Code files, Obsidian, etc.) |
 | `Watcher` | Monitors sources for new content (filesystem, git) |
@@ -46,7 +46,7 @@ Storage is SQLite with FTS5. The daemon runs async on tokio.
 1. Create a new module under `src/output/`
 2. Implement the `OutputSink` trait
 3. Register it in the sink registry (`src/output/mod.rs`)
-4. Add configuration options to `MnemonicConfig`
+4. Add configuration options to `OutputConfig` in `src/config.rs`
 
 ## Pull requests
 

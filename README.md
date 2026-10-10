@@ -90,7 +90,7 @@ last two optional):
 
 ## Requirements
 
-- **Current Rust toolchain** — edition 2024; this change is tested with Rust/Cargo 1.94.1
+- **Rust toolchain**: edition 2024. The repository pins the compiler in `rust-toolchain.toml` (1.94.1); rustup installs it on the first build in a checkout
 - **Git** — for commit tracking (optional, works without it)
 - **macOS or Linux** — Windows not yet supported
 
@@ -130,6 +130,10 @@ mnemonic status    # see what's in the DB
 
 That's it — the daemon is now watching your work. Everything below is optional polish.
 
+One thing is not automatic: live projects, time by project and plans need to know
+where your projects live. See [Projects](#projects), or follow
+[docs/agent-setup-workspace.md](docs/agent-setup-workspace.md) from the start.
+
 ### Use with Claude Code
 
 Give Claude Code this repo link and it can set everything up for you. A setup agent follows
@@ -145,15 +149,30 @@ memory kept apart. Beyond wiring the hook and MCP server below, it should also:
 
 Or wire it manually:
 
-**1. Auto-start the daemon + inject context on session start** — add to `.claude/settings.json` → `hooks.SessionStart`:
+**1. Auto-start the daemon + inject context on session start.** Add this to
+`~/.claude/settings.json` (your user settings, so it runs in every project), under
+`hooks.SessionStart`. If the file already has that list, add the inner entry to it:
 
 ```json
 {
-  "type": "command",
-  "command": "sh -c '~/.cargo/bin/mnemonic start -d 2>/dev/null; ~/.cargo/bin/mnemonic context 2>/dev/null || true'",
-  "timeout": 5000
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c '~/.cargo/bin/mnemonic start -d 2>/dev/null; ~/.cargo/bin/mnemonic context 2>/dev/null || true'",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
 }
 ```
+
+`timeout` is in seconds. The daemon watches files and commits in the folder it is
+started in; the runbook above shows how to make that your workspace every time.
 
 `start -d` exits with 1 when the daemon is already running, so the two commands are joined
 with `;`, not `&&`: the context is generated on every session, not only on the first one
@@ -166,13 +185,17 @@ after a reboot.
   "mcpServers": {
     "mnemonic": {
       "type": "stdio",
-      "command": "~/.cargo/bin/mnemonic",
+      "command": "/absolute/path/to/mnemonic",
       "args": ["mcp"],
       "env": { "RUST_LOG": "error" }
     }
   }
 }
 ```
+
+Write the real path there (`command -v mnemonic` prints it): `~` may not be expanded in
+this file. Or let Claude Code write the entry:
+`claude mcp add --scope user mnemonic -- "$(command -v mnemonic)" mcp`.
 
 MCP tools: `memory_search` · `memory_save` · `memory_recent` · `memory_similar` · `memory_context` · `memory_status` · `memory_graph` · `memory_followups` · `memory_followup_open` · `memory_followup_update` · `memory_fact_set` · `memory_facts`
 
@@ -200,13 +223,13 @@ a second, human-curated layer on top.
 
 ### Use with Codex (or any MCP agent)
 
-The daemon's automatic capture (git, file changes, corrections) is **agent-agnostic** — start it
-once and it records your work no matter which agent you drive. To also give Codex the
+Git and file-change capture does not depend on the agent you drive. Decisions and corrections
+are captured from the transcripts of Claude Code and Codex. To also give Codex the
 memory tools, register the same MCP server in `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.mnemonic]
-command = "mnemonic"   # or the absolute path: ~/.cargo/bin/mnemonic
+command = "/absolute/path/to/mnemonic"   # what `command -v mnemonic` prints
 args = ["mcp"]
 env = { RUST_LOG = "error" }
 ```
@@ -294,8 +317,8 @@ The existing screens remain available, including:
   select a link to read supporting memories. Stale projects and outside-registry
   entities have separate shelves with explicit archive and Undo actions.
 
-The new project screens are provisional. Owner visual acceptance and the
-native open-window budget remain pending.
+The new project screens are provisional: their look and the time they take
+to open are not final.
 
 With projects configured, `GET /api/graph/curated` supplies a registry-led
 graph with stable positions and an entity tag. Projects, parts, plan units,
@@ -485,7 +508,7 @@ Every component is a trait — swap implementations without touching the pipelin
 ```rust
 trait Watcher         // FileWatcher, GitWatcher, ConversationWatcher
 trait Classifier      // RuleClassifier, (future: LLM-based)
-trait Embedder        // HashEmbedder, NeuralEmbedder (optional, --features neural)
+trait Embedder        // HashEmbedder, NeuralEmbedder (the default `neural` feature)
 trait EntityExtractor // RuleExtractor, (future: LLM-based)
 trait OutputSink      // SQLite, MemoryFiles, Obsidian, MemoryAPI
 ```
@@ -551,7 +574,8 @@ mnemonic upgrade             # Rebuild + install binary + restart widget
 ## Configuration
 
 Default config path: `~/.config/mnemonic/config.toml`. See
-[config.example.toml](config.example.toml) for all options.
+[config.example.toml](config.example.toml) for the common options; `mnemonic init` writes every
+section with its defaults.
 
 Key settings:
 
@@ -690,7 +714,9 @@ explicit project and prints no task titles or checkout paths.
 ### Uninstall
 
 ```bash
+mnemonic stop 2>/dev/null                                              # stop the daemon first
 launchctl bootout gui/$(id -u)/com.kossvat.mnemonic.daemon 2>/dev/null  # only if you set up launchd
+rm -f ~/Library/LaunchAgents/com.kossvat.mnemonic.daemon.plist          # the same
 rm -f ~/.cargo/bin/mnemonic
 rm -rf ~/.mnemonic ~/.config/mnemonic ~/.fastembed_cache
 ```
@@ -772,7 +798,7 @@ title-only files are retained, so a backfill can create additional files.
 - [x] Doctor diagnostics
 - [x] macOS menu bar widget (SwiftUI)
 - [x] Knowledge graph (entities, edges, rule-based extraction)
-- [x] Neural embeddings (multilingual-e5-base via fastembed, optional `--features neural`)
+- [x] Neural embeddings (multilingual-e5-base via fastembed, the default `neural` feature)
 - [x] Conversation watcher (Claude Code JSONL session monitoring)
 - [x] Memory API sync (cross-agent shared memory)
 - [x] Graph-aware context generation (entities + neighbors in CONTEXT.md)
@@ -787,17 +813,14 @@ title-only files are retained, so a backfill can create additional files.
 ## Building
 
 ```bash
-# Use a current Rust toolchain (edition 2024)
-cargo build --release
-
-# With neural embeddings (768-dim multilingual-e5-base, multilingual incl. Russian)
-cargo build --release --features neural
+# rustup takes the compiler pinned in rust-toolchain.toml
+cargo build --release     # neural embeddings (768-dim multilingual-e5-base) are part of the default build
 
 cargo test                # run tests
 cargo install --path .    # install globally
 ```
 
-Binary size: ~6 MB default, ~26 MB with `--features neural` (statically linked SQLite + ONNX Runtime).
+Binary size: about 40 MB (statically linked SQLite + ONNX Runtime).
 
 ## License
 

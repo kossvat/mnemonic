@@ -185,7 +185,7 @@ struct DayDetailView: View {
                         if let span = day.spanHuman { stat(span, "span") }
                     }
                     // One line, slight shrink instead of the ugly mid-value
-                    // wrap ("12:30am–\n1:24am") night spans used to get.
+                    // wrap that spans crossing midnight used to get.
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
                 }
@@ -200,7 +200,7 @@ struct DayDetailView: View {
 }
 
 /// Thin lane showing the day's work blocks. The window defaults to 6a–10p
-/// and STRETCHES to cover real blocks — night-owl sessions (12:30am–1:24am)
+/// and STRETCHES to cover the blocks of the day: blocks after midnight
 /// used to be clipped away entirely, rendering an empty lane on a day with
 /// tracked work. Hour ticks adapt to the stretched window.
 struct SessionTimelineView: View {

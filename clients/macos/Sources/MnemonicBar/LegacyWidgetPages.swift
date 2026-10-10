@@ -33,7 +33,7 @@ struct ProjectsPageView: View {
         let ranked = projects.sorted { first, second in (val(first) ?? -1) > (val(second) ?? -1) }
         // Projects with real time lead; the long tail without attributed
         // time used to render as a wall of identical "tracking soon" rows
-        // (9 of 12 on real data) drowning the projects that matter.
+        // drowning the projects that matter.
         let tracked = ranked.filter { project in !soon(project) }
         let waiting = ranked.filter { project in soon(project) }
         let unattr = unattributedValue

@@ -416,7 +416,7 @@ fn append_line(path: &Path, text: String) {
 
 /// A tick reads its whole namespace in ONE query. Before, every transcript
 /// cost its own lookup and its own lock of the shared connection, every ten
-/// seconds, on ~1,700 files. Since the tick looks at stamps first, a tick
+/// seconds, for every file. Since the tick looks at stamps first, a tick
 /// with nothing to read reads no cursor at all.
 #[test]
 fn ingress_an_idle_tick_reads_the_cursors_once_not_once_per_file() {

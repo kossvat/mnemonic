@@ -1,0 +1,6 @@
+# One compiler for local checks, for CI and for release builds: a newer
+# linter must not fail a build that passed here. Raising the version is a
+# change of its own; .github/workflows name the same version.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

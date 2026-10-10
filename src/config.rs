@@ -564,10 +564,10 @@ pub struct ActivityConfig {
     pub idle_threshold_secs: u64,
     /// Sessions shorter than this (seconds) are dropped when they close
     /// instead of being kept. Filters phantom blips: some peripherals /
-    /// utilities reset the system idle counter for an instant (observed
-    /// as exactly-15-minute 0-second "sessions"), which pollutes session
-    /// counts while adding no time. Deliberately tiny by default — blips
-    /// measure 0-2s, while a genuine quick check-in (10-20s) must keep
+    /// utilities reset the system idle counter for an instant (they show
+    /// up as 0-second "sessions"), which pollutes session counts while
+    /// adding no time. Deliberately tiny by default: such a blip lasts a
+    /// second or two, while a genuine quick check-in (10-20s) must keep
     /// counting toward daily totals. 0 disables the filter.
     #[serde(default = "default_activity_min_session_secs")]
     pub min_session_secs: u64,

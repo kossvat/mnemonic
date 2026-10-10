@@ -277,10 +277,9 @@ impl ConversationWatcher {
         // `message.content`:
         //   1. String:  "content": "the text"
         //   2. Array:   "content": [{"type":"text","text":"..."}, ...]
-        // Sampling typical ~/.claude/projects JSONLs showed array
-        // form is 4667 assistant + 2853 user rows vs only 295 user
-        // strings — i.e., the previous string-only parser silently
-        // dropped >95% of real lines. Both shapes route through
+        // Almost every row of a Claude Code transcript uses the array
+        // form, so the previous string-only parser silently dropped
+        // nearly all of them. Both shapes route through
         // `extract_message_content` which concatenates `text` blocks
         // and ignores `tool_use` / `tool_result` / `thinking`.
         let content_value = v.get("message")?.get("content")?;

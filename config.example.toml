@@ -9,7 +9,7 @@ log_file = "~/.mnemonic/daemon.log"
 [watchers]
 # Directories to watch for file changes
 watch_paths = [
-    ".",                    # current working directory
+    ".",                    # the folder the daemon is started in; name your workspace instead to fix it
     "~/.claude-flow",       # claude-flow sessions/insights
 ]
 # File extensions to track
@@ -49,6 +49,12 @@ obsidian_path = "~/Documents/Obsidian/Vault"
 # Batch write interval (seconds)
 # Events are collected and processed in batches
 batch_interval_secs = 5
+
+# The loopback API the menu-bar widget and the companion app read. Off by
+# default; it listens on this machine only, behind the token in token_file.
+# [ui]
+# enabled = true
+# port = 3737
 
 # Where your projects live: needed for live projects, time by project and the
 # Projects board. Every visible child folder of the folder of projects is a

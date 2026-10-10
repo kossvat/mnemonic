@@ -83,8 +83,8 @@ impl Storage {
         // WAL mode: concurrent readers don't block on a single writer (daemon).
         // busy_timeout: if locked, retry for up to 5s instead of hanging forever.
         // wal_autocheckpoint: auto-checkpoint WAL every 1000 pages (~4MB) so the
-        //   WAL file doesn't grow unbounded. Prevents multi-MB WAL files observed
-        //   in production (memory.db-wal growing 3x the size of memory.db).
+        //   WAL file doesn't grow unbounded. Prevents a WAL file that grows
+        //   past the size of the database itself.
         // Without WAL+busy_timeout, CLI invocations during daemon writes hang in
         // UE state on macOS (see tests::reader_does_not_hang_during_writer).
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -5456,8 +5456,8 @@ impl Storage {
     /// This used to rank the sessions of the store, which begin at the
     /// first memory captured from a transcript and were closed thirty
     /// minutes after the last one: hours of work came out as fragments,
-    /// and the longest "session" on record was under three hours while the
-    /// transcripts held stretches of twenty.
+    /// and no "session" came out as long as the stretches the transcripts
+    /// held.
     ///
     /// `top_project` comes from `project_signals_in_window` over the padded
     /// window — the SAME signal the attribution worker uses. It is

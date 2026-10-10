@@ -37,9 +37,8 @@ and IDs. Empty sections name what is not recorded. Canonical detail responses
 are accepted for merged routes, and live failure hides old sessions without
 discarding held plan, time, and history.
 
-The project screens are provisional. Owner visual acceptance and the native
-open-window budget remain pending; current evidence is in the live-projects
-design, section 19.
+The project screens are provisional: their look and the time they take to
+open are not final.
 
 ## Timeline in MnemonicApp
 
@@ -98,8 +97,8 @@ fixture JSON, before creating a live app model. Native budget tooling uses
 requires a visible Graph window and completed painting of the current nonempty
 snapshot containing both synthetic projects and their plan units. The frame
 budget remains BLOCKED: the release renderer measured a maximum of 8.073 ms
-against the 8 ms limit, with P95 7.551 ms. Owner visual acceptance and the native
-graph budget remain pending; evidence is in the live-projects design, section 19.
+against the 8 ms limit, with P95 7.551 ms. The look of the graph and its
+native budget are not final.
 
 ## Requirements
 
@@ -147,7 +146,7 @@ endpoint outright (only an http address of this machine is accepted), and
 ## Auto-start on Login
 
 1. Build release: `swift build -c release`
-2. Copy to Applications: `cp -r .build/release/MnemonicBar /Applications/MnemonicBar`
+2. Copy it where you keep your own apps: `mkdir -p ~/Applications && cp .build/release/MnemonicBar ~/Applications/MnemonicBar`
 3. System Settings > General > Login Items > add MnemonicBar
 
 ## Architecture

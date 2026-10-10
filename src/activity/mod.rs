@@ -506,8 +506,8 @@ impl ActivityStore {
         // But the DISPLAYED sessions (timeline, count, longest, span) drop
         // sub-minute micro-blocks. Those are sampling/daemon-restart noise
         // (0–2s bursts) that would clutter the timeline with invisible dots
-        // and inflate the session count. Codex flagged 11 "sessions" today,
-        // 6 of them <60s. Their seconds still live in total_seconds above.
+        // and inflate the session count. A day can hold many blocks under a
+        // minute. Their seconds still live in total_seconds above.
         let blocks: Vec<SessionBlock> = all
             .into_iter()
             .filter(|b| b.seconds() >= MIN_SESSION_SECS)

@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mnemonic backup <dir>`: whole, checked copies of the memory and activity stores, taken while the daemon runs. It migrates nothing and never writes over a copy.
 
 ### Changed
+- The compiler is pinned in `rust-toolchain.toml` (1.94.1) and both workflows build with it, so a newer linter cannot fail a build that passed locally. Raising the version is a deliberate change.
 - The store's schema generation is 3: the rows of time by project mean something new, so an earlier binary refuses a store this version opened. The upgrade takes a one-time snapshot first; the way back is a backup taken before it.
 - The daemon at rest: a transcript that did not change is not opened again, and the embedding model is released after fifteen minutes without use and loaded again on demand.
 - With projects configured, model extraction assigns the project type only to current registry names and name aliases, including on cache hits. Without configured projects, extraction keeps its existing behavior.
@@ -70,9 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Update crossbeam-epoch, h2, rustls-webpki, anyhow and git2 to remove known RustSec vulnerability/unsoundness findings. The local Git watcher no longer pulls Git SSH/HTTPS transport defaults; maintenance warnings in embedding/index dependencies remain documented.
 
 ### Documentation
+- The agent runbook for a workspace of projects was read cold by two agents and rewritten where they stopped: what the daemon watches and where to start it, the place and the shape of the Claude Code hook, upgrading an existing install, a worked task file, the stages of a plan, and a login job. The README's hook timeout is in seconds, its server path is absolute, and it no longer calls neural embeddings optional.
 - An agent runbook for one person with several projects, `docs/agent-setup-workspace.md`: how the folders must be laid out, how a session is tied to a project, where plans and gate receipts are read from, and an acceptance test. The README shows the current widget and the Projects board, rendered by the clients from the invented data in `docs/screenshots/demo`. The example configuration names the `[projects]` section.
-- The shared graph renderer remains machine-blocked: release maximum frame time is 8.073 ms against the 8 ms budget, with P95 7.551 ms. The benchmark workload and assertions are unchanged, and owner visual acceptance remains pending.
-- The project screens remain provisional: owner visual acceptance and the native open-window budget are pending. The locked-screen budget block and interim Swift results are recorded in the live-projects design; neither is a final acceptance receipt.
+- The shared graph renderer remains machine-blocked: release maximum frame time is 8.073 ms against the 8 ms budget, with P95 7.551 ms. The benchmark workload and assertions are unchanged.
+- The project screens remain provisional: their look and the time they take to open are not final.
 - The README says what the code does: 12 MCP tools, the HTTP API off by default and what needs it, the embedding model at about 1 GB on disk, and what the generated context leaves out, marks, and does not touch.
 - Secret redaction: what is recognized and what is not, which names are refused, that every writer has to be upgraded, that what was stored before is not rewritten, and how to scan a copy of a store.
 - Clarify entry export/import limitations and the trusted-launcher boundary for shared context; document Mac-to-hub architecture and remaining ingestion/sink/recovery work.

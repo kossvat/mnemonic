@@ -347,9 +347,9 @@ pub fn summary_for_session(storage: &Storage, session_id: &str) -> Result<Option
 /// Format the title. "Session summary: <peer> · <date>". Peer name
 /// is best-effort — if we can't resolve, fall back to "(unknown)".
 ///
-/// Date uses the parsed timestamp's YYYY-MM-DD format. Codex caught
-/// that the previous `split('T')` only worked on RFC3339 — SQLite
-/// rows in the live DB use `2026-05-25 06:04:35` (space, not T),
+/// Date uses the parsed timestamp's YYYY-MM-DD format. The previous
+/// `split('T')` only worked on RFC3339: SQLite rows are written as
+/// `2026-05-25 06:04:35` (space, not T),
 /// so the title accidentally included the full timestamp. The
 /// shared `parse_session_timestamp` helper accepts both formats.
 fn render_heuristic_title(session: &Session, storage: &Storage) -> String {

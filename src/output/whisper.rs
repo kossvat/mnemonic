@@ -8,7 +8,7 @@ use crate::storage::{RankedEntry, Storage};
 
 /// Hard ceiling for the generated context, enforced mechanically (design
 /// review): adding project digests must make the injection SMARTER, not
-/// BIGGER. Measured from the pre-digest output (~9-10k chars on a live DB).
+/// BIGGER. Set from the size of the output before digests were added.
 const MAX_CONTEXT_CHARS: usize = 10_000;
 /// How many project state digests lead the context.
 const MAX_DIGEST_PROJECTS: usize = 3;

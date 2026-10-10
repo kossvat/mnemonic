@@ -5,7 +5,7 @@ import SwiftUI
 /// latest memory: what memory returned on this local day, from the recall
 /// log. Its numbers come from the daemon's route, or from the command line
 /// when the route does not answer (MnemonicService.recallToday); how the
-/// card looks is the owner's judgement.
+/// card looks is a matter of taste.
 struct MemoryTodayView: View {
     let state: RecallDayState
 

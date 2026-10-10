@@ -32,9 +32,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The version of rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.94.1
         with:
           targets: ${{ matrix.target }}
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
