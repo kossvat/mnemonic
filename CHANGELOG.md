@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mnemonic backup <dir>`: whole, checked copies of the memory and activity stores, taken while the daemon runs. It migrates nothing and never writes over a copy.
 
 ### Changed
+- The copyright holder and the author of the crate are Picksa Corp.
 - The compiler is pinned in `rust-toolchain.toml` (1.94.1) and both workflows build with it, so a newer linter cannot fail a build that passed locally. Raising the version is a deliberate change.
 - The store's schema generation is 3: the rows of time by project mean something new, so an earlier binary refuses a store this version opened. The upgrade takes a one-time snapshot first; the way back is a backup taken before it.
 - The daemon at rest: a transcript that did not change is not opened again, and the embedding model is released after fifteen minutes without use and loaded again on demand.

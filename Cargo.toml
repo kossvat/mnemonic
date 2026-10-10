@@ -9,7 +9,7 @@ homepage = "https://github.com/kossvat/mnemonic"
 keywords = ["ai", "memory", "claude", "agent", "mcp"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
-authors = ["AgentForgeAI"]
+authors = ["Picksa Corp"]
 default-run = "mnemonic"
 
 [[bin]]
