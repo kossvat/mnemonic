@@ -19,7 +19,7 @@
         "counts": { "done": 1, "planned": 1 },
         "waiting_on_owner": [],
         "weekly_count": 0,
-        "gate": { "status": "none", "at": null, "failed_runs": 0 },
+        "gate": { "status": "none", "at": null, "failed_runs": 0, "result": null },
         "provider": "checkbox",
         "checkouts": 0,
         "as_of": 1790762460,
@@ -27,13 +27,15 @@
           { "id": "T01", "title": "Build the fixture", "status": "done", "owner": null },
           { "id": "T02", "title": "Review the result", "status": "planned", "owner": null }
         ],
-        "error": null
+        "error": null,
+        "closed": false,
+        "closed_at": null
       }
     ],
     "message": null
   },
   "sessions": [
-    { "agent": "claude", "driver": "owner", "state": "running", "started_at": 1790762400 }
+    { "agent": "claude", "driver": "owner", "state": "running", "started_at": 1790762400, "last_record_at": 1790762460 }
   ],
   "gate_detail": { "plan": { "dirty": null, "commits_since": null } },
   "time": [
@@ -55,6 +57,6 @@
   "top_terms": [],
   "owner_estimate": true,
   "history": [
-    { "id": "decision-a", "title": "Use the local cache", "at": 1790762460 }
+    { "id": "decision-a", "title": "Use the local cache", "at": 1790762460, "kind": "decision" }
   ]
 }

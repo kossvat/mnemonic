@@ -76,6 +76,8 @@ anndists = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# Tests count the statements a read runs; release builds do not trace.
+rusqlite = { version = "0.35", features = ["bundled", "trace"] }
 
 [features]
 default = ["neural"]

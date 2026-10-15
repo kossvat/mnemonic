@@ -976,6 +976,15 @@ impl ActivityStore {
     /// One local day's attributed projects `(key, seconds, confidence)` sorted
     /// by seconds desc, plus that day's unattributed seconds. Reads only the
     /// precomputed tables — the journal's deterministic fact-collector uses it.
+    /// Lets a test count the statements a read of this store runs. Only the
+    /// route tests of the binary call it, so the library's tests do not.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn trace(&self, trace: Option<fn(rusqlite::trace::TraceEvent<'_>)>) {
+        let conn = self.conn.lock().unwrap_or_else(|held| held.into_inner());
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, trace);
+    }
+
     pub fn project_attribution_for_day(&self, day: NaiveDate) -> Result<DayAttribution> {
         let day_str = day.format("%Y-%m-%d").to_string();
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;

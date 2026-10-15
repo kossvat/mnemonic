@@ -10,6 +10,15 @@ struct MnemonicApp: App {
 
     init() {
         let arguments = CommandLine.arguments
+        if arguments.contains("--render-fixture-states") {
+            do {
+                try FixtureStateRender.run(arguments: arguments)
+                exit(0)
+            } catch {
+                FileHandle.standardError.write(Data("Fixture state rendering failed.\n".utf8))
+                exit(2)
+            }
+        }
         if arguments.contains("--render-project-fixtures") {
             do {
                 try AppFixturePreview.run(arguments: arguments)

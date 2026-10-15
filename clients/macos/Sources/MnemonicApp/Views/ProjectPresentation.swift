@@ -4,6 +4,22 @@ import MnemonicShared
 
 /// Display decisions shared by the board and detail, without data work.
 enum ProjectPresentation {
+    enum Served<Value> {
+        case notServed, absent, value(Value)
+    }
+
+    static func served<Element>(_ presence: FieldPresence<[Element]>) -> Served<[Element]> {
+        switch presence {
+        case .missing: return .notServed
+        case .null: return .absent
+        case .value(let values): return values.isEmpty ? .absent : .value(values)
+        }
+    }
+
+    static func focusUnit(_ units: [ProjectPlanUnit]) -> ProjectPlanUnit? {
+        units.first { unit in unit.currentTask != nil } ?? units.first
+    }
+
     struct LiveCard: Identifiable {
         let project: LiveProject
         let row: ProjectBoardRow?
@@ -142,15 +158,6 @@ enum ProjectPresentation {
         return "\(count) \(count == 1 ? "commit" : "commits") since gate"
     }
 
-    static func days(_ values: [ProjectDay]) -> [ProjectDay] {
-        Array(values.sorted { left, right in left.day < right.day }.suffix(14))
-    }
-
-    static func ownerTotal(_ days: [ProjectDay]) -> Double? {
-        guard !days.isEmpty, days.allSatisfy({ day in day.ownerSeconds != nil }) else { return nil }
-        return days.reduce(0) { total, day in total + (day.ownerSeconds ?? 0) }
-    }
-
     static func failure(_ value: LocalAPIFailure) -> (title: String, detail: String) {
         switch value {
         case .off:
@@ -192,43 +199,5 @@ struct ProjectNotice: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-struct ProjectSection<Content: View>: View {
-    let title: String
-    let icon: String
-    let content: Content
-
-    init(title: String, icon: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.icon = icon
-        self.content = content()
-    }
-
-    var body: some View {
-        Card(padding: Theme.Space.xl) {
-            VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                Label { Text(verbatim: title).font(Theme.Font.title) } icon: {
-                    Image(systemName: icon).foregroundStyle(Theme.Palette.textMuted)
-                }
-                Divider().overlay(Theme.Palette.border)
-                content
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-}
-
-struct ProjectSessionLabel: View {
-    let session: LiveSession
-    var body: some View {
-        Label {
-            Text(verbatim: "\(ProjectPresentation.agent(session.agent)) · \(ProjectPresentation.title(session.state.rawValue))")
-        } icon: {
-            Image(systemName: ProjectPresentation.agentIcon(session.agent))
-        }
-        .font(Theme.Font.captionBold)
-        .foregroundStyle(session.state == .running ? Theme.Palette.decision : Theme.Palette.textMuted)
     }
 }

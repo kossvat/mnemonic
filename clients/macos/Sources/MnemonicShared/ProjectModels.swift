@@ -3,6 +3,13 @@ import Foundation
 /// The project board returned by the local project collection route.
 public struct ProjectBoard: Codable, Equatable, Sendable {
     public let projects: [ProjectBoardRow]
+    /// The owner's and the agents' time over the board's seven days, once
+    /// for the board; `.missing` from a daemon of an earlier build.
+    public let week: FieldPresence<ProjectWeek>
+
+    enum CodingKeys: String, CodingKey {
+        case projects, week
+    }
 }
 
 /// Registry state differs from the activity state of a live session.
@@ -20,6 +27,15 @@ public struct ProjectBoardRow: Codable, Equatable, Sendable, Identifiable {
     public let week: ProjectWeek
     public let plan: LivePlan?
     public let planMessage: String?
+    /// Values a daemon of an earlier build does not serve: `.missing` then.
+    public let gateAt: FieldPresence<Int>
+    public let planProvider: FieldPresence<ProjectPlanProvider>
+    public let planCounts: FieldPresence<[String: Int]>
+    public let planWeeklyCount: FieldPresence<Int>
+    public let openUnits: FieldPresence<Int>
+    /// Reasons, the owner's own text or titles of tasks, shown verbatim.
+    public let waitingOnOwner: FieldPresence<[String]>
+    public let lastClosed: FieldPresence<ProjectLastClosed>
 
     public var id: String { key }
 
@@ -28,6 +44,26 @@ public struct ProjectBoardRow: Codable, Equatable, Sendable, Identifiable {
         case mergedInto = "merged_into"
         case lastActiveAt = "last_active_at"
         case planMessage = "plan_message"
+        case gateAt = "gate_at"
+        case planProvider = "plan_provider"
+        case planCounts = "plan_counts"
+        case planWeeklyCount = "plan_weekly_count"
+        case openUnits = "open_units"
+        case waitingOnOwner = "waiting_on_owner"
+        case lastClosed = "last_closed"
+    }
+}
+
+/// The closed unit the reader holds, and its closure time when one is
+/// recorded.
+public struct ProjectLastClosed: Codable, Equatable, Sendable {
+    public let title: String
+    /// A recorded null says that no closure time is recorded.
+    public let closedAt: FieldPresence<Int>
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case closedAt = "closed_at"
     }
 }
 
@@ -56,6 +92,7 @@ public struct ProjectDetail: Codable, Equatable, Sendable, Identifiable {
     public let ownerEstimate: Bool
     public let history: [ProjectHistoryEntry]
     public let topTerms: [ProjectTerm]?
+    public let topTermsPresence: FieldPresence<[ProjectTerm]>
 
     public var id: String { key }
 
@@ -97,6 +134,10 @@ public struct ProjectPlanUnit: Codable, Equatable, Sendable, Identifiable {
     public let asOf: Int
     public let tasks: [ProjectTask]
     public let error: String?
+    /// Whether the reader holds the unit as closed; `.missing` from a
+    /// daemon of an earlier build, which does not say.
+    public let closed: FieldPresence<Bool>
+    public let closedAt: FieldPresence<Int>
 
     /// Status tables have counts, never a task completion percentage.
     public var completionFraction: Double? {
@@ -110,6 +151,8 @@ public struct ProjectPlanUnit: Codable, Equatable, Sendable, Identifiable {
         case waitingOnOwner = "waiting_on_owner"
         case weeklyCount = "weekly_count"
         case asOf = "as_of"
+        case closed
+        case closedAt = "closed_at"
     }
 }
 
@@ -131,13 +174,19 @@ public enum ProjectGateStatus: String, Codable, Sendable {
     case passed, failed, stale, none
 }
 
+/// What the newest receipt says of its own run.
+public enum ProjectGateResult: String, Codable, Sendable {
+    case passed, failed
+}
+
 public struct ProjectGate: Codable, Equatable, Sendable {
     public let status: ProjectGateStatus
     public let at: Int?
     public let failedRuns: Int
+    public let result: FieldPresence<ProjectGateResult>
 
     enum CodingKeys: String, CodingKey {
-        case status, at
+        case status, at, result
         case failedRuns = "failed_runs"
     }
 }
@@ -172,6 +221,12 @@ public struct ProjectHistoryEntry: Codable, Equatable, Sendable, Identifiable {
     public let id: String
     public let title: String
     public let at: Int
+    /// "decision", or "correction" for a memory the store types as feedback.
+    public let kind: FieldPresence<String>
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, at, kind
+    }
 }
 
 public struct ProjectTerm: Codable, Equatable, Sendable {

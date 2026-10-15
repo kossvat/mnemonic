@@ -265,7 +265,7 @@ class MnemonicService: ObservableObject {
             home.appendingPathComponent("Applications/Mnemonic.app"),
             URL(fileURLWithPath: "/Applications/Mnemonic.app"),
         ]
-        let localBundle = sourceDir.appendingPathComponent("build")
+        let localBundle = sourceDir.appendingPathComponent("build/Mnemonic.noindex")
             .appendingPathComponent(bundles[0].lastPathComponent)
         guard let binary = DashboardCapability.firstCompatible(built: executables, bundles: [localBundle] + bundles) else {
             dashboardFailure("No compatible dashboard was found. Update the dashboard, or run clients/macos/scripts/build-app.sh from the current source checkout, then try again.")

@@ -75,7 +75,9 @@ pub struct CurrentTask {
 /// filename; the provider and fixed error identify an unreadable unit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Unit {
-    #[serde(skip)]
+    /// The outcome of the reader's test of a closed unit, not a stored flag.
+    pub closed: bool,
+    /// The recorded closure time; never the time the unit was last touched.
     pub closed_at: Option<i64>,
     pub id: String,
     pub title: String,
@@ -206,6 +208,7 @@ fn finish(
         .unwrap_or(modified)
         .max(modified);
     Unit {
+        closed: false,
         closed_at: None,
         id: parsed.id,
         title: parsed.title,
@@ -224,6 +227,12 @@ fn finish(
         tasks: parsed.tasks,
         error: parsed.error,
     }
+}
+
+/// The reader's test of a closed unit: a closure time is recorded, or the
+/// stage is done.
+fn closed(closed_at: Option<i64>, stage: Stage) -> bool {
+    closed_at.is_some() || stage == Stage::Done
 }
 
 impl Unit {

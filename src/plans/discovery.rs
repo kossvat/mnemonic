@@ -1,5 +1,5 @@
 use super::{
-    Checkout, Input, ParsedUnit, Plan, Provider, Stage, Unit, cache, finish, gate, providers,
+    Checkout, Input, ParsedUnit, Plan, Provider, Unit, cache, closed, finish, gate, providers,
 };
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet};
@@ -343,9 +343,7 @@ impl Reader {
         // out of the normal surface without treating them as missing data.
         let last_closed = candidates
             .iter()
-            .filter(|candidate| {
-                candidate.closed_at.is_some() || candidate.unit.stage == Stage::Done
-            })
+            .filter(|candidate| closed(candidate.closed_at, candidate.unit.stage))
             .max_by_key(|candidate| {
                 (
                     candidate.closed_at.unwrap_or(candidate.unit.as_of),
@@ -354,12 +352,13 @@ impl Reader {
             })
             .map(|candidate| candidate.unit.id.clone());
         candidates.retain(|candidate| {
-            (candidate.closed_at.is_none() && candidate.unit.stage != Stage::Done)
+            !closed(candidate.closed_at, candidate.unit.stage)
                 || Some(&candidate.unit.id) == last_closed.as_ref()
         });
         let units: Vec<Unit> = candidates
             .into_iter()
             .map(|mut candidate| {
+                candidate.unit.closed = closed(candidate.closed_at, candidate.unit.stage);
                 candidate.unit.closed_at = candidate.closed_at;
                 candidate.unit
             })

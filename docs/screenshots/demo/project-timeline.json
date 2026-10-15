@@ -1,0 +1,45 @@
+{
+ "day": "2026-09-30",
+ "from": 1790726400.0,
+ "to": 1790812800.0,
+ "projects": [
+  {"key": "acme-api", "name": "Harbor"},
+  {"key": "web-client", "name": "Beacon"}
+ ],
+ "segments": [
+  {
+   "id": "segment-1", "stream": "fixture-1", "project": "acme-api",
+   "agent": "claude", "driver": "owner", "from": 1790758800.0, "to": 1790762400.0
+  },
+  {
+   "id": "segment-2", "stream": "fixture-2", "project": "acme-api",
+   "agent": "codex", "driver": "program", "from": 1790759100.0, "to": 1790761500.0
+  },
+  {
+   "id": "segment-3", "stream": "fixture-3", "project": "web-client",
+   "agent": "codex", "driver": "owner", "from": 1790763600.0, "to": 1790764500.0
+  }
+ ],
+ "owner": [
+  {
+   "id": "owner-1", "from": 1790758800.0, "to": 1790759100.0,
+   "assignments": [{"project": "acme-api", "share": 1.0, "confidence": "high"}]
+  },
+  {
+   "id": "owner-2", "from": 1790759100.0, "to": 1790760300.0,
+   "assignments": [
+    {"project": "acme-api", "share": 0.5, "confidence": "high"},
+    {"project": "web-client", "share": 0.5, "confidence": "high"}
+   ]
+  },
+  {
+   "id": "owner-3", "from": 1790760300.0, "to": 1790761500.0,
+   "assignments": [{"project": "acme-api", "share": 1.0, "confidence": "high"}]
+  },
+  {
+   "id": "owner-4", "from": 1790764500.0, "to": 1790765100.0,
+   "assignments": [{"project": null, "share": 1.0, "confidence": null}]
+  }
+ ],
+ "owner_available": true
+}

@@ -93,6 +93,22 @@ final class FixtureWindowStateTests: XCTestCase {
                 try decoder.decode(LiveSnapshot.self, from: JSONSerialization.data(withJSONObject: live)))
     }
 
+    /// Presents an answer and announces it, as every answer of the app is announced.
+    @MainActor
+    private func announce(_ model: MnemonicAppModel, board: ProjectBoard?, detail: ProjectDetail?,
+                          live: LiveAnswer, route: AppRoute) {
+        model.projects.present(board: board, detail: detail, live: live, route: route)
+        model.projects.onPresentationChange?()
+    }
+
+    /// Both synthetic cards report a committed paint of the board and snapshot held now.
+    @MainActor
+    private func paintCards(_ model: MnemonicAppModel, _ paint: BoardPaint? = nil, revision: UInt64? = nil) {
+        for card in ["fixture-00", "fixture-01"] {
+            model.boardDidDraw(paint ?? model.heldBoardPaint, card: card, revision: revision ?? model.boardPaintRevision)
+        }
+    }
+
     @MainActor
     private func makeModel(_ profile: MnemonicProfile, clock: ProjectTestClock) -> MnemonicAppModel {
         let controller = AppProjectController(clock: clock, ask: {
@@ -150,6 +166,12 @@ final class FixtureWindowStateTests: XCTestCase {
 
         model.projects.present(board: board, detail: nil, live: .snapshot(live), route: .projects)
         writer.update(model: model)
+        XCTAssertFalse(try fixture.read().ready, "decoded but not yet painted")
+        model.boardDidDraw(model.heldBoardPaint, card: "fixture-00", revision: model.boardPaintRevision)
+        writer.update(model: model)
+        XCTAssertFalse(try fixture.read().ready, "one card of two is not the board")
+        paintCards(model)
+        writer.update(model: model)
         XCTAssertEqual(try fixture.read(), Marker(visible: true, route: "projects", ready: true))
         let ready = try Stamp(fixture.marker)
         writer.update(model: model)
@@ -167,7 +189,9 @@ final class FixtureWindowStateTests: XCTestCase {
         let writer = FixtureWindowState(profile: fixture.profile)
         let (board, live) = try readyValues()
         model.projects.present(board: board, detail: nil, live: .snapshot(live), route: .projects)
+        paintCards(model)
         writer.update(model: model)
+        XCTAssertTrue(try fixture.read().ready)
         let open = try Stamp(fixture.marker)
 
         model.projects.hide()
@@ -177,10 +201,95 @@ final class FixtureWindowStateTests: XCTestCase {
         XCTAssertNotEqual(hidden, open)
         model.projects.present(board: board, detail: nil, live: .snapshot(live), route: .projects)
         writer.update(model: model)
+        XCTAssertFalse(try fixture.read().ready, "the paint before the hide does not count")
+        paintCards(model)
+        writer.update(model: model)
         XCTAssertEqual(try fixture.read(), Marker(visible: true, route: "projects", ready: true))
         XCTAssertNotEqual(try Stamp(fixture.marker), hidden)
         XCTAssertNotEqual(try Stamp(fixture.marker), open)
         XCTAssertEqual(clock.starts, 0)
+    }
+
+    @MainActor
+    func testOnlyThePaintOfTheHeldSnapshotMakesTheMarkerReady() throws {
+        let fixture = try ProfileFixture()
+        defer { fixture.remove() }
+        let clock = ProjectTestClock()
+        // A change of route refreshes the selected screen; these answers fail quietly.
+        let model = MnemonicAppModel(profile: fixture.profile, controller: AppProjectController(
+            clock: clock, ask: { .failed(.off) }, board: { .failure(.off) }, detail: { _ in .failure(.off) }))
+        model.activateWindow = {}
+        defer { model.projects.hide() }
+        let writer = FixtureWindowState(profile: fixture.profile)
+        let (board, live) = try readyValues()
+        announce(model, board: board, detail: nil, live: .snapshot(live), route: .projects)
+        let held = model.heldBoardPaint
+
+        paintCards(model, BoardPaint(board: nil, live: model.projects.live.shown))
+        writer.update(model: model)
+        XCTAssertFalse(try fixture.read().ready, "a paint of another board does not count")
+        paintCards(model)
+        writer.update(model: model)
+        XCTAssertTrue(try fixture.read().ready)
+
+        // A new snapshot takes it back until its own paint, and so does the
+        // return of the earlier one (A, B, then A again).
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(live)) as? [String: Any])
+        object["v"] = ((object["v"] as? Int) ?? 0) + 1
+        let next = try JSONDecoder().decode(LiveSnapshot.self, from: JSONSerialization.data(withJSONObject: object))
+        announce(model, board: board, detail: nil, live: .snapshot(next), route: .projects)
+        writer.update(model: model)
+        XCTAssertFalse(try fixture.read().ready)
+        paintCards(model, held)
+        writer.update(model: model)
+        XCTAssertFalse(try fixture.read().ready, "the paint of the earlier snapshot is not this one")
+        announce(model, board: board, detail: nil, live: .snapshot(live), route: .projects)
+        writer.update(model: model)
+        XCTAssertFalse(try fixture.read().ready, "A again after B needs its own paint")
+        paintCards(model)
+        writer.update(model: model)
+        XCTAssertTrue(try fixture.read().ready)
+
+        // A failure takes it back, and an equal answer after it needs a new paint.
+        announce(model, board: board, detail: nil, live: .failed(.unreachable), route: .projects)
+        XCTAssertNil(model.boardPaint)
+        announce(model, board: board, detail: nil, live: .snapshot(live), route: .projects)
+        writer.update(model: model)
+        XCTAssertFalse(try fixture.read().ready)
+        let revision = model.boardPaintRevision
+        paintCards(model)
+        writer.update(model: model)
+        XCTAssertTrue(try fixture.read().ready)
+        let stamp = try Stamp(fixture.marker)
+        announce(model, board: board, detail: nil, live: .snapshot(live), route: .projects)
+        writer.update(model: model)
+        XCTAssertEqual(try Stamp(fixture.marker), stamp, "an equal answer keeps the proof and the marker")
+        XCTAssertEqual(model.boardPaintRevision, revision)
+
+        // Reports queued before the proof was taken back do not count after it,
+        // even for an equal answer; nor do those of A when A came back after B.
+        let early = model.boardPaintRevision
+        model.projects.hide()
+        announce(model, board: board, detail: nil, live: .snapshot(live), route: .projects)
+        paintCards(model, revision: early)
+        writer.update(model: model)
+        XCTAssertFalse(try fixture.read().ready, "a report from before the hide")
+        let pending = model.boardPaintRevision
+        announce(model, board: board, detail: nil, live: .snapshot(next), route: .projects)
+        announce(model, board: board, detail: nil, live: .snapshot(live), route: .projects)
+        paintCards(model, held, revision: pending)
+        writer.update(model: model)
+        XCTAssertFalse(try fixture.read().ready, "a report of A drawn before B came")
+        paintCards(model)
+        writer.update(model: model)
+        XCTAssertTrue(try fixture.read().ready)
+
+        // A change of route takes it back, and a paint reported on another route is not counted.
+        model.route = .timeline(TimelineDay.today(now: Date(timeIntervalSince1970: 1_790_766_000)))
+        XCTAssertNil(model.boardPaint)
+        XCTAssertGreaterThan(model.boardPaintRevision, revision)
+        paintCards(model)
+        XCTAssertNil(model.boardPaint)
     }
 
     @MainActor

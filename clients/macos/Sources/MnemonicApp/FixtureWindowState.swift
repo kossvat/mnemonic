@@ -23,9 +23,11 @@ final class FixtureWindowState {
             !row.sessions.isEmpty && row.plan?.done == 1 && row.plan?.total == 2
         }.map(\.key))
         let visible = model.visible
+        // Ready only once both cards were painted for the board and snapshot held now.
+        let drawn = model.boardPaint == model.heldBoardPaint && expected.isSubset(of: model.boardPaintedCards)
         let ready = visible && model.route == .projects && model.projects.failure == nil
             && model.projects.live.failure == nil
-            && expected.isSubset(of: board) && expected.isSubset(of: live)
+            && expected.isSubset(of: board) && expected.isSubset(of: live) && drawn
         var value: [String: Any] = ["visible": visible, "route": model.route.rawValue, "ready": ready]
         if model.route == .graph {
             let snapshot = model.curatedGraph.snapshot

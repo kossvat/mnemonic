@@ -4,11 +4,22 @@ use anyhow::Result;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 
+// Kept for library callers of project_decisions.
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct Decision {
     pub id: String,
     pub title: String,
     pub at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HistoryEntry {
+    pub id: String,
+    pub title: String,
+    pub at: i64,
+    /// "decision", or "correction" for a memory the store types as feedback.
+    pub kind: &'static str,
 }
 
 impl Storage {
@@ -46,7 +57,35 @@ impl Storage {
         Ok(result)
     }
 
+    /// The latest decisions of a project, newest first, as the library has
+    /// always served them.
+    // Kept for library callers; the routes serve project_history.
+    #[allow(dead_code)]
     pub fn project_decisions(&self, project: i64, limit: usize) -> Result<Vec<Decision>> {
+        Ok(self
+            .project_memories(project, limit, &["decision"])?
+            .into_iter()
+            .map(|entry| Decision {
+                id: entry.id,
+                title: entry.title,
+                at: entry.at,
+            })
+            .collect())
+    }
+
+    /// The latest decisions and corrections of a project, newest first.
+    /// Rows the redaction policy refuses still take part of the limit.
+    pub fn project_history(&self, project: i64, limit: usize) -> Result<Vec<HistoryEntry>> {
+        self.project_memories(project, limit, &["decision", "feedback"])
+    }
+
+    /// Memories of the given fixed types linked to a project's group.
+    fn project_memories(
+        &self,
+        project: i64,
+        limit: usize,
+        types: &[&'static str],
+    ) -> Result<Vec<HistoryEntry>> {
         let canonical = self.project_canonical(project)?;
         let group = self
             .project_groups()?
@@ -61,19 +100,29 @@ impl Storage {
             .lock()
             .map_err(|_| anyhow::anyhow!("store lock unavailable"))?;
         let mut query = conn.prepare(&format!(
-            "SELECT DISTINCT m.id, m.title, unixepoch(m.timestamp) FROM memories m
+            "SELECT DISTINCT m.id, m.title, unixepoch(m.timestamp), m.memory_type FROM memories m
              JOIN memory_entities me ON me.memory_id = m.id
              JOIN projects p ON p.entity_id = me.entity_id
-             WHERE p.id IN ({placeholders}) AND m.memory_type = 'decision'
+             WHERE p.id IN ({placeholders}) AND m.memory_type IN ({kinds})
              ORDER BY m.timestamp DESC, m.id LIMIT {}",
-            limit.min(20)
+            limit.min(20),
+            kinds = types
+                .iter()
+                .map(|kind| format!("'{kind}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ))?;
         let rows = query
             .query_map(rusqlite::params_from_iter(group), |row| {
-                Ok(Decision {
+                Ok(HistoryEntry {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     at: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    kind: if row.get::<_, String>(3)? == "feedback" {
+                        "correction"
+                    } else {
+                        "decision"
+                    },
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

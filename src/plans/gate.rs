@@ -27,11 +27,22 @@ pub enum GateStatus {
     None,
 }
 
+/// What the newest receipt says of its own run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateResult {
+    Passed,
+    Failed,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct Gate {
     pub status: GateStatus,
     pub at: Option<i64>,
     pub failed_runs: usize,
+    /// Kept from the parse that gave the status. None when the newest
+    /// receipt says nothing of its result or cannot be read.
+    pub result: Option<GateResult>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -195,6 +206,17 @@ impl Reader {
             status,
             at: newest.at,
             failed_runs,
+            result: newest
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.passed)
+                .map(|passed| {
+                    if passed {
+                        GateResult::Passed
+                    } else {
+                        GateResult::Failed
+                    }
+                }),
         }
     }
 

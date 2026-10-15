@@ -1,5 +1,5 @@
 use super::*;
-use crate::plans::Config;
+use crate::plans::{Config, Stage};
 
 fn write(root: &Path, relative: &str, text: &str) {
     let path = root.join(relative);
@@ -59,6 +59,18 @@ fn plan_archive_keeps_latest_closed_unit_with_its_original_gate_id() {
         "an archive does not imply a passed gate"
     );
     assert!(plan.units.iter().all(|unit| unit.id != "z-older"));
+    let archived = chrono::NaiveDate::from_ymd_opt(2002, 1, 2)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp();
+    assert_eq!((closed.closed, closed.closed_at), (true, Some(archived)));
+    let active = plan.units.iter().find(|unit| unit.id == "active").unwrap();
+    assert_eq!((active.closed, active.closed_at), (false, None));
+    let served = serde_json::to_value(closed).unwrap();
+    assert_eq!(served["closed"], true);
+    assert_eq!(served["closed_at"], archived);
     let parsed = reader.parsed_count();
     assert_eq!(reader.read(&source, now), plan);
     assert_eq!(reader.parsed_count(), parsed);
@@ -85,6 +97,15 @@ fn plan_archive_and_completed_active_units_share_one_closed_slot() {
             .any(|unit| unit.id == "just-completed" && unit.stage == Stage::Done)
     );
     assert!(plan.units.iter().all(|unit| unit.id != "earlier"));
+    // Done with no closure time recorded: closed, and no time under the name.
+    let done = plan
+        .units
+        .iter()
+        .find(|unit| unit.id == "just-completed")
+        .unwrap();
+    assert_eq!((done.closed, done.closed_at), (true, None));
+    let served = serde_json::to_value(done).unwrap();
+    assert_eq!(served["closed_at"], serde_json::Value::Null);
 }
 
 #[test]

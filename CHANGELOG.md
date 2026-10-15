@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Named synthetic states for the app frame, Projects, project page and Timeline, with expected presentation values and input digests. `--render-fixture-states OUTPUT [--only ID]` draws the states in both appearances with an isolated profile and no daemon.
+- Local server public interface additions: `GET /api/projects` adds row fields `gate_at`, `plan_provider`, `plan_counts`, `plan_weekly_count`, `open_units`, `waiting_on_owner` and `last_closed {title, closed_at}`, plus the board's `week {owner_s, agent_s, owner_estimate}`. `GET /api/projects/{key}` adds `sessions[].last_record_at`, `history[].kind` (`"decision"` or `"correction"`, with feedback now included as corrections), `plan.units[].gate.result` (`"passed"`, `"failed"` or null), `plan.units[].closed` and `plan.units[].closed_at`. Missing plans retain null board values; a closure time is null unless recorded. Board agent totals sum daily unions including unassigned work, and owner totals include unattributed time before archived rows are removed; unavailable owner activity stays null. History keeps its latest ten entry limit before filtering. The shared Swift models distinguish missing fields from recorded null values.
+- Library additions: `Storage::project_history` and `storage::project_view::HistoryEntry` serve decisions and corrections with their kind; `Storage::project_decisions` and `Decision` are unchanged and still serve decisions only. `plans::Unit` serialises `closed` and `closed_at`, and `plans::gate::Gate` gains `result`.
 - Project Graph presents the curated graph with plan previews, bounded supporting-memory pages, stale and outside-registry shelves, and explicit archive recovery. Graph and Memory Map share a static canvas with indexed picking, pan and zoom, without simulation or a graph timer.
 - A registry-led curated graph API with stable stored slots, bounded overview and expansion payloads, memory evidence pages, reversible entity archives, and matching Swift response models. Project detail includes top terms without turning concepts into graph nodes.
 - A local-day Timeline shows project and agent segments alongside estimated owner activity, follows clock-change day lengths, and supports explicit attribution corrections with Undo. Historical days use a bounded memory cache; today shares the existing visible refresh.
@@ -25,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mnemonic backup <dir>`: whole, checked copies of the memory and activity stores, taken while the daemon runs. It migrates nothing and never writes over a copy.
 
 ### Changed
+- The app frame groups working routes under NOW, MEMORY and EXPLORE, with a daemon state footer and its own light and dark palette. Projects shows today's and seven day totals, live cards, plan and gate details, one priority footer fact, activity ordered rows and a fold for stale projects. Funnel plans show counts without percentages.
+- The project page puts the focused unit above units, tasks and gate, followed by live sessions and Recent work in three columns. It keeps closed units separate, folds finished tasks, shows last record ages and groups returned decisions and corrections by day without claiming that an unrepresented day has no history.
+- Timeline combines a two hour focus with a whole day strip and day view, keeps block widths true to time, fits labels inside blocks and folds crowded projects after three rows. Owner activity, agent totals and exact recorded intervals remain available; selecting a clipped block preserves its original correction bounds.
 - The copyright holder and the author of the crate are Picksa Corp.
 - The compiler is pinned in `rust-toolchain.toml` (1.94.1) and both workflows build with it, so a newer linter cannot fail a build that passed locally. Raising the version is a deliberate change.
 - The store's schema generation is 3: the rows of time by project mean something new, so an earlier binary refuses a store this version opened. The upgrade takes a one-time snapshot first; the way back is a backup taken before it.
@@ -55,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reflection consolidates a cluster with a member stored before the policy (its text is redacted in the consolidated memory) instead of skipping it. A cluster with a member filed under an id the policy refuses is left as it is.
 
 ### Fixed
+- The Projects fixture window reports ready only after both synthetic cards have completed painting for the held board and live snapshot. A hide or snapshot change revokes readiness; the probe adds no timer or persistent observer.
+- The bundle script requires an icon source and conversion tools, stages the app bundle under `build/Mnemonic.noindex`, removes its old staged copy and refuses links in its output paths. Failed icon conversion removes the unfinished bundle, and the release executable keeps its digest bound routing receipt.
 - The crate builds without warnings under the linter of the current stable toolchain: the replay sorts its chosen segments by key.
 - A stretch of work is extended even when another process writes to the store at the same moment: the reader waits for the lock, where it used to give up and lose the times of that poll.
 - Writes of the project registry and of attribution corrections wait for another process that is writing the store, where they could fail with a locked database and lose the change.
@@ -72,10 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Update crossbeam-epoch, h2, rustls-webpki, anyhow and git2 to remove known RustSec vulnerability/unsoundness findings. The local Git watcher no longer pulls Git SSH/HTTPS transport defaults; maintenance warnings in embedding/index dependencies remain documented.
 
 ### Documentation
+- The macOS guide lists every app and widget render option. Demo fixtures include the new board and detail values and a Timeline day; the screenshot guide maps renderer outputs to documentation pictures and names older pictures with no demo renderer. App tests compare the documented options with the parser and launch each against isolated synthetic inputs.
 - The agent runbook for a workspace of projects was read cold by two agents and rewritten where they stopped: what the daemon watches and where to start it, the place and the shape of the Claude Code hook, upgrading an existing install, a worked task file, the stages of a plan, and a login job. The README's hook timeout is in seconds, its server path is absolute, and it no longer calls neural embeddings optional.
 - An agent runbook for one person with several projects, `docs/agent-setup-workspace.md`: how the folders must be laid out, how a session is tied to a project, where plans and gate receipts are read from, and an acceptance test. The README shows the current widget and the Projects board, rendered by the clients from the invented data in `docs/screenshots/demo`. The example configuration names the `[projects]` section.
 - The shared graph renderer remains machine-blocked: release maximum frame time is 8.073 ms against the 8 ms budget, with P95 7.551 ms. The benchmark workload and assertions are unchanged.
-- The project screens remain provisional: their look and the time they take to open are not final.
+- The open app budget run, MN-42-11, remains pending with the owner at the unlocked Mac. Project graph and Memory actions on the project page, whole project totals and registry memory counts remain outside this stage.
 - The README says what the code does: 12 MCP tools, the HTTP API off by default and what needs it, the embedding model at about 1 GB on disk, and what the generated context leaves out, marks, and does not touch.
 - Secret redaction: what is recognized and what is not, which names are refused, that every writer has to be upgraded, that what was stored before is not rewritten, and how to scan a copy of a store.
 - Clarify entry export/import limitations and the trusted-launcher boundary for shared context; document Mac-to-hub architecture and remaining ingestion/sink/recovery work.
@@ -90,7 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dynamic importance scoring (frequency x 0.3 + recency x 0.3 + signal x 0.4)
 - Claude Code memory file output (auto-detected project paths)
 - Obsidian vault output (optional, disabled by default)
-- Whisper context injection -- generates CONTEXT.md with prioritized memories
+- Whisper context injection generates CONTEXT.md with prioritized memories
 - MCP server with 6 tools (memory_search, memory_save, memory_recent, memory_similar, memory_context, memory_status)
 - CLI with 14 commands (start, stop, status, query, similar, recent, save, context, export, import, cleanup, doctor, mcp, init)
 - Export/import for backup and migration

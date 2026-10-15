@@ -18,24 +18,44 @@ struct Day {
     confidence: Option<String>,
 }
 
-fn days(state: &AppState, count: u32) -> anyhow::Result<BTreeMap<i64, Vec<Day>>> {
+/// The days of each project, and the totals of all of them that the same
+/// walk computes for the board's week.
+struct Days {
+    by_project: BTreeMap<i64, Vec<Day>>,
+    /// The sum of the daily unions of agent work, the segments of no known
+    /// project included.
+    agent_s: i64,
+    /// The attributed rows and the unattributed seconds of each day, taken
+    /// before rekeying drops the rows of archived projects. None when a day
+    /// has no read of the owner's activity.
+    owner_s: Option<f64>,
+}
+
+fn days(state: &AppState, count: u32) -> anyhow::Result<Days> {
     let today = Local::now().date_naive();
     let keys = state.storage.attribution_keys()?;
     let mut result = BTreeMap::<i64, Vec<Day>>::new();
+    let (mut agent_s, mut owner_s) = (0, Some(0.0));
     for offset in (0..count).rev() {
         let day = today - Duration::days(i64::from(offset));
         let Some((from, to)) = crate::activity::local_day_bounds_utc(day) else {
+            owner_s = None;
             continue;
         };
-        let (agents, _) = state.storage.agent_time(from, to.min(Utc::now()))?;
-        let owner = state
+        let (agents, union) = state.storage.agent_time(from, to.min(Utc::now()))?;
+        agent_s += union;
+        let read = state
             .activity
             .as_ref()
-            .map(|activity| {
-                activity
-                    .project_attribution_for_day(day)
-                    .and_then(|(rows, _)| state.storage.rekeyed_day(rows))
-            })
+            .map(|activity| activity.project_attribution_for_day(day))
+            .transpose()?;
+        owner_s = owner_s
+            .zip(read.as_ref())
+            .map(|(sum, (rows, unattributed))| {
+                sum + rows.iter().map(|row| row.1).sum::<f64>() + unattributed
+            });
+        let owner = read
+            .map(|(rows, _)| state.storage.rekeyed_day(rows))
             .transpose()?;
         for (id, key) in &keys {
             let row = owner
@@ -49,7 +69,11 @@ fn days(state: &AppState, count: u32) -> anyhow::Result<BTreeMap<i64, Vec<Day>>>
             });
         }
     }
-    Ok(result)
+    Ok(Days {
+        by_project: result,
+        agent_s,
+        owner_s,
+    })
 }
 
 fn plans(state: &AppState) -> BTreeMap<i64, crate::plans::Plan> {
@@ -83,6 +107,10 @@ fn board_value(state: &AppState) -> anyhow::Result<serde_json::Value> {
     let rows = state.storage.projects()?;
     let activity = state.storage.project_last_activity()?;
     let days = days(state, 7)?;
+    let week = serde_json::json!({
+        "owner_s": days.owner_s, "agent_s": days.agent_s, "owner_estimate": true,
+    });
+    let days = days.by_project;
     let canonical_keys: BTreeMap<i64, String> =
         rows.iter().map(|row| (row.id, row.slug.clone())).collect();
     let projects: Vec<_> = rows.into_iter().filter_map(|row| {
@@ -95,6 +123,8 @@ fn board_value(state: &AppState) -> anyhow::Result<serde_json::Value> {
         let plan = plans.get(&canonical);
         let unit = plan.and_then(|plan| plan.units.iter().find(|unit| unit.current_task.is_some())
             .or_else(|| plan.units.first()));
+        let last_closed = plan.and_then(|plan| plan.units.iter().find(|unit| unit.closed))
+            .map(|unit| serde_json::json!({ "title": unit.title, "closed_at": unit.closed_at }));
         Some(serde_json::json!({
             "key": row.slug,
             "name": crate::redaction::state::prepare_capped(&row.name, 160).value,
@@ -102,10 +132,19 @@ fn board_value(state: &AppState) -> anyhow::Result<serde_json::Value> {
             "last_active_at": activity.get(&canonical),
             "week": { "owner_s": owner_s, "agent_s": agent_s, "owner_estimate": true },
             "plan": unit.map(|unit| unit.line()),
+            "gate_at": unit.and_then(|unit| unit.gate.at),
+            "plan_provider": unit.map(|unit| unit.provider),
+            "plan_counts": unit.map(|unit| &unit.counts),
+            "plan_weekly_count": unit.map(|unit| unit.weekly_count),
+            // A plan with no unit is the reader's "no plan file": nothing to count.
+            "open_units": plan.filter(|plan| !plan.units.is_empty())
+                .map(|plan| plan.units.iter().filter(|unit| !unit.closed).count()),
+            "waiting_on_owner": unit.map(|unit| &unit.waiting_on_owner),
+            "last_closed": last_closed,
             "plan_message": plan.and_then(|plan| plan.message).or_else(|| plan.is_none().then_some("no plan file")),
         }))
     }).collect();
-    Ok(serde_json::json!({ "projects": projects }))
+    Ok(serde_json::json!({ "projects": projects, "week": week }))
 }
 
 pub(super) async fn detail(
@@ -150,6 +189,7 @@ fn detail_value(state: &AppState, key: &str) -> Result<serde_json::Value, AppErr
             Some(serde_json::json!({
                 "agent": session.agent, "driver": if session.program { "program" } else { "owner" },
                 "state": session.state_at(Utc::now()), "started_at": session.started_at.timestamp(),
+                "last_record_at": session.last_at.timestamp(),
             }))
         })
         .collect();
@@ -157,8 +197,8 @@ fn detail_value(state: &AppState, key: &str) -> Result<serde_json::Value, AppErr
         "key": row.slug, "name": crate::redaction::state::prepare_capped(&row.name, 160).value,
         "state": row.state.as_str(), "plan": plan, "sessions": sessions,
         "gate_detail": state.live.as_ref().map(|live| live.project_plan_details(canonical)),
-        "time": time.remove(&canonical).unwrap_or_default(), "owner_estimate": true,
-        "history": state.storage.project_decisions(canonical, 10)?,
+        "time": time.by_project.remove(&canonical).unwrap_or_default(), "owner_estimate": true,
+        "history": state.storage.project_history(canonical, 10)?,
         "top_terms": state.storage.curated_graph_top_terms(canonical, 12)?.into_iter()
             .map(|term| serde_json::json!({"name": term.name, "memory_count": term.memory_count}))
             .collect::<Vec<_>>(),
@@ -168,3 +208,15 @@ fn detail_value(state: &AppState, key: &str) -> Result<serde_json::Value, AppErr
 #[cfg(test)]
 #[path = "http_project_read_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "http_project_board_tests.rs"]
+mod board_tests;
+
+#[cfg(test)]
+#[path = "http_project_cost_tests.rs"]
+mod cost_tests;
+
+#[cfg(test)]
+#[path = "http_project_history_tests.rs"]
+mod history_tests;

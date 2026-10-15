@@ -8,216 +8,171 @@ struct ProjectsView: View {
     let loading: Bool
     let now: Date
     let onOpen: (String) -> Void
+    /// Raised by the app whenever it takes back the proof of a paint.
+    var paintRevision: UInt64 = 0
+    /// Told which card was painted for which board and snapshot; the app's
+    /// window passes it, renders do not.
+    var onDraw: ((BoardPaint, String, UInt64) -> Void)? = nil
     @State private var showStale = false
+    @Environment(\.calendar) private var calendar
+    @Environment(\.mnemonicWindowVisible) private var windowVisible
 
     var body: some View {
-        let groups = ProjectPresentation.groups(board: board, live: live, now: now)
+        let display = ProjectPresentation.board(board: board, live: live, failure: failure,
+                                                loading: loading, now: now, calendar: calendar)
         ScrollView {
-            VStack(alignment: .leading, spacing: Theme.Space.xl) {
-                header
-                if let failure {
-                    let message = ProjectPresentation.failure(failure)
-                    Card {
-                        ProjectNotice(icon: "exclamationmark.circle", title: message.title, detail: message.detail)
+            VStack(alignment: .leading, spacing: 12) {
+                header(display)
+                if let failure = display.failure {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(verbatim: failure.title).font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(AppPalette.textPrimary)
+                        Text(verbatim: failure.detail).font(.system(size: 12))
+                            .foregroundStyle(AppPalette.textSecondary)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(14)
+                    .background(AppPalette.raised, in: RoundedRectangle(cornerRadius: 15))
                 }
-                liveSection(groups)
-                if board != nil {
-                    if !groups.recent.isEmpty {
-                        VStack(alignment: .leading, spacing: Theme.Space.md) {
-                            sectionHeading("Other projects", count: groups.recent.count)
-                            LazyVStack(spacing: Theme.Space.sm) {
-                                ForEach(groups.recent) { row in projectRow(row) }
-                            }
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Text("Active now").font(.system(size: 14, weight: .semibold))
+                        if let active = display.active {
+                            Text(verbatim: active.projects).font(.system(size: 14))
+                                .foregroundStyle(AppPalette.textSecondary)
+                            Spacer(minLength: 12)
+                            Text(verbatim: active.sessions).font(.system(size: 11))
+                                .foregroundStyle(display.cut ? AppPalette.textSecondary : AppPalette.agents)
                         }
                     }
-                    if !groups.stale.isEmpty {
-                        DisclosureGroup(isExpanded: $showStale) {
-                            LazyVStack(spacing: Theme.Space.sm) {
-                                ForEach(groups.stale) { row in projectRow(row) }
-                            }
-                            .padding(.top, Theme.Space.md)
-                        } label: {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(verbatim: "Older activity · \(groups.stale.count)")
-                                    .font(Theme.Font.bodyMedium).foregroundStyle(Theme.Palette.textPrimary)
-                                Text(verbatim: "Last recorded activity was more than 30 days ago.")
-                                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted)
-                            }
-                        }
-                        .tint(Theme.Palette.textMuted)
-                    }
-                    if groups.live.isEmpty && groups.recent.isEmpty && groups.stale.isEmpty {
-                        Card {
-                            ProjectNotice(
-                                icon: "folder", title: groups.excluded > 0 ? "No active projects" : "No projects registered",
-                                detail: groups.excluded > 0
-                                    ? "All registered projects are archived, ignored, or merged."
-                                    : "Projects will appear here after the workspace registry discovers them.")
-                        }
-                    }
-                    if groups.excluded > 0 {
-                        HStack(spacing: Theme.Space.sm) {
-                            Image(systemName: "archivebox")
-                            Text(verbatim: "Outside this board: \(groups.excludedLabel)")
-                        }
-                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted)
-                    }
-                } else if !loading && failure == nil {
-                    Card {
-                        ProjectNotice(icon: "folder.badge.questionmark", title: "Project registry unavailable",
-                                      detail: "The board has not received the registered projects yet.")
-                    }
-                }
-            }
-            .padding(Theme.Space.xxl)
-            .frame(maxWidth: 1_120, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-        }
-        .background(Theme.Palette.bgPrimary)
-    }
-
-    private var header: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                Text(verbatim: "Projects").font(Theme.Font.display).tracking(Theme.Font.trackingDisplay)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                Text(verbatim: "Live work, plans, and the time behind them.")
-                    .font(Theme.Font.body).foregroundStyle(Theme.Palette.textMuted)
-            }
-            Spacer()
-            if loading { ProgressView().controlSize(.small).padding(.top, 8) }
-        }
-    }
-
-    private func sectionHeading(_ title: String, count: Int) -> some View {
-        HStack(spacing: Theme.Space.sm) {
-            Text(verbatim: title).font(Theme.Font.title).foregroundStyle(Theme.Palette.textPrimary)
-            Text(verbatim: String(count)).font(Theme.Font.captionBold)
-                .foregroundStyle(Theme.Palette.textMuted)
-                .padding(.horizontal, 7).padding(.vertical, 3)
-                .background(Capsule().fill(Theme.Palette.bgTint))
-        }
-    }
-
-    private func liveSection(_ groups: ProjectPresentation.Groups) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
-            sectionHeading("Live now", count: groups.live.count)
-            if !groups.live.isEmpty {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 300), spacing: Theme.Space.md)],
-                          alignment: .leading, spacing: Theme.Space.md) {
-                    ForEach(groups.live) { card in liveCard(card) }
-                }
-            } else {
-                Card {
-                    ProjectNotice(icon: live == nil ? "antenna.radiowaves.left.and.right" : "moon",
-                                  title: live == nil ? "Live activity unavailable" : "No projects live right now",
-                                  detail: live == nil
-                                    ? (loading ? "Asking the daemon for its current sessions." : "No live snapshot has been received.")
-                                    : "A project appears here when an agent session is in progress.")
-                }
-            }
-            if let live, live.moreProjects > 0 {
-                Text(verbatim: "\(live.moreProjects) additional live projects are outside this snapshot.")
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted)
-            }
-            if let live {
-                let unknown = live.unknown.sessions.count + live.unknown.moreSessions
-                if unknown > 0 {
-                    Label {
-                        Text(verbatim: "\(unknown) \(unknown == 1 ? "session has" : "sessions have") no recorded project.")
-                    } icon: { Image(systemName: "questionmark.folder") }
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted)
-                }
-            }
-        }
-    }
-
-    private func liveCard(_ card: ProjectPresentation.LiveCard) -> some View {
-        let project = card.project
-        return Button { onOpen(project.key) } label: {
-            Card(padding: Theme.Space.xl) {
-                VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                    HStack(alignment: .top) {
-                        Text(verbatim: project.name).font(Theme.Font.heading)
-                            .foregroundStyle(Theme.Palette.textPrimary).lineLimit(2)
-                        Spacer(minLength: 6)
-                        ProjectPill(text: ProjectPresentation.title(project.state.rawValue),
-                                    color: project.state == .running ? Theme.Palette.decision : Theme.Palette.textMuted)
-                    }
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(Array(project.sessions.prefix(3).enumerated()), id: \.offset) { _, session in
-                            HStack {
-                                ProjectSessionLabel(session: session)
-                                if session.driver == "program" {
-                                    Text(verbatim: "Automated").font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted)
+                    .frame(height: 24)
+                    if let message = display.liveMessage { notice(message) }
+                    if !display.cards.isEmpty {
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 300), spacing: 12)], spacing: 12) {
+                            ForEach(display.cards) { card in
+                                BoardProjectCard(card: card, onOpen: onOpen).overlay(alignment: .bottomTrailing) {
+                                    if let onDraw {
+                                        BoardPaintProbe(paint: BoardPaint(board: board, live: live), card: card.id,
+                                                        revision: paintRevision, visible: windowVisible, onDraw: onDraw)
+                                            .frame(width: 1, height: 1).allowsHitTesting(false).accessibilityHidden(true)
+                                    }
                                 }
                             }
                         }
-                        let extra = max(0, project.sessions.count - 3) + project.moreSessions
-                        if extra > 0 {
-                            Text(verbatim: "+\(extra) more sessions").font(Theme.Font.caption)
-                                .foregroundStyle(Theme.Palette.textMuted)
-                        }
                     }
-                    HStack(spacing: Theme.Space.xl) {
-                        metric("You · last 7 days", value: ProjectPresentation.ownerTime(
-                            card.row?.week.ownerSeconds, estimated: card.row?.week.ownerEstimate ?? false))
-                        metric("Agents · last 7 days", value: ProjectPresentation.duration(
-                            card.row.map { row in Double(row.week.agentSeconds) }))
-                    }
-                    Divider().overlay(Theme.Palette.border)
+                    ForEach(display.notices, id: \.self) { message in notice(message) }
+                }
+                if display.inactiveLine != nil || display.rowsMessage != nil {
                     VStack(alignment: .leading, spacing: 6) {
-                        let plan = project.plan ?? card.row?.plan
-                        Text(verbatim: ProjectPresentation.planLine(plan, message: card.row?.planMessage))
-                            .font(Theme.Font.bodyMedium).foregroundStyle(Theme.Palette.textPrimary).lineLimit(2)
-                        Text(verbatim: plan?.task ?? "No current task recorded")
-                            .font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted).lineLimit(2)
+                        HStack {
+                            Text("Not active now").font(.system(size: 14, weight: .semibold))
+                            Spacer(minLength: 12)
+                            if let line = display.inactiveLine {
+                                Text(verbatim: line).font(.system(size: 11)).foregroundStyle(AppPalette.textSecondary)
+                            }
+                        }
+                        .frame(height: 24)
+                        if let message = display.rowsMessage { notice(message) }
+                        rows(display.rows)
                     }
-                    HStack {
-                        Text(verbatim: "Open project").font(Theme.Font.captionBold)
-                        Spacer()
-                        Image(systemName: "arrow.up.right").font(.system(size: 10, weight: .semibold))
-                    }
-                    .foregroundStyle(Theme.Palette.accent)
                 }
-                .frame(maxWidth: .infinity, minHeight: 225, alignment: .topLeading)
+                if let line = display.staleLine {
+                    VStack(spacing: 6) {
+                        Button { showStale.toggle() } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: showStale ? "chevron.down" : "chevron.right")
+                                    .font(.system(size: 12)).frame(width: 15)
+                                Text(verbatim: line)
+                                Spacer(minLength: 12)
+                                if let detail = display.staleDetail { Text(verbatim: detail).font(.system(size: 11)) }
+                            }
+                            .font(.system(size: 12)).foregroundStyle(AppPalette.textSecondary)
+                            .padding(.horizontal, 12).frame(height: 44)
+                            .background(AppPalette.folded, in: RoundedRectangle(cornerRadius: 9))
+                            .overlay(RoundedRectangle(cornerRadius: 9).stroke(AppPalette.cardBorder, lineWidth: 1))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityValue(showStale ? "Expanded" : "Collapsed")
+                        if showStale { rows(display.stale) }
+                    }
+                }
+                if let excluded = display.excluded { notice("Outside this board: " + excluded) }
             }
-            .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.md))
+            .foregroundStyle(AppPalette.textPrimary)
+            .padding(.horizontal, 28).padding(.vertical, 24)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .buttonStyle(.plain)
-        .accessibilityHint(Text(verbatim: "Open this project's plan, gate, time, and history"))
+        .background(AppPalette.window)
     }
 
-    private func metric(_ title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(verbatim: title).font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted)
-            Text(verbatim: value).font(Theme.Font.title).monospacedDigit().foregroundStyle(Theme.Palette.textPrimary)
+    private func header(_ display: ProjectPresentation.Board) -> some View {
+        HStack(alignment: .center, spacing: 20) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Projects").font(.system(size: 28, weight: .semibold)).tracking(-0.9)
+                Text(verbatim: display.dateNote).font(.system(size: 11))
+                    .foregroundStyle(AppPalette.textSecondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            HStack(spacing: 24) {
+                if let today = display.today { headerTimes("TODAY", today) }
+                if let week = display.week { headerTimes("LAST 7 DAYS", week) }
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(minHeight: 44)
     }
 
-    private func projectRow(_ row: ProjectBoardRow) -> some View {
-        Button { onOpen(row.key) } label: {
-            Card {
-                HStack(spacing: Theme.Space.lg) {
-                    Image(systemName: "folder").foregroundStyle(Theme.Palette.entityProject).frame(width: 22)
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(verbatim: row.name).font(Theme.Font.bodyMedium).foregroundStyle(Theme.Palette.textPrimary)
-                        Text(verbatim: ProjectPresentation.planLine(row.plan, message: row.planMessage))
-                            .font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted).lineLimit(1)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    VStack(alignment: .trailing, spacing: 5) {
-                        Text(verbatim: ProjectPresentation.activity(row.lastActiveAt, now: now))
-                        Text(verbatim: "Last 7 days · You \(ProjectPresentation.ownerTime(row.week.ownerSeconds, estimated: row.week.ownerEstimate)) · Agents \(ProjectPresentation.duration(Double(row.week.agentSeconds)))")
-                    }
-                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted).monospacedDigit()
-                    Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(Theme.Palette.textSubtle)
-                }
+    private func headerTimes(_ label: String, _ values: ProjectPresentation.BoardTimes) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(verbatim: label).font(.system(size: 10)).foregroundStyle(AppPalette.textSecondary)
+            HStack(spacing: 9) {
+                Text(verbatim: "You " + values.owner).foregroundStyle(AppPalette.owner)
+                Text(verbatim: "Agents " + values.agents).foregroundStyle(AppPalette.agents)
             }
-            .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.md))
+            .font(.system(size: 12)).monospacedDigit().fixedSize()
         }
-        .buttonStyle(.plain)
+    }
+
+    private func notice(_ text: String) -> some View {
+        Text(verbatim: text).font(.system(size: 12)).foregroundStyle(AppPalette.textSecondary)
+            .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+            .background(AppPalette.folded, in: RoundedRectangle(cornerRadius: 9))
+    }
+
+    private func rows(_ values: [ProjectPresentation.BoardRow]) -> some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 440), spacing: 20)], spacing: 2) {
+            ForEach(values) { row in
+                Button { onOpen(row.id) } label: {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(verbatim: row.name).font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(AppPalette.textPrimary)
+                            Text(verbatim: row.plan).font(.system(size: 10))
+                                .foregroundStyle(AppPalette.textSecondary)
+                            if let funnel = row.funnel {
+                                if let counts = funnel.counts {
+                                    Text(verbatim: counts).font(.system(size: 10))
+                                        .foregroundStyle(AppPalette.textSecondary).help(counts)
+                                }
+                                if let weekly = funnel.weeklyCount {
+                                    Text(verbatim: weekly).font(.system(size: 10)).foregroundStyle(AppPalette.agents)
+                                }
+                            }
+                        }
+                        .lineLimit(1).truncationMode(.tail).frame(maxWidth: .infinity, alignment: .leading)
+                        VStack(alignment: .trailing, spacing: 1) {
+                            Text(verbatim: row.activity).font(.system(size: 10)).foregroundStyle(AppPalette.textSecondary)
+                            Text(verbatim: "You " + row.week.owner).font(.system(size: 11)).foregroundStyle(AppPalette.owner)
+                            Text(verbatim: "Agents " + row.week.agents + " · 7 days")
+                                .font(.system(size: 10)).foregroundStyle(AppPalette.agents)
+                        }
+                        .monospacedDigit().fixedSize()
+                    }
+                    .padding(.horizontal, 12).frame(minHeight: 60)
+                    .overlay(alignment: .bottom) { Rectangle().fill(AppPalette.border).frame(height: 1) }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
     }
 }

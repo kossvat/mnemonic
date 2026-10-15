@@ -11,6 +11,7 @@ final class MnemonicAppModel: ObservableObject {
             isLoading = false
             syncTimelineContext()
             graphDrawnSnapshot = nil
+            revokeBoardPaint()
             syncGraphContext()
             projects.select(route)
         }
@@ -35,6 +36,14 @@ final class MnemonicAppModel: ObservableObject {
     let timeline: AppTimelineController
     let curatedGraph: AppGraphController
     private(set) var graphDrawnSnapshot: CuratedGraphSnapshot?
+    /// The board and snapshot the cards were painted for, and the cards whose
+    /// paint was committed in a shown window.
+    private(set) var boardPaint: BoardPaint?
+    private(set) var boardPaintedCards: Set<String> = []
+    /// Raised whenever the proof of a paint is taken back, so the cards paint again.
+    @Published private(set) var boardPaintRevision: UInt64 = 0
+    /// What the board held, and whether it could be shown, at the last announcement.
+    private var announcedBoard: (paint: BoardPaint, shown: Bool)?
     private let preferences: ProfilePreferences
     private let readMemories: @MainActor () async throws -> MemoryListResponse
     private let readEntities: @MainActor () async throws -> EntitiesResponse
@@ -93,6 +102,16 @@ final class MnemonicAppModel: ObservableObject {
             return false
         }
         projects.onPresentationChange = { [weak self] in
+            // A change of what the board holds, a failure or a hide takes the proof
+            // back, whether or not a paint was reported yet; an equal answer keeps it.
+            if let self {
+                let now = (paint: self.heldBoardPaint, shown: self.projects.visible
+                    && self.projects.failure == nil && self.projects.live.failure == nil)
+                if self.announcedBoard.map({ last in last.paint != now.paint || last.shown != now.shown }) ?? true {
+                    self.announcedBoard = now
+                    self.revokeBoardPaint()
+                }
+            }
             self?.syncTimelineContext()
             self?.syncGraphContext()
             self?.onWindowStateChange?()
@@ -144,10 +163,34 @@ final class MnemonicAppModel: ObservableObject {
         onWindowStateChange?()
     }
 
+    var heldBoardPaint: BoardPaint { BoardPaint(board: projects.board, live: projects.live.shown) }
+
+    /// A card reports that its paint was committed. Only a paint of the board and
+    /// snapshot held now, drawn for the current revision of the proof, counts, so
+    /// a report queued before the proof was taken back is not.
+    func boardDidDraw(_ paint: BoardPaint, card: String, revision: UInt64) {
+        guard visible, route == .projects, !endpointChanging, projects.failure == nil,
+              projects.live.failure == nil, revision == boardPaintRevision, paint == heldBoardPaint else { return }
+        if boardPaint != paint {
+            boardPaint = paint
+            boardPaintedCards = []
+        }
+        guard boardPaintedCards.insert(card).inserted else { return }
+        onWindowStateChange?()
+    }
+
+    /// Takes back the proof of a paint and asks the cards to paint again.
+    private func revokeBoardPaint() {
+        boardPaint = nil
+        boardPaintedCards = []
+        boardPaintRevision &+= 1
+    }
+
     func window(_ id: ObjectIdentifier, visible shown: Bool) {
         if shown { visibleWindows.insert(id) } else { visibleWindows.remove(id) }
         if visibleWindows.isEmpty {
             graphDrawnSnapshot = nil
+            revokeBoardPaint()
             epoch &+= 1
             isLoading = false
             syncTimelineContext(visible: false)
@@ -192,6 +235,7 @@ final class MnemonicAppModel: ObservableObject {
             syncGraphContext(visible: false)
             curatedGraph.resetEndpoint()
             graphDrawnSnapshot = nil
+            revokeBoardPaint()
             projects.hide()
             try await localAPI.setEndpoint(chosen.absoluteString)
             try await client.setEndpoint(chosen.absoluteString)
@@ -200,6 +244,8 @@ final class MnemonicAppModel: ObservableObject {
             status = nil
             setupMessage = nil
             endpointChanging = false
+            // Paints refused while the endpoint changed are asked for again.
+            revokeBoardPaint()
             if !visibleWindows.isEmpty {
                 syncTimelineContext(visible: true)
                 syncGraphContext(visible: true)

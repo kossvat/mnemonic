@@ -41,6 +41,16 @@ final class ProjectTests: XCTestCase {
         XCTAssertEqual(project.plan?.stage, "building")
         XCTAssertEqual(project.plan?.task, "Review the result")
         XCTAssertNil(project.planMessage)
+        XCTAssertEqual(project.gateAt, .null)
+        XCTAssertEqual(project.planProvider, .value(.checkbox))
+        XCTAssertEqual(project.planCounts, .value(["done": 1, "planned": 1]))
+        XCTAssertEqual(project.planWeeklyCount, .value(0))
+        XCTAssertEqual(project.openUnits, .value(1))
+        XCTAssertEqual(project.waitingOnOwner, .value([]))
+        XCTAssertEqual(project.lastClosed, .null)
+        XCTAssertEqual(board.week.value?.ownerSeconds, 1500.0)
+        XCTAssertEqual(board.week.value?.agentSeconds, 3600)
+        XCTAssertEqual(board.week.value?.ownerEstimate, true)
         try roundTrip(board)
     }
 
@@ -66,10 +76,14 @@ final class ProjectTests: XCTestCase {
         XCTAssertEqual(unit.gate.status, .none)
         XCTAssertNil(unit.gate.at)
         XCTAssertEqual(unit.gate.failedRuns, 0)
+        XCTAssertEqual(unit.gate.result, .null)
+        XCTAssertEqual(unit.closed, .value(false))
+        XCTAssertEqual(unit.closedAt, .null)
         XCTAssertNil(unit.error)
         XCTAssertEqual(detail.sessions.map(\.agent), ["claude"])
         XCTAssertEqual(detail.sessions[0].state, .running)
         XCTAssertEqual(detail.sessions[0].startedAt, 1_790_762_400)
+        XCTAssertEqual(detail.sessions[0].lastRecordAt, .value(1_790_762_460))
         let gateDetail = try XCTUnwrap(detail.gateDetail?["plan"])
         XCTAssertNil(gateDetail.dirty)
         XCTAssertNil(gateDetail.commitsSince)
@@ -81,21 +95,30 @@ final class ProjectTests: XCTestCase {
         XCTAssertEqual(detail.history.map(\.id), ["decision-a"])
         XCTAssertEqual(detail.history[0].title, "Use the local cache")
         XCTAssertEqual(detail.history[0].at, 1_790_762_460)
+        XCTAssertEqual(detail.history[0].kind, .value("decision"))
         XCTAssertEqual(detail.topTerms, [])
         try roundTrip(detail)
     }
 
-    func testDetailKeepsMissingNullAndPopulatedTopTermsCompatible() throws {
+    func testDetailKeepsMissingNullEmptyAndPopulatedTopTermsCompatible() throws {
         var value = try object("project-detail")
         value.removeValue(forKey: "top_terms")
         let missing = try decode(ProjectDetail.self, value)
         XCTAssertNil(missing.topTerms)
+        XCTAssertEqual(missing.topTermsPresence, .missing)
         try roundTrip(missing)
 
         value["top_terms"] = NSNull()
-        let unknown = try decode(ProjectDetail.self, value)
-        XCTAssertNil(unknown.topTerms)
-        try roundTrip(unknown)
+        let absent = try decode(ProjectDetail.self, value)
+        XCTAssertNil(absent.topTerms)
+        XCTAssertEqual(absent.topTermsPresence, .null)
+        try roundTrip(absent)
+
+        value["top_terms"] = [] as [Any]
+        let empty = try decode(ProjectDetail.self, value)
+        XCTAssertEqual(empty.topTerms, [])
+        XCTAssertEqual(empty.topTermsPresence, .value([]))
+        try roundTrip(empty)
 
         value["top_terms"] = [
             ["name": "index", "memory_count": 7],
@@ -103,6 +126,7 @@ final class ProjectTests: XCTestCase {
         ]
         let populated = try decode(ProjectDetail.self, value)
         let terms = try XCTUnwrap(populated.topTerms)
+        XCTAssertEqual(populated.topTermsPresence, .value(terms))
         XCTAssertEqual(terms.map(\.name), ["index", "sync"])
         XCTAssertEqual(terms.map(\.memoryCount), [7, 3])
         try roundTrip(populated)
@@ -175,6 +199,111 @@ final class ProjectTests: XCTestCase {
         unit["total"] = 2
         let counted = try decode(ProjectPlanUnit.self, unit)
         XCTAssertNil(counted.completionFraction)
+    }
+
+    /// A daemon of an earlier build omits the additions of design 9.1: each
+    /// decodes as missing, not as a recorded null, and is not written back.
+    func testAdditionsFromAnEarlierDaemonAreMissingAndStayOmitted() throws {
+        var board = try object("project-board")
+        var rows = try XCTUnwrap(board["projects"] as? [[String: Any]])
+        for key in ["gate_at", "plan_provider", "plan_counts", "plan_weekly_count",
+                    "open_units", "waiting_on_owner", "last_closed"] {
+            rows[0].removeValue(forKey: key)
+        }
+        board["projects"] = rows
+        board.removeValue(forKey: "week")
+        let earlierBoard = try decode(ProjectBoard.self, board)
+        XCTAssertEqual(earlierBoard.week, .missing)
+        try roundTrip(earlierBoard)
+        let row = try XCTUnwrap(earlierBoard.projects.first)
+        XCTAssertEqual(row.gateAt, .missing)
+        XCTAssertEqual(row.planProvider, .missing)
+        XCTAssertEqual(row.planCounts, .missing)
+        XCTAssertEqual(row.planWeeklyCount, .missing)
+        XCTAssertEqual(row.openUnits, .missing)
+        XCTAssertEqual(row.waitingOnOwner, .missing)
+        XCTAssertEqual(row.lastClosed, .missing)
+        let rowKeys = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(row)) as? [String: Any])
+        XCTAssertEqual(Set(rowKeys.keys), Set(rows[0].keys).subtracting(["merged_into", "plan_message"]))
+
+        var detail = try object("project-detail")
+        var plan = try XCTUnwrap(detail["plan"] as? [String: Any])
+        var units = try XCTUnwrap(plan["units"] as? [[String: Any]])
+        units[0].removeValue(forKey: "closed")
+        units[0].removeValue(forKey: "closed_at")
+        var gate = try XCTUnwrap(units[0]["gate"] as? [String: Any])
+        gate.removeValue(forKey: "result")
+        units[0]["gate"] = gate
+        plan["units"] = units
+        detail["plan"] = plan
+        var sessions = try XCTUnwrap(detail["sessions"] as? [[String: Any]])
+        sessions[0].removeValue(forKey: "last_record_at")
+        detail["sessions"] = sessions
+        var history = try XCTUnwrap(detail["history"] as? [[String: Any]])
+        history[0].removeValue(forKey: "kind")
+        detail["history"] = history
+        let earlier = try decode(ProjectDetail.self, detail)
+        let unit = try XCTUnwrap(earlier.plan.units.first)
+        XCTAssertEqual(unit.closed, .missing)
+        XCTAssertEqual(unit.closedAt, .missing)
+        XCTAssertEqual(unit.gate.result, .missing)
+        XCTAssertEqual(earlier.sessions[0].lastRecordAt, .missing)
+        XCTAssertEqual(earlier.history[0].kind, .missing)
+        try roundTrip(earlier)
+        let written = String(decoding: try JSONEncoder().encode(earlier), as: UTF8.self)
+        for key in ["\"closed\"", "closed_at", "\"result\"", "last_record_at", "\"kind\""] {
+            XCTAssertFalse(written.contains(key), key)
+        }
+    }
+
+    func testAdditionsCarryTheValuesTheDaemonHolds() throws {
+        var board = try object("project-board")
+        var rows = try XCTUnwrap(board["projects"] as? [[String: Any]])
+        rows[0]["gate_at"] = 1_700_000_000
+        rows[0]["plan_provider"] = "funnel"
+        rows[0]["plan_counts"] = ["contacted": 4, "replied": 1]
+        rows[0]["plan_weekly_count"] = 3
+        rows[0]["open_units"] = 2
+        rows[0]["waiting_on_owner"] = ["Confirm the copy"]
+        rows[0]["last_closed"] = ["title": "Shipped", "closed_at": 1_767_312_000]
+        board["projects"] = rows
+        board["week"] = ["owner_s": NSNull(), "agent_s": 6000, "owner_estimate": true]
+        let served = try decode(ProjectBoard.self, board)
+        XCTAssertEqual(served.week.value?.ownerSeconds, nil)
+        XCTAssertEqual(served.week.value?.agentSeconds, 6000)
+        try roundTrip(served)
+        let row = try XCTUnwrap(served.projects.first)
+        XCTAssertEqual(row.openUnits, .value(2))
+        XCTAssertEqual(row.waitingOnOwner, .value(["Confirm the copy"]))
+        XCTAssertEqual(row.lastClosed.value?.title, "Shipped")
+        XCTAssertEqual(row.lastClosed.value?.closedAt, .value(1_767_312_000))
+        let undated = try decode(ProjectLastClosed.self, ["title": "Done in place", "closed_at": NSNull()])
+        XCTAssertEqual(undated.closedAt, .null)
+        try roundTrip(undated)
+        let written = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(undated)) as? [String: Any])
+        XCTAssertTrue(written["closed_at"] is NSNull)
+        let earlier = try decode(ProjectLastClosed.self, ["title": "Done in place"])
+        XCTAssertEqual(earlier.closedAt, .missing)
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(earlier), as: UTF8.self).contains("closed_at"))
+        XCTAssertEqual(row.gateAt, .value(1_700_000_000))
+        XCTAssertEqual(row.planProvider, .value(.funnel))
+        XCTAssertEqual(row.planCounts, .value(["contacted": 4, "replied": 1]))
+        XCTAssertEqual(row.planWeeklyCount, .value(3))
+        try roundTrip(row)
+
+        let plan = try XCTUnwrap(try object("project-detail")["plan"] as? [String: Any])
+        var unit = try XCTUnwrap((plan["units"] as? [[String: Any]])?.first)
+        unit["closed"] = true
+        unit["closed_at"] = 1_009_929_600
+        unit["gate"] = ["status": "stale", "at": 1_700_000_000, "failed_runs": 0, "result": "passed"]
+        let closed = try decode(ProjectPlanUnit.self, unit)
+        XCTAssertEqual(closed.closed, .value(true))
+        XCTAssertEqual(closed.closedAt, .value(1_009_929_600))
+        XCTAssertEqual(closed.gate.status, .stale)
+        XCTAssertEqual(closed.gate.result, .value(.passed))
+        try roundTrip(closed)
+        unit["gate"] = ["status": "failed", "at": NSNull(), "failed_runs": 1, "result": "failed"]
+        XCTAssertEqual(try decode(ProjectPlanUnit.self, unit).gate.result, .value(.failed))
     }
 
     func testGateDetailsKeepFalseAndZeroDistinctFromUnknown() throws {

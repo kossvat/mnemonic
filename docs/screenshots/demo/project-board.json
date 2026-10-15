@@ -1,8 +1,9 @@
 {
+ "week": {"owner_s": 45000.0, "agent_s": 68400, "owner_estimate": true},
  "projects": [
   {
    "key": "acme-api",
-   "name": "acme-api",
+   "name": "Harbor",
    "state": "active",
    "merged_into": null,
    "last_active_at": 1790765940,
@@ -12,18 +13,25 @@
     "owner_estimate": true
    },
    "plan": {
-    "unit": "auth-hardening",
+    "unit": "Harbor contract",
     "done": 3,
     "total": 7,
     "stage": "building",
-    "task": "Rotate refresh tokens on every use",
-    "gate": "passed"
+    "task": "Review the result",
+    "gate": "stale"
    },
+   "gate_at": 1790762400,
+   "plan_provider": "checkbox",
+   "plan_counts": {"done": 3, "in_progress": 1, "planned": 3},
+   "plan_weekly_count": 0,
+   "open_units": 1,
+   "waiting_on_owner": ["Review the result"],
+   "last_closed": {"title": "Harbor draft", "closed_at": 1790679600},
    "plan_message": null
   },
   {
    "key": "web-client",
-   "name": "web-client",
+   "name": "Beacon",
    "state": "active",
    "merged_into": null,
    "last_active_at": 1790765700,
@@ -33,11 +41,18 @@
     "owner_estimate": true
    },
    "plan": null,
+   "gate_at": null,
+   "plan_provider": null,
+   "plan_counts": null,
+   "plan_weekly_count": null,
+   "open_units": null,
+   "waiting_on_owner": null,
+   "last_closed": null,
    "plan_message": null
   },
   {
    "key": "mobile-app",
-   "name": "mobile-app",
+   "name": "Ledger",
    "state": "active",
    "merged_into": null,
    "last_active_at": 1790593200,
@@ -47,18 +62,25 @@
     "owner_estimate": true
    },
    "plan": {
-    "unit": "offline-sync",
+    "unit": "Ledger delivery",
     "done": 2,
     "total": 9,
     "stage": "planned",
-    "task": "Queue writes while the device is offline",
+    "task": "Check the local cache",
     "gate": "none"
    },
+   "gate_at": null,
+   "plan_provider": "checkbox",
+   "plan_counts": {"done": 2, "planned": 7},
+   "plan_weekly_count": 0,
+   "open_units": 1,
+   "waiting_on_owner": [],
+   "last_closed": null,
    "plan_message": null
   },
   {
    "key": "infra-scripts",
-   "name": "infra-scripts",
+   "name": "Atlas",
    "state": "active",
    "merged_into": null,
    "last_active_at": 1790334000,
@@ -67,12 +89,22 @@
     "agent_s": 3000,
     "owner_estimate": true
    },
-   "plan": null,
+   "plan": {
+    "unit": "Atlas review", "done": 0, "total": 0, "stage": "building",
+    "task": null, "gate": "none"
+   },
+   "gate_at": null,
+   "plan_provider": "funnel",
+   "plan_counts": {"contacted": 6, "waiting_on_owner": 2},
+   "plan_weekly_count": 3,
+   "open_units": 1,
+   "waiting_on_owner": ["Check the result"],
+   "last_closed": null,
    "plan_message": null
   },
   {
    "key": "design-system",
-   "name": "design-system",
+   "name": "Juniper",
    "state": "active",
    "merged_into": null,
    "last_active_at": 1789815600,
@@ -82,6 +114,13 @@
     "owner_estimate": true
    },
    "plan": null,
+   "gate_at": null,
+   "plan_provider": null,
+   "plan_counts": null,
+   "plan_weekly_count": null,
+   "open_units": null,
+   "waiting_on_owner": null,
+   "last_closed": null,
    "plan_message": null
   }
  ]

@@ -20,8 +20,8 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            Sidebar(selection: $model.route)
-                .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 260)
+            Sidebar(selection: $model.route, daemonFailure: live.failure ?? (model.isOnline ? nil : .unreachable))
+                .navigationSplitViewColumnWidth(min: 200, ideal: 208, max: 260)
         } detail: {
             ZStack(alignment: .bottom) {
                 detailView
@@ -30,39 +30,30 @@ struct ContentView: View {
                 if let message = model.toastMessage {
                     HStack(spacing: Theme.Space.sm) {
                         Circle()
-                            .fill(Theme.Palette.accent)
+                            .fill(AppPalette.agents)
                             .frame(width: 6, height: 6)
                         Text(message)
                             .font(Theme.Font.bodyMedium)
-                            .foregroundStyle(Theme.Palette.textPrimary)
+                            .foregroundStyle(AppPalette.textPrimary)
                     }
                     .padding(.horizontal, Theme.Space.lg)
                     .padding(.vertical, Theme.Space.sm)
                     .background(
                         RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
-                            .fill(Theme.Palette.bgSurface)
+                            .fill(AppPalette.raised)
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
-                            .stroke(Theme.Palette.border, lineWidth: Theme.Stroke.thin)
+                            .stroke(AppPalette.border, lineWidth: Theme.Stroke.thin)
                     )
                     .padding(.bottom, Theme.Space.xl)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
+            .background(AppPalette.window)
         }
+        .background(AppPalette.window)
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(model.isOnline ? Theme.Palette.decision : Theme.Palette.feedback)
-                        .frame(width: 6, height: 6)
-                    Text(model.isOnline ? "Daemon online" : "Offline")
-                        .font(Theme.Font.caption)
-                        .foregroundStyle(Theme.Palette.textMuted)
-                }
-            }
-
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     Task { await model.refreshAll() }
@@ -98,14 +89,20 @@ struct ContentView: View {
         case .projects:
             ProjectsView(board: projects.board, live: live.shown,
                          failure: projects.failure ?? live.failure, loading: projects.loading,
-                         now: projects.now, onOpen: { key in model.route = .project(key) })
+                         now: projects.now, onOpen: { key in model.route = .project(key) },
+                         paintRevision: model.boardPaintRevision,
+                         onDraw: { paint, card, revision in
+                             if windowVisible { model.boardDidDraw(paint, card: card, revision: revision) }
+                         })
         case .timeline(let day):
             TimelinePage(
                 day: day, snapshot: timeline.snapshot, loading: timeline.loading,
                 failure: timeline.failure, mutationInFlight: timeline.mutationInFlight,
                 message: timeline.message, canUndo: timeline.canUndo,
+                now: projects.now, live: live.failure == nil ? live.shown : nil,
+                registry: projects.board,
                 onDay: { chosen in model.route = .timeline(chosen) },
-                onToday: { model.route = .timeline(TimelineDay.today()) },
+                onToday: selectToday,
                 onRefresh: { Task { await model.refreshAll() } },
                 onApply: { correction, chosen in await timeline.apply(correction, for: chosen) },
                 onUndo: { await timeline.undo() })
@@ -117,7 +114,7 @@ struct ContentView: View {
         case .project(let key):
             ProjectPage(key: key, detail: projects.detail,
                         failure: projects.failure, loading: projects.loading,
-                        liveFailure: live.failure, onBack: { model.route = .projects })
+                        liveFailure: live.failure, now: projects.now, onBack: { model.route = .projects })
         default:
             if let message = model.setupMessage, model.status == nil {
                 SetupView(message: message, model: model)
@@ -133,5 +130,9 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    func selectToday() {
+        model.route = .timeline(TimelineDay.today(now: projects.currentDate))
     }
 }

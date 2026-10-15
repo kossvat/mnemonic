@@ -145,6 +145,27 @@ final class AppTimelineIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testTodayUsesTheInjectedClockAfterMidnightWithoutARefreshOrLiveSession() throws {
+        let fixture = try TimelineIntegrationFixture(today: "2026-06-18")
+        defer { fixture.close() }
+        let controller = fixture.model.projects
+        controller.present(board: nil, detail: nil, live: .snapshot(try FixtureWire.live()), route: fixture.model.route)
+        let content = ContentView(model: fixture.model)
+        let shownAt = controller.now
+        XCTAssertEqual(fixture.model.route, .timeline("2026-06-17"))
+        XCTAssertTrue(controller.visible)
+        XCTAssertTrue(controller.live.shown?.projects.isEmpty == true)
+        XCTAssertEqual(fixture.clock.starts, 0)
+        fixture.clock.now = try XCTUnwrap(TimelineDay.date("2026-06-19")).addingTimeInterval(1)
+        XCTAssertEqual(controller.now, shownAt)
+        XCTAssertEqual(TimelineDay.today(now: controller.now), "2026-06-18")
+        content.selectToday()
+        XCTAssertEqual(fixture.model.route, .timeline("2026-06-19"))
+        XCTAssertEqual(controller.route, .timeline("2026-06-19"))
+        XCTAssertEqual(controller.now, shownAt)
+    }
+
+    @MainActor
     func testMidnightSignalDuringHeldTodayReadFinishesThePastDayBeforeCaching() async throws {
         let fixture = try TimelineIntegrationFixture()
         defer { fixture.close() }

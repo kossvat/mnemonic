@@ -58,12 +58,16 @@ public struct LiveSession: Codable, Equatable, Sendable {
     /// Seconds since the epoch. The snapshot carries the start, never a
     /// duration: the client counts the elapsed time itself.
     public let startedAt: Int
+    /// The time of the session's last record. Only the detail route of a
+    /// project serves it; `.missing` elsewhere and from an earlier daemon.
+    public let lastRecordAt: FieldPresence<Int>
 
     public var started: Date { Date(timeIntervalSince1970: TimeInterval(startedAt)) }
 
     enum CodingKeys: String, CodingKey {
         case agent, driver, state
         case startedAt = "started_at"
+        case lastRecordAt = "last_record_at"
     }
 }
 

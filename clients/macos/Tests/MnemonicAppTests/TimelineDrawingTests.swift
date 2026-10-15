@@ -74,7 +74,7 @@ final class TimelineDrawingTests: XCTestCase {
         XCTAssertEqual(blocks["point-b"]?.length, 0)
         XCTAssertTrue(blocks["point-a"]?.point == true)
         XCTAssertNotEqual(blocks["long"]?.mark, blocks["overlap"]?.mark)
-        XCTAssertEqual(blocks["long"]?.label, "Claude")
+        XCTAssertEqual(blocks["long"]?.label, "Claude Code")
         XCTAssertEqual(blocks["overlap"]?.label, "Codex")
         XCTAssertEqual(drawing.lanes.map(\.id), reversed.lanes.map(\.id))
         XCTAssertEqual(drawing.lanes.flatMap(\.blocks).map(\.track), reversed.lanes.flatMap(\.blocks).map(\.track))

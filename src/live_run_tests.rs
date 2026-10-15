@@ -44,6 +44,27 @@ impl Calendar for Utc0 {
     }
 }
 
+/// Days turn twelve hours before and after the instant it holds.
+struct NoonAt(DateTime<Utc>);
+
+impl NoonAt {
+    /// How far a day of this calendar starts after midnight of UTC.
+    fn shift(&self) -> Duration {
+        self.0 - self.0.date_naive().and_hms_opt(12, 0, 0).unwrap().and_utc()
+    }
+}
+
+impl Calendar for NoonAt {
+    fn bounds(&self, day: NaiveDate) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let start = day.and_hms_opt(0, 0, 0)?.and_utc() + self.shift();
+        Some((start, start + Duration::days(1)))
+    }
+
+    fn date_of(&self, at: DateTime<Utc>) -> NaiveDate {
+        (at - self.shift()).date_naive()
+    }
+}
+
 fn session(project: Option<i64>, kind: Kind, last_at: DateTime<Utc>) -> Session {
     Session {
         agent: "claude".into(),
@@ -122,20 +143,23 @@ fn live_run_a_new_count_of_memories_is_signalled_without_a_request() {
 fn live_run_the_timer_waits_for_the_next_change_and_for_nothing_else() {
     let (live, _, _) = live("boot-a");
     let now = Utc::now();
+    // Midnight ends a wait too. Here the days turn twelve hours from now,
+    // so the waits below end at the change they are for at any hour.
+    let noon = NoonAt(now);
     let clock = Instant::now() + std::time::Duration::from_secs(60);
     // Nothing is live and no day is open: the timer is not armed.
-    assert_eq!(live.wait(&Utc0, now, clock), None);
+    assert_eq!(live.wait(&noon, now, clock), None);
 
     // A running session becomes quiet two minutes after its last record.
     live.observed("s", session(None, Kind::Call, now));
-    let wait = live.wait(&Utc0, now, clock).unwrap();
+    let wait = live.wait(&noon, now, clock).unwrap();
     assert_eq!(wait.as_secs(), crate::live::RUNNING_SECS as u64);
     // Its time comes: the state moves, and the next wait is to its end.
     let later = now + Duration::seconds(crate::live::RUNNING_SECS);
     let before = live.state.version();
-    live.pass(&Utc0, later, clock);
+    live.pass(&noon, later, clock);
     assert_eq!(live.state.version(), before + 1);
-    let wait = live.wait(&Utc0, later, clock).unwrap();
+    let wait = live.wait(&noon, later, clock).unwrap();
     assert_eq!(
         wait.as_secs() as i64,
         crate::live::QUIET_SECS - crate::live::RUNNING_SECS
@@ -143,8 +167,8 @@ fn live_run_the_timer_waits_for_the_next_change_and_for_nothing_else() {
     // It leaves; with no day open the timer is at rest again.
     let gone = now + Duration::seconds(crate::live::QUIET_SECS);
     let clock = clock + std::time::Duration::from_secs(1680);
-    live.pass(&Utc0, gone, clock);
-    assert_eq!(live.wait(&Utc0, gone, clock), None);
+    live.pass(&noon, gone, clock);
+    assert_eq!(live.wait(&noon, gone, clock), None);
 
     // A day whose hours are open keeps the timer armed until midnight,
     // when they start again without a record.

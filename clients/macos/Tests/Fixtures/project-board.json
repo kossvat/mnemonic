@@ -19,7 +19,19 @@
         "task": "Review the result",
         "gate": "none"
       },
-      "plan_message": null
+      "plan_message": null,
+      "gate_at": null,
+      "plan_provider": "checkbox",
+      "plan_counts": { "done": 1, "planned": 1 },
+      "plan_weekly_count": 0,
+      "open_units": 1,
+      "waiting_on_owner": [],
+      "last_closed": null
     }
-  ]
+  ],
+  "week": {
+    "owner_s": 1500.0,
+    "agent_s": 3600,
+    "owner_estimate": true
+  }
 }

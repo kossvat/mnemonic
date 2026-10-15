@@ -35,14 +35,15 @@ enum AppFixturePreview {
             let list = ProjectsView(board: listBoard, live: live, failure: nil, loading: false, now: now, onOpen: { _ in })
             try write(list, route: .projects, scheme: scheme, height: 1_100,
                       to: output.appendingPathComponent("projects-list-\(suffix).png"))
-            let project = ProjectPage(key: detail.key, detail: detail, failure: nil, loading: false, onBack: {})
+            let project = ProjectPage(key: detail.key, detail: detail, failure: nil, loading: false, now: now, onBack: {})
             try write(project, route: .project(detail.key), scheme: scheme, height: 1_700,
                       to: output.appendingPathComponent("project-\(suffix).png"))
             let empty = ProjectsView(board: emptyBoard, live: emptyLive, failure: nil, loading: false, now: now, onOpen: { _ in })
             try write(empty, route: .projects, scheme: scheme, height: 900,
                       to: output.appendingPathComponent("projects-empty-\(suffix).png"))
-            let missing = ProjectPage(key: "demoapp", detail: nil, failure: .unreachable, loading: false, onBack: {})
+            let missing = ProjectPage(key: "demoapp", detail: nil, failure: .unreachable, loading: false, now: now, onBack: {})
             try write(missing, route: .project("demoapp"), scheme: scheme, height: 1_500,
+                      daemonFailure: .unreachable,
                       to: output.appendingPathComponent("project-unavailable-\(suffix).png"))
         }
     }
@@ -98,20 +99,30 @@ enum AppFixturePreview {
 
     @MainActor
     static func write<V: View>(
-        _ view: V, route: AppRoute, scheme: ColorScheme, height: CGFloat, to url: URL
+        _ view: V, route: AppRoute, scheme: ColorScheme, height: CGFloat,
+        width: CGFloat = 1_180, scale: CGFloat? = nil,
+        daemonFailure: LocalAPIFailure? = nil, to url: URL
     ) throws {
         let frame = HStack(spacing: 0) {
-            Sidebar(selection: .constant(route)).frame(width: 220)
-            Divider()
+            Sidebar(selection: .constant(route), daemonFailure: daemonFailure).frame(width: 208)
             view.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .environment(\.colorScheme, scheme)
-        .background(Theme.Palette.bgPrimary)
+        .background(AppPalette.window)
         let host = NSHostingView(rootView: frame)
         host.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
-        host.frame = NSRect(x: 0, y: 0, width: 1_180, height: height)
+        host.frame = NSRect(x: 0, y: 0, width: width, height: height)
         host.layoutSubtreeIfNeeded()
-        guard let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { throw Failure.image }
+        let representation: NSBitmapImageRep?
+        if let scale {
+            representation = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(width * scale),
+                pixelsHigh: Int(height * scale), bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+            representation?.size = host.bounds.size
+        } else {
+            representation = host.bitmapImageRepForCachingDisplay(in: host.bounds)
+        }
+        guard let bitmap = representation else { throw Failure.image }
         host.cacheDisplay(in: host.bounds, to: bitmap)
         guard let png = bitmap.representation(using: .png, properties: [:]) else { throw Failure.image }
         try png.write(to: url)

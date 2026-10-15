@@ -27,6 +27,8 @@ final class AppProjectController: ObservableObject {
     private var invalidatedVisits: Set<UInt64> = []
     private var subscriber: LiveSignalSubscriber?
 
+    var currentDate: Date { date() }
+
     init(
         clock: LiveClock, date: @escaping @MainActor () -> Date = Date.init,
         ask: @escaping @Sendable () async -> LiveAnswer,

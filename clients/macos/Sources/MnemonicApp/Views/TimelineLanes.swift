@@ -6,161 +6,167 @@ struct TimelineLanes: View {
     let snapshot: ProjectTimeline
     let calendar: Calendar
     let onSelect: (TimelineSelection) -> Void
-    private let labelWidth: CGFloat = 150
-
-    private var height: CGFloat {
-        52 + drawing.lanes.reduce(0) { total, lane in total + CGFloat(lane.tracks) * 48 + 20 } + 96
-    }
+    @State private var expanded: Set<String> = []
 
     var body: some View {
-        GeometryReader { geometry in
-            let axisWidth = max(660, geometry.size.width - labelWidth - 20)
-            ScrollView(.horizontal) {
-                VStack(alignment: .leading, spacing: 0) {
-                    axis(width: axisWidth)
-                    ForEach(drawing.lanes) { lane in
-                        HStack(alignment: .top, spacing: 0) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(verbatim: lane.name).font(Theme.Font.bodyMedium).lineLimit(2)
-                                Text(verbatim: "\(lane.blocks.count) recorded segments")
-                                    .font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted)
-                            }
-                            .frame(width: labelWidth, alignment: .leading).padding(.top, 8)
-                            ZStack(alignment: .topLeading) {
-                                grid(width: axisWidth)
-                                ForEach(lane.blocks) { block in agent(block, width: axisWidth) }
-                            }
-                            .frame(width: axisWidth, height: CGFloat(lane.tracks) * 48 + 12)
+        let lanes = drawing.presentedLanes(expanded: expanded)
+        ScrollView(.horizontal) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: TimelineDrawing.labelGap) {
+                    Text("PROJECT / AGENT").font(.system(size: 10)).tracking(0.6)
+                        .frame(width: TimelineDrawing.labelWidth, alignment: .leading)
+                    TimelineAxis(drawing: drawing)
+                }
+                .foregroundStyle(AppPalette.textSecondary).frame(height: 32)
+                owner
+                ForEach(lanes) { presented in
+                    let lane = presented.lane
+                    HStack(spacing: TimelineDrawing.labelGap) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(verbatim: lane.name).font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(AppPalette.textPrimary)
+                            if !lane.agents.isEmpty { Text(verbatim: lane.agents).font(.system(size: 10)) }
+                            if lane.count > 0 { Text(verbatim: TimelineDrawing.segmentCount(lane.count)).font(.system(size: 10)) }
                         }
-                        .padding(.bottom, 8)
+                        .lineLimit(1).truncationMode(.tail).foregroundStyle(AppPalette.textSecondary)
+                        .frame(width: TimelineDrawing.labelWidth, alignment: .leading)
+                        .help(lane.name + "\n" + lane.agents)
+                        VStack(spacing: 0) {
+                            if let message = lane.emptyMessage {
+                                ownerNotice(message).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                            } else {
+                                ForEach(presented.rows.indices, id: \.self) { index in agentRow(presented.rows[index]) }
+                            }
+                            if let label = presented.toggleLabel {
+                                Button {
+                                    if expanded.contains(lane.id) { expanded.remove(lane.id) }
+                                    else { expanded.insert(lane.id) }
+                                } label: {
+                                    Text(verbatim: label).font(.system(size: 11))
+                                        .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
+                                }
+                                .buttonStyle(.plain).foregroundStyle(AppPalette.agents).padding(.leading, 8)
+                            }
+                        }
+                        .frame(width: drawing.width, height: presented.height)
+                        .background { TimelineGrid(drawing: drawing) }
                     }
-                    owner(width: axisWidth)
-                }
-                .frame(width: labelWidth + axisWidth + 20, alignment: .leading)
-            }
-        }
-        .frame(height: height)
-    }
-
-    private func axis(width: CGFloat) -> some View {
-        HStack(spacing: 0) {
-            Text(verbatim: "Local time").font(Theme.Font.captionBold)
-                .foregroundStyle(Theme.Palette.textMuted).frame(width: labelWidth, alignment: .leading)
-            ZStack(alignment: .topLeading) {
-                ForEach(drawing.ticks.filter(\.major)) { tick in
-                    Text(verbatim: tick.label).font(Theme.Font.mono).foregroundStyle(Theme.Palette.textMuted)
-                        .fixedSize().offset(x: CGFloat(tick.position) * width - (tick.position > 0.98 ? 40 : 0), y: 10)
+                    .overlay(alignment: .bottom) { Rectangle().fill(AppPalette.cardBorder).frame(height: 1) }
                 }
             }
-            .frame(width: width, height: 48, alignment: .topLeading)
+            .frame(width: TimelineDrawing.labelWidth + TimelineDrawing.labelGap + drawing.width)
+        }
+        .frame(height: TimelineDrawing.presentedHeight(lanes))
+    }
+
+    private func agentRow(_ blocks: [TimelineDrawing.Block]) -> some View {
+        ZStack(alignment: .topLeading) {
+            ForEach(blocks) { block in
+                TimelineAgentMark(mark: block.mark, geometry: block.geometry)
+                    .frame(width: block.geometry.paint.width, height: block.geometry.paintHeight)
+                    .offset(x: block.geometry.paint.x, y: block.geometry.paintY)
+                    .help(description(block))
+                    .accessibilityLabel(Text(verbatim: description(block)))
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityAction { onSelect(.agent(day: snapshot.day, block.segment)) }
+                if let caption = block.caption {
+                    Text(verbatim: caption.text).font(.system(size: 10)).fixedSize()
+                        .foregroundStyle(AppPalette.textPrimary)
+                        .frame(width: caption.rect.width, height: block.geometry.paintHeight)
+                        .clipped()
+                        .offset(x: caption.rect.x, y: block.geometry.paintY).accessibilityHidden(true)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+        .frame(width: drawing.width, height: TimelineDrawing.rowHeight, alignment: .topLeading)
+        .clipped()
+        .overlay {
+            Color.clear.contentShape(Rectangle())
+                .onTapGesture(coordinateSpace: .local) { location in
+                    if let segment = drawing.segment(at: location.x, in: blocks) {
+                        onSelect(.agent(day: snapshot.day, segment))
+                    }
+                }
+                .accessibilityHidden(true)
         }
     }
 
-    private func grid(width: CGFloat) -> some View {
+    private var owner: some View {
+        HStack(spacing: TimelineDrawing.labelGap) {
+            Text("You at the Mac").font(.system(size: 12, weight: .semibold)).foregroundStyle(AppPalette.owner)
+                .frame(width: TimelineDrawing.labelWidth, alignment: .leading)
+            ZStack(alignment: .leading) {
+                TimelineGrid(drawing: drawing)
+                ForEach(drawing.owner) { block in
+                    RoundedRectangle(cornerRadius: 3).fill(AppPalette.owner)
+                        .frame(width: block.geometry.paint.width, height: block.geometry.paintHeight)
+                        .overlay { TimelineContinuation(geometry: block.geometry, color: AppPalette.window) }
+                        .offset(x: block.geometry.paint.x)
+                        .accessibilityLabel(Text(verbatim: "Owner estimate, " + TimelineDrawing.time(block.range.from, calendar: calendar)
+                            + " to " + TimelineDrawing.time(block.range.to, calendar: calendar)))
+                        .accessibilityAddTraits(.isButton)
+                        .accessibilityAction { onSelect(.owner(day: snapshot.day, block.range)) }
+                }
+                if let notice = TimelineDrawing.ownerNotice(drawing, snapshot: snapshot) { ownerNotice(notice) }
+            }
+            .allowsHitTesting(false)
+            .frame(width: drawing.width, height: TimelineDrawing.ownerHeight).clipped()
+            .overlay {
+                Color.clear.contentShape(Rectangle())
+                    .onTapGesture(coordinateSpace: .local) { location in
+                        if let range = drawing.ownerRange(at: location.x) { onSelect(.owner(day: snapshot.day, range)) }
+                    }
+                    .accessibilityHidden(true)
+            }
+        }
+        .overlay(alignment: .bottom) { Rectangle().fill(AppPalette.cardBorder).frame(height: 1) }
+    }
+
+    private func ownerNotice(_ text: String) -> some View {
+        Text(verbatim: text).font(.system(size: 11)).foregroundStyle(AppPalette.textSecondary)
+            .lineLimit(1).truncationMode(.tail).padding(.leading, 8)
+    }
+
+    private func description(_ block: TimelineDrawing.Block) -> String {
+        block.label + ", " + TimelineDrawing.time(block.segment.from, calendar: calendar)
+            + (block.point ? ", point with no elapsed duration" : " to " + TimelineDrawing.time(block.segment.to, calendar: calendar))
+            + (block.geometry.continuesBefore ? ". Continues before this span" : "")
+            + (block.geometry.continuesAfter ? ". Continues after this span" : "") + ". Open details."
+    }
+}
+
+struct TimelineAxis: View {
+    let drawing: TimelineDrawing
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            ForEach(drawing.axisTicks) { tick in
+                let rect = TimelineDrawing.tickLabel(tick, width: drawing.width)
+                Text(verbatim: tick.label).font(.system(size: 10)).lineLimit(1)
+                    .frame(width: rect.width, alignment: tick.position == 0 ? .leading : tick.position == 1 ? .trailing : .center)
+                    .clipped()
+                    .offset(x: rect.x)
+            }
+        }
+        .frame(width: drawing.width, height: 14, alignment: .topLeading)
+        .foregroundStyle(AppPalette.textSecondary)
+    }
+}
+
+struct TimelineGrid: View {
+    let drawing: TimelineDrawing
+    var body: some View {
         GeometryReader { geometry in
             Path { path in
-                for tick in drawing.ticks {
-                    let x = CGFloat(tick.position) * width
+                for tick in drawing.ticks.filter(\.major) {
+                    let x = tick.position * drawing.width
                     path.move(to: CGPoint(x: x, y: 0))
                     path.addLine(to: CGPoint(x: x, y: geometry.size.height))
                 }
             }
-            .stroke(Theme.Palette.border.opacity(0.65), style: StrokeStyle(lineWidth: 0.5, dash: [3, 4]))
+            .stroke(AppPalette.timelineGrid, lineWidth: 1)
         }
         .accessibilityHidden(true)
-    }
-
-    private func agent(_ block: TimelineDrawing.Block, width: CGFloat) -> some View {
-        let length = CGFloat(block.length) * width
-        let title = block.label + (block.point ? " · point" : "")
-        return Button { onSelect(.agent(day: snapshot.day, block.segment)) } label: {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(verbatim: title).font(Theme.Font.captionBold).foregroundStyle(color(block.mark))
-                    .fixedSize()
-                if block.point {
-                    Image(systemName: block.mark == .codex ? "diamond.fill" : block.mark == .claude ? "circle.fill" : "triangle.fill")
-                        .font(.system(size: 10)).foregroundStyle(color(block.mark)).offset(x: -5)
-                } else {
-                    mark(block.mark).frame(width: length, height: 12)
-                }
-            }
-            .frame(width: max(length, 90), height: 42, alignment: .topLeading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .offset(x: CGFloat(block.position) * width, y: CGFloat(block.track) * 48 + 5)
-        .help(segmentDescription(block))
-        .accessibilityLabel(Text(verbatim: segmentDescription(block)))
-    }
-
-    private func owner(width: CGFloat) -> some View {
-        HStack(alignment: .top, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(verbatim: "Owner").font(Theme.Font.bodyMedium)
-                Text(verbatim: "Estimated attribution").font(Theme.Font.caption)
-                    .foregroundStyle(Theme.Palette.textMuted)
-            }
-            .frame(width: labelWidth, alignment: .leading).padding(.top, 10)
-            ZStack(alignment: .topLeading) {
-                grid(width: width)
-                if !drawing.ownerAvailable {
-                    Text(verbatim: "Owner activity unavailable · time is unknown")
-                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted).padding(.top, 20)
-                } else if drawing.owner.isEmpty {
-                    Text(verbatim: "No owner activity recorded for this day")
-                        .font(Theme.Font.caption).foregroundStyle(Theme.Palette.textMuted).padding(.top, 20)
-                } else {
-                    ForEach(drawing.owner) { block in
-                        Button { onSelect(.owner(day: snapshot.day, block.range)) } label: {
-                            VStack(spacing: 0) {
-                                ForEach(Array(block.range.assignments.enumerated()), id: \.offset) { index, share in
-                                    Rectangle().fill(ownerColor(index, project: share.project))
-                                        .frame(height: share.share.isFinite ? CGFloat(max(0, min(1, share.share))) * 24 : 0)
-                                }
-                            }
-                            .frame(width: CGFloat(block.length) * width, height: 24, alignment: .top)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .offset(x: CGFloat(block.position) * width, y: 18)
-                        .help(ownerDescription(block.range))
-                        .accessibilityLabel(Text(verbatim: ownerDescription(block.range)))
-                    }
-                }
-            }
-            .frame(width: width, height: 88)
-        }
-        .overlay(alignment: .top) { Rectangle().fill(Theme.Palette.border).frame(height: 1) }
-    }
-
-    @ViewBuilder private func mark(_ value: TimelineDrawing.AgentMark) -> some View {
-        switch value {
-        case .claude: Capsule().fill(color(value))
-        case .codex: Rectangle().fill(color(value))
-        case .unknown:
-            RoundedRectangle(cornerRadius: 2).strokeBorder(color(value), style: StrokeStyle(lineWidth: 1.5, dash: [3, 2]))
-        }
-    }
-
-    private func color(_ mark: TimelineDrawing.AgentMark) -> Color {
-        switch mark { case .claude: Theme.Palette.feedback; case .codex: Theme.Palette.accent; case .unknown: Theme.Palette.textMuted }
-    }
-    private func ownerColor(_ index: Int, project: String?) -> Color {
-        guard project != nil else { return Theme.Palette.textSubtle.opacity(0.5) }
-        return index % 2 == 0 ? Theme.Palette.decision.opacity(0.8) : Theme.Palette.note.opacity(0.8)
-    }
-    private func ownerNames(_ range: TimelineOwnerRange) -> String {
-        range.assignments.map { assignment in
-            assignment.project.flatMap { key in snapshot.projects.first(where: { project in project.key == key })?.name ?? key }
-                ?? "Unassigned"
-        }.joined(separator: " / ")
-    }
-    private func segmentDescription(_ block: TimelineDrawing.Block) -> String {
-        let start = TimelineDrawing.time(block.segment.from, calendar: calendar)
-        if block.point { return "\(block.label), \(start), point with no elapsed duration. Open details." }
-        return "\(block.label), \(start) to \(TimelineDrawing.time(block.segment.to, calendar: calendar)). Open details."
-    }
-    private func ownerDescription(_ range: TimelineOwnerRange) -> String {
-        "Owner estimate: \(ownerNames(range)), \(TimelineDrawing.time(range.from, calendar: calendar)) to \(TimelineDrawing.time(range.to, calendar: calendar)). Shares cover the same interval. Open details."
     }
 }

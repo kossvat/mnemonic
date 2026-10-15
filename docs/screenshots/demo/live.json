@@ -4,7 +4,7 @@
  "projects": [
   {
    "key": "acme-api",
-   "name": "acme-api",
+   "name": "Harbor",
    "state": "running",
    "sessions": [
     {
@@ -27,17 +27,17 @@
     "confidence": "high"
    },
    "plan": {
-    "unit": "auth-hardening",
+    "unit": "Harbor contract",
     "done": 3,
     "total": 7,
     "stage": "building",
-    "task": "Rotate refresh tokens on every use",
-    "gate": "passed"
+    "task": "Review the result",
+    "gate": "stale"
    }
   },
   {
    "key": "web-client",
-   "name": "web-client",
+   "name": "Beacon",
    "state": "waiting",
    "sessions": [
     {

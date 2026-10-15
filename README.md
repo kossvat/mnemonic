@@ -297,17 +297,33 @@ ignored, and merged rows are counted outside the board.
   <sub>The Projects board. (Demo data shown.)</sub>
 </p>
 
-Open a project for **Now, Plan, Gate, Time, and History**: sessions, plan units
-and task disclosures, gate receipts and checkout measurements, 14 daily time
-rows, and memory titles with IDs. Missing owner time and checkout measurements
-stay unknown. Task completion does not replace the recorded plan stage.
-Widget project links open the same profile's project in the app.
+Open a project for its active change and its stage among the stages, the open
+units with the one closed last, tasks with the finished ones folded, the
+verification gate with the result it is stale against, live sessions with
+their last record, and recent days with the decisions and corrections of
+each. Missing values stay unknown rather than zero. Widget project links open
+the same profile's project in the app.
 
-**Timeline** shows a local day with project lanes, distinct Claude and Codex
-blocks, and a separate lane for your activity. Its axis follows the actual
-length of the day, including clock changes. Your project shares are estimates
-on their recorded intervals. A block opens details; an explicit correction
-can reassign its time, and Undo removes that correction.
+<p align="center">
+  <img src="docs/screenshots/app-project.png" alt="MnemonicApp project page: active change and stages, units, tasks, gate, sessions and recent work" width="820"/>
+</p>
+<p align="center">
+  <sub>The page of a project. (Demo data shown.)</sub>
+</p>
+
+**Timeline** opens on a two-hour focus with a strip of the whole day above
+it; the whole day, of its real length, is one click away. Claude and Codex
+blocks differ by shape and label, your activity has its own lane, a label is
+drawn only where it fits inside its block, and a crowded project folds past
+three rows. A block opens details; an explicit correction can reassign its
+time, and Undo removes that correction.
+
+<p align="center">
+  <img src="docs/screenshots/app-timeline.png" alt="MnemonicApp Timeline: two-hour focus over a strip of the day, lanes by project, totals of the day" width="820"/>
+</p>
+<p align="center">
+  <sub>The Timeline in focus. (Demo data shown.)</sub>
+</p>
 
 The existing screens remain available, including:
 

@@ -19,17 +19,17 @@ impl crate::live_signal::Post for Silent {
     fn post(&self, _name: &str) {}
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     _temp: tempfile::TempDir,
-    state: AppState,
-    project: PathBuf,
+    pub(super) state: AppState,
+    pub(super) project: PathBuf,
     activity: PathBuf,
     decision: String,
-    yesterday: String,
+    pub(super) yesterday: String,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let project = workspace.join("projects/demoapp");
@@ -148,11 +148,11 @@ impl Fixture {
         }
     }
 
-    fn changes(&self) -> u64 {
+    pub(super) fn changes(&self) -> u64 {
         self.state.storage.conn.lock().unwrap().total_changes()
     }
 
-    fn stores(&self) -> (BTreeMap<String, Vec<String>>, BTreeMap<String, Vec<String>>) {
+    pub(super) fn stores(&self) -> (BTreeMap<String, Vec<String>>, BTreeMap<String, Vec<String>>) {
         let memory = dump(&self.state.storage.conn.lock().unwrap());
         let activity = rusqlite::Connection::open_with_flags(
             &self.activity,
@@ -198,7 +198,7 @@ fn dump(conn: &rusqlite::Connection) -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
-fn request(path: &str, token: bool, host: &str) -> Request<Body> {
+pub(super) fn request(path: &str, token: bool, host: &str) -> Request<Body> {
     let mut request = Request::builder().uri(path).header(header::HOST, host);
     if token {
         request = request.header(TOKEN_HEADER, "test-token");
@@ -206,7 +206,7 @@ fn request(path: &str, token: bool, host: &str) -> Request<Body> {
     request.body(Body::empty()).unwrap()
 }
 
-async fn call(state: &AppState, request: Request<Body>) -> (StatusCode, Value) {
+pub(super) async fn call(state: &AppState, request: Request<Body>) -> (StatusCode, Value) {
     let response = router(state.clone()).call(request).await.unwrap();
     let status = response.status();
     let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -274,6 +274,9 @@ async fn plan_project_routes_return_plans_sessions_days_and_history_without_stor
     assert!(detail["plan"]["units"][0]["as_of"].as_i64().is_some());
     detail["plan"]["units"][0]["as_of"] = expected_detail["plan"]["units"][0]["as_of"].clone();
     detail["sessions"][0]["started_at"] = expected_detail["sessions"][0]["started_at"].clone();
+    assert!(detail["sessions"][0]["last_record_at"].as_i64().is_some());
+    detail["sessions"][0]["last_record_at"] =
+        expected_detail["sessions"][0]["last_record_at"].clone();
     for (actual, expected) in detail["time"]
         .as_array_mut()
         .unwrap()
@@ -288,6 +291,85 @@ async fn plan_project_routes_return_plans_sessions_days_and_history_without_stor
     assert_eq!(detail, expected_detail);
     assert_eq!(f.stores(), before);
     assert_eq!(f.changes(), changes);
+}
+
+#[tokio::test]
+async fn plan_project_routes_serve_the_gate_closure_and_session_times_the_daemon_holds() {
+    let f = Fixture::new();
+    let live = f.state.live.as_ref().unwrap();
+    let receipt = f.project.join("target/checks/plan/run/verification.json");
+    std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+    std::fs::write(
+        &receipt,
+        r#"{"change":"plan","passed":false,"timestamp":1700000000}"#,
+    )
+    .unwrap();
+    live.refresh_plans_at(Utc::now(), std::time::Instant::now(), true);
+    let (before, changes) = (f.stores(), f.changes());
+    let (_, board) = call(&f.state, request("/api/projects", true, "localhost")).await;
+    let row = &board["projects"][0];
+    assert_eq!(row["gate_at"], 1_700_000_000);
+    assert_eq!(row["plan"]["gate"], "failed");
+    assert_eq!(row["plan_provider"], "checkbox");
+    assert_eq!(row["plan_counts"]["done"], 1);
+    assert_eq!(row["plan_weekly_count"], 0);
+    let (_, detail) = call(
+        &f.state,
+        request("/api/projects/demoapp", true, "localhost"),
+    )
+    .await;
+    let unit = &detail["plan"]["units"][0];
+    assert_eq!(unit["gate"]["result"], "failed");
+    assert_eq!(unit["gate"]["at"], 1_700_000_000);
+    assert_eq!(
+        (&unit["closed"], &unit["closed_at"]),
+        (&Value::Bool(false), &Value::Null)
+    );
+    let session = &detail["sessions"][0];
+    assert!(session["last_record_at"].as_i64().unwrap() >= session["started_at"].as_i64().unwrap());
+    assert_eq!(detail["history"][0]["kind"], "decision");
+    assert_eq!(f.stores(), before);
+    assert_eq!(f.changes(), changes);
+
+    // A receipt with no result, then every task done with no closure time.
+    std::fs::write(&receipt, r#"{"change":"plan","timestamp":1700000100}"#).unwrap();
+    std::fs::write(
+        f.project.join("tasks.md"),
+        "- [x] T01: Build the fixture\n- [x] T02: Review the result\n",
+    )
+    .unwrap();
+    live.refresh_plans_at(Utc::now(), std::time::Instant::now(), true);
+    let (before, changes) = (f.stores(), f.changes());
+    let (_, board) = call(&f.state, request("/api/projects", true, "localhost")).await;
+    assert_eq!(board["projects"][0]["gate_at"], 1_700_000_100);
+    let (_, detail) = call(
+        &f.state,
+        request("/api/projects/demoapp", true, "localhost"),
+    )
+    .await;
+    let unit = &detail["plan"]["units"][0];
+    assert_eq!(unit["stage"], "done");
+    assert_eq!(unit["gate"]["result"], Value::Null);
+    assert_eq!(
+        (&unit["closed"], &unit["closed_at"]),
+        (&Value::Bool(true), &Value::Null)
+    );
+    assert_eq!(f.stores(), before);
+    assert_eq!(f.changes(), changes);
+
+    // No plan file: the row keeps the new keys, each null.
+    std::fs::remove_file(f.project.join("tasks.md")).unwrap();
+    live.refresh_plans_at(Utc::now(), std::time::Instant::now(), true);
+    let (_, board) = call(&f.state, request("/api/projects", true, "localhost")).await;
+    let row = board["projects"][0].as_object().unwrap();
+    for key in [
+        "gate_at",
+        "plan_provider",
+        "plan_counts",
+        "plan_weekly_count",
+    ] {
+        assert_eq!(row.get(key), Some(&Value::Null), "{key}");
+    }
 }
 
 #[tokio::test]

@@ -296,6 +296,25 @@ impl Live {
         self.signal(true, monotonic);
     }
 
+    /// The next request sweeps, as one does after five seconds.
+    #[cfg(test)]
+    pub fn expire_plan_sweep(&self) {
+        self.plans
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .last_sweep = None;
+    }
+
+    /// How many plan files the reader has parsed since it was made.
+    #[cfg(test)]
+    pub fn plan_files_parsed(&self) -> usize {
+        self.plans
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .reader
+            .parsed_count()
+    }
+
     pub fn project_plans(&self) -> BTreeMap<i64, Plan> {
         self.plans
             .lock()

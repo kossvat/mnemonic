@@ -1,31 +1,35 @@
 {
  "key": "acme-api",
- "name": "acme-api",
+ "name": "Harbor",
  "state": "active",
  "plan": {
   "units": [
    {
     "id": "plan",
-    "title": "plan",
-    "done": 1,
-    "total": 2,
+    "title": "Harbor contract",
+    "done": 3,
+    "total": 7,
     "stage": "building",
+    "closed": false,
+    "closed_at": null,
     "stale": false,
     "current_task": {
      "id": "T02",
      "title": "Review the result",
-     "source": "first_open"
+     "source": "registry"
     },
     "counts": {
-     "done": 1,
-     "planned": 1
+     "done": 3,
+     "in_progress": 1,
+     "planned": 3
     },
-    "waiting_on_owner": [],
+    "waiting_on_owner": ["Review the result"],
     "weekly_count": 0,
     "gate": {
-     "status": "none",
-     "at": null,
-     "failed_runs": 0
+     "status": "stale",
+     "at": 1790762400,
+     "failed_runs": 0,
+     "result": "passed"
     },
     "provider": "checkbox",
     "checkouts": 0,
@@ -33,16 +37,34 @@
     "tasks": [
      {
       "id": "T01",
-      "title": "Build the fixture",
+      "title": "Build the cache",
       "status": "done",
       "owner": null
      },
      {
       "id": "T02",
       "title": "Review the result",
-      "status": "planned",
+      "status": "in_progress",
       "owner": null
-     }
+     },
+     {"id": "T03", "title": "Draft the guide", "status": "done", "owner": null},
+     {"id": "T04", "title": "Record the contract", "status": "done", "owner": null},
+     {"id": "T05", "title": "Verify the response", "status": "planned", "owner": null},
+     {"id": "T06", "title": "Check the delivery", "status": "planned", "owner": null},
+     {"id": "T07", "title": "Review the guide", "status": "planned", "owner": null}
+    ],
+    "error": null
+   },
+   {
+    "id": "unit-2", "title": "Harbor draft", "done": 2, "total": 2,
+    "stage": "done", "stale": false, "closed": true, "closed_at": 1790679600,
+    "current_task": null, "counts": {"done": 2}, "waiting_on_owner": [],
+    "weekly_count": 0,
+    "gate": {"status": "passed", "at": 1790679000, "failed_runs": 0, "result": "passed"},
+    "provider": "checkbox", "checkouts": 0, "as_of": 1790679600,
+    "tasks": [
+     {"id": "T08", "title": "Draft the contract", "status": "done", "owner": null},
+     {"id": "T09", "title": "Check the draft", "status": "done", "owner": null}
     ],
     "error": null
    }
@@ -54,14 +76,20 @@
    "agent": "claude",
    "driver": "owner",
    "state": "running",
-   "started_at": 1790762400
+   "started_at": 1790762400,
+   "last_record_at": 1790765880
+  },
+  {
+   "agent": "codex", "driver": "program", "state": "running",
+   "started_at": 1790762405, "last_record_at": 1790765940
   }
  ],
  "gate_detail": {
   "plan": {
-   "dirty": null,
-   "commits_since": null
-  }
+   "dirty": true,
+   "commits_since": 2
+  },
+  "unit-2": {"dirty": false, "commits_since": 0}
  },
  "time": [
   {
@@ -144,18 +172,23 @@
   },
   {
    "day": "2026-09-30",
-   "owner_s": 300.0,
-   "agent_s": 0,
+   "owner_s": 5400.0,
+   "agent_s": 9000,
    "confidence": "medium"
   }
  ],
- "top_terms": [],
+ "top_terms": [{"name": "cache", "memory_count": 4}, {"name": "contract", "memory_count": 2}],
  "owner_estimate": true,
  "history": [
   {
+   "id": "decision-b", "title": "Keep the local response", "at": 1790765400,
+   "kind": "correction"
+  },
+  {
    "id": "decision-a",
    "title": "Use the local cache",
-   "at": 1790762460
+   "at": 1790762460,
+   "kind": "decision"
   }
  ]
 }

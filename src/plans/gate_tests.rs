@@ -214,6 +214,45 @@ fn gate_newest_malformed_receipt_cannot_revive_older_pass() {
 }
 
 #[test]
+fn gate_result_is_what_the_newest_receipt_says_from_one_parse() {
+    let fixture = Fixture::new(true);
+    let path = fixture.passing("10");
+    let mut reader = Reader::default();
+    for _ in 0..3 {
+        assert_eq!(
+            reader.read(&fixture.project, "unit-a", None).result,
+            Some(GateResult::Passed)
+        );
+    }
+    assert_eq!(reader.parsed_count(), 1, "the result needs no second read");
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({ "change": "unit-a", "passed": false })).unwrap(),
+    )
+    .unwrap();
+    let gate = reader.read(&fixture.project, "unit-a", None);
+    assert_eq!(
+        (gate.status, gate.result),
+        (GateStatus::Failed, Some(GateResult::Failed))
+    );
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({ "change": "unit-a" })).unwrap(),
+    )
+    .unwrap();
+    let gate = reader.read(&fixture.project, "unit-a", None);
+    assert_eq!((gate.status, gate.result), (GateStatus::Stale, None));
+    fs::write(&path, "{").unwrap();
+    let gate = reader.read(&fixture.project, "unit-a", None);
+    assert_eq!((gate.status, gate.result), (GateStatus::Stale, None));
+    assert_eq!(reader.parsed_count(), 4);
+    assert_eq!(
+        serde_json::to_value(Gate::default()).unwrap()["result"],
+        Value::Null
+    );
+}
+
+#[test]
 fn gate_record_times_order_nonnumeric_run_folders() {
     let fixture = Fixture::new(true);
     fixture.receipt(
@@ -439,6 +478,6 @@ fn gate_timestamp_units_and_serialized_statuses_are_stable() {
     }
     assert_eq!(
         serde_json::to_value(Gate::default()).unwrap(),
-        json!({ "status": "none", "at": null, "failed_runs": 0 })
+        json!({ "status": "none", "at": null, "failed_runs": 0, "result": null })
     );
 }

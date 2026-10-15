@@ -132,22 +132,6 @@ final class ProjectPresentationTests: XCTestCase {
         XCTAssertEqual(ProjectPresentation.commits(clean), "0 commits since gate")
     }
 
-    func testTimeShowsTheLatestFourteenDaysAndKeepsPartialOwnerAttributionUnknown() throws {
-        let rows = try (1...16).map { number in
-            try decode(ProjectDay.self, [
-                "day": String(format: "2026-03-%02d", number),
-                "owner_s": number == 16 ? NSNull() : 60 as Any,
-                "agent_s": 120,
-            ])
-        }
-        let days = ProjectPresentation.days(Array(rows.reversed()))
-        XCTAssertEqual(days.count, 14)
-        XCTAssertEqual(days.first?.day, "2026-03-03")
-        XCTAssertEqual(days.last?.day, "2026-03-16")
-        XCTAssertNil(ProjectPresentation.ownerTotal(days))
-        XCTAssertEqual(ProjectPresentation.ownerTotal(Array(days.dropLast())), 13 * 60)
-    }
-
     func testFailureStatesHaveDistinctSpecificMessages() {
         let failures: [LocalAPIFailure] = [.off, .unreachable, .unauthorised, .earlierDaemon, .undecodable]
         let titles = failures.map { failure in ProjectPresentation.failure(failure).title }
