@@ -126,12 +126,7 @@ extension ProjectPresentation {
     }
 
     static func boardDate(_ now: Date, calendar: Calendar, format: String = "EEEE, d MMMM") -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = calendar
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = format
-        return formatter.string(from: now)
+        FixedDateFormat.string(now, format: format, calendar: calendar)
     }
 
     static func headerTotals(_ snapshot: LiveSnapshot) -> BoardTimes {

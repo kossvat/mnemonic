@@ -50,7 +50,7 @@ final class AppProjectController: ObservableObject {
             if self.invalidateSelectedRead() { return }
             Task { @MainActor [weak self] in
                 guard let self, self.visible, self.visit == started else { return }
-                await self.refresh()
+                await self.refresh(quiet: true)
             }
         }
         coordinator.onAnswer = { [weak self] _ in
@@ -136,13 +136,19 @@ final class AppProjectController: ObservableObject {
         }
     }
 
-    func refresh(force: Bool = true) async {
+    /// A quiet refresh is the one of the timer: it shows no loading over a
+    /// screen that has something to show, and while the label clock ticks an
+    /// answer that changes nothing publishes nothing, so nothing is drawn again.
+    func refresh(force: Bool = true, quiet: Bool = false) async {
         guard visible else { return }
-        // The label clock is absent with no live sessions. The existing
-        // visible refresh still advances activity ages and the stale fold.
-        now = date()
+        let current = date()
+        // The label clock is absent with no live sessions. A visible refresh
+        // then advances activity ages and the stale fold. A new day is not
+        // left to that clock: Today and the Timeline's day follow it here.
+        if !quiet || !coordinator.labelsArmed || TimelineDay.today(now: now) != TimelineDay.today(now: current),
+           now != current { now = current }
         // Today's timeline becomes historical at local midnight without a new timer.
-        coordinator.setPlanVisible(route.refreshes(at: now))
+        coordinator.setPlanVisible(route.refreshes(at: current))
         let currentVisit = visit
         let selected = route
         if force && invalidateSelectedRead() { return }
@@ -157,32 +163,38 @@ final class AppProjectController: ObservableObject {
             invalidatedVisits.remove(currentVisit)
             switch selected {
             case .projects:
-                loading = true
+                if !quiet || board == nil, !loading { loading = true }
                 let answer = await readBoard()
                 guard visible, visit == currentVisit, route == selected else { return }
                 if invalidatedVisits.contains(currentVisit) { continue }
-                loading = false
+                if loading { loading = false }
                 switch answer {
                 case .success(let value):
-                    if board != value { board = value }
-                    failure = nil
+                    if board != value {
+                        advanceToAnswer()
+                        board = value
+                    }
+                    if failure != nil { failure = nil }
                 case .failure(let reason):
-                    board = nil
-                    failure = reason
+                    if board != nil { board = nil }
+                    if failure != reason { failure = reason }
                 }
             case .project(let key):
-                loading = true
+                if !quiet || detail == nil, !loading { loading = true }
                 let answer = await readDetail(key)
                 guard visible, visit == currentVisit, route == selected else { return }
                 if invalidatedVisits.contains(currentVisit) { continue }
-                loading = false
+                if loading { loading = false }
                 switch answer {
                 case .success(let value):
-                    if detail != value { detail = value }
-                    failure = nil
+                    if detail != value {
+                        advanceToAnswer()
+                        detail = value
+                    }
+                    if failure != nil { failure = nil }
                 case .failure(let reason):
-                    detail = nil
-                    failure = reason
+                    if detail != nil { detail = nil }
+                    if failure != reason { failure = reason }
                 }
             default:
                 await onLegacyRefresh?(selected)
@@ -190,6 +202,13 @@ final class AppProjectController: ObservableObject {
         } while visible && visit == currentVisit && route == selected && invalidatedVisits.contains(currentVisit)
         guard visible, visit == currentVisit else { return }
         onPresentationChange?()
+    }
+
+    /// A changed answer is drawn against the time it arrived, not the time it
+    /// was asked for: a label tick during the read may have moved the clock on.
+    private func advanceToAnswer() {
+        let accepted = date()
+        if now != accepted { now = accepted }
     }
 
     /// Rendering fixtures does not construct a transport or arm a clock.

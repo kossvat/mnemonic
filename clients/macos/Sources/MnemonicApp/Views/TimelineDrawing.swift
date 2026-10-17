@@ -119,17 +119,14 @@ struct TimelineDrawing {
     }
 
     private static func ticks(span: Span, calendar: Calendar) -> [Tick] {
-        let formatter = DateFormatter()
-        formatter.calendar = calendar
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "HH:mm"
         var instants: [Double] = []
         let focus = span.duration <= 7_200
         var at = span.from
         while at < span.to, instants.count < 50 { instants.append(at); at += focus ? 1_800 : 3_600 }
         instants.append(span.to)
-        let labels = instants.map { instant in formatter.string(from: Date(timeIntervalSince1970: instant)) }
+        let labels = instants.map { instant in
+            FixedDateFormat.string(Date(timeIntervalSince1970: instant), format: "HH:mm", calendar: calendar)
+        }
         return instants.enumerated().map { index, instant in
             var label = labels[index]
             // Repeated local hours carry their UTC offsets.
@@ -175,12 +172,8 @@ struct TimelineDrawing {
 
     static func time(_ instant: Double, calendar: Calendar) -> String {
         guard instant.isFinite else { return "Unknown time" }
-        let formatter = DateFormatter()
-        formatter.calendar = calendar
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = instant.rounded(.towardZero) == instant ? "HH:mm:ss z" : "HH:mm:ss.SSS z"
-        return formatter.string(from: Date(timeIntervalSince1970: instant))
+        let format = instant.rounded(.towardZero) == instant ? "HH:mm:ss z" : "HH:mm:ss.SSS z"
+        return FixedDateFormat.string(Date(timeIntervalSince1970: instant), format: format, calendar: calendar)
     }
 }
 

@@ -7,12 +7,7 @@ public enum TimelineDay {
     }
 
     public static func string(_ date: Date, calendar: Calendar = .current) -> String {
-        let formatter = DateFormatter()
-        formatter.calendar = gregorian(calendar)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: date)
+        FixedDateFormat.string(date, format: "yyyy-MM-dd", calendar: gregorian(calendar))
     }
 
     public static func date(_ value: String, calendar: Calendar = .current) -> Date? {

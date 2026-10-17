@@ -105,6 +105,10 @@ public final class LiveCoordinator {
     /// today's timeline.
     public private(set) var planVisible = false
 
+    /// Whether the clock of the elapsed labels is held: while it is, it
+    /// alone advances the labels.
+    public var labelsArmed: Bool { labelsTimer != nil }
+
     /// The timers held now, by name: what the tests look at.
     public var armed: Set<String> {
         var names: Set<String> = []

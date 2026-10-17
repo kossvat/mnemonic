@@ -150,7 +150,7 @@ final class AppTimelineIntegrationTests: XCTestCase {
         defer { fixture.close() }
         let controller = fixture.model.projects
         controller.present(board: nil, detail: nil, live: .snapshot(try FixtureWire.live()), route: fixture.model.route)
-        let content = ContentView(model: fixture.model)
+        let content = RouteDetail(model: fixture.model, windowVisible: true)
         let shownAt = controller.now
         XCTAssertEqual(fixture.model.route, .timeline("2026-06-17"))
         XCTAssertTrue(controller.visible)

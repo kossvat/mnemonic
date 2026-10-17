@@ -87,24 +87,34 @@ final class AppProjectControllerTests: XCTestCase {
         await counts(source, live: 2, board: 2)
         let completed = expectation(description: "The refreshed board reached the controller")
         let rearmed = expectation(description: "The refresh timer was rearmed after the live answer")
-        var started = false
-        var finished = false
+        let delivered = expectation(description: "The live answer was presented while the board is held")
+        var raised = false
         let loading = controller.$loading.dropFirst().sink { value in
-            if value { started = true }
+            if value { raised = true }
         }
+        // While the board's answer is held, only the live answer presents.
         controller.onPresentationChange = {
-            guard started, !finished, !controller.loading else { return }
-            finished = true
-            completed.fulfill()
+            controller.onPresentationChange = nil
+            delivered.fulfill()
         }
         clock.onArm = { seconds in
             if seconds == 30 { rearmed.fulfill() }
         }
+        await source.holdNext(.board)
+        await source.holdNext(.live)
         try clock.queue(30)()
         try await arrived(source, .live, count: 3)
         try await arrived(source, .board, count: 3)
-        await fulfillment(of: [completed, rearmed], timeout: 5)
+        await source.finishLive()
+        await fulfillment(of: [delivered, rearmed], timeout: 5)
+        controller.onPresentationChange = {
+            controller.onPresentationChange = nil
+            completed.fulfill()
+        }
+        await source.finishBoard()
+        await fulfillment(of: [completed], timeout: 5)
         loading.cancel()
+        XCTAssertFalse(raised, "The timer's refresh of a shown board does not show loading")
         controller.onPresentationChange = nil
         clock.onArm = nil
         await counts(source, live: 3, board: 3)

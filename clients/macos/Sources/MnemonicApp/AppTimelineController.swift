@@ -64,17 +64,17 @@ final class AppTimelineController: ObservableObject {
     func refresh() async {
         guard visible, let selected = day, !running.contains(visit) else { return }
         if let value = cached(selected) {
-            snapshot = value
-            failure = nil
+            if snapshot != value { snapshot = value }
+            if failure != nil { failure = nil }
             return
         }
         let started = visit
         running.insert(started)
-        loading = true
+        if !loading { loading = true }
         defer {
             running.remove(started)
             invalidated.remove(started)
-            if visit == started { loading = false }
+            if visit == started, loading { loading = false }
         }
         repeat {
             invalidated.remove(started)
@@ -97,12 +97,12 @@ final class AppTimelineController: ObservableObject {
                     failure = .undecodable
                     return
                 }
-                snapshot = value
-                failure = nil
+                if snapshot != value { snapshot = value }
+                if failure != nil { failure = nil }
                 if wasPast && selected < today { remember(value) }
             case .failure(let reason):
-                snapshot = nil
-                failure = reason
+                if snapshot != nil { snapshot = nil }
+                if failure != reason { failure = reason }
             }
         } while current(selected, started) && invalidated.contains(started)
     }
